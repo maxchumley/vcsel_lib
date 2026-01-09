@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vcsel_lib"
+version = "0.1.0"
+description = "Functions to Simulate VCSEL Array Dynamics"
+authors = [{ name = "Max Chumley" }]
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = ["numpy",
+                "sympy",
+                "matplotlib",
+                "IPython",
+                "jupyter",
+                "scipy",
+                "tqdm"]
