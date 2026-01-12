@@ -15,4 +15,5 @@ dependencies = ["numpy",
                 "IPython",
                 "jupyter",
                 "scipy",
-                "tqdm"]
+                "tqdm",
+                "latex"]
