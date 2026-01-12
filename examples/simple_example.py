@@ -64,7 +64,7 @@ N_lasers = 3
 
 n_iterations = 1
 
-kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=kappa_c, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme='ATA')
+kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme='ATA')
 
 
 
@@ -111,7 +111,7 @@ nd['N_lasers'] = N_lasers
 
 nd['kappa'] = nd['kappa'][-1]
 
-history, freq_hist, eq = vcsel.generate_history(nd, shape='EQ', n_cases=n_iterations)
+history, freq_hist, eq = vcsel.generate_history(nd, shape='FR', n_cases=n_iterations)
 
 
 
@@ -143,12 +143,8 @@ freqs_std = np.std(freqs, axis=0)
 dphi = freqs_avg * 1e-9 / (2*np.pi*tau_p)
 dphi_std = freqs_std * 1e-9 / (2*np.pi*tau_p)
 
-# Initialize prev_dphi from detunings
-dphi0 = np.array(nd['delta_p']) * 1e-9 / (2*np.pi*tau_p)  # (N_lasers,)
-prev_dphi = np.ones((N_lasers, 2*delay_steps)) * dphi0[:, None]
-
 # Apply previous values for initial delay steps
-dphi[:, :2*delay_steps] = freq_hist[0] * 1e-9 / (2*np.pi*tau_p) 
+dphi[:, :2*delay_steps] = freq_hist[0] 
 dphi_std[:, :2*delay_steps] = 0   # std = 0 for forced region
 
 # Complex fields for all lasers
