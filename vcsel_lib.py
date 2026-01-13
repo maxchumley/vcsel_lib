@@ -339,14 +339,16 @@ class VCSEL:
             kappa_inj    = nd["kappa_inj"][j]
             t = j*nd["dt"]
 
-            S0   = S[0, 0]
-            phi0 = phi[0, 0]
+            for p in range(N):
 
-            inj_cos = np.cos(omega_inj*t + inj_phase - phi0)
-            inj_sin = np.sin(omega_inj*t + inj_phase - phi0)
+                S0   = S[0, p]
+                phi0 = phi[0, p]
 
-            dS[0, 0]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
-            dphi[0, 0] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
+                inj_cos = np.cos(omega_inj*t + inj_phase - phi0)
+                inj_sin = np.sin(omega_inj*t + inj_phase - phi0)
+
+                dS[0, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
+                dphi[0, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
 
         # ----------------- PACK OUTPUT -----------------
         out = np.empty((n_cases, 3*N))
@@ -798,7 +800,7 @@ class VCSEL:
             phi[:, 1:] = results[valid_indices, 2*N_lasers : 3*N_lasers - 1] # phi1 = 0
 
             
-            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
+            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi + nd['phi_p']))
             E_tot = np.abs(np.sum(E, axis=1))**2
 
             final_root = results[np.argmax(E_tot)]
