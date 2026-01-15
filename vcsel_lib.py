@@ -305,6 +305,8 @@ class VCSEL:
         # Carrier dynamics
         denom = 1 + s*S
         dn = (1/T)*(p - n - (1+n)*S/denom)
+        dS = ((1+n)/denom - 1)*S + beta_n*n + beta_c
+        dphi = (alpha*0.5)*(n - nbar)/denom + delta
 
         # ----------------- MUTUAL COUPLING -----------------
         # shape: (n_cases, N, N)
@@ -313,12 +315,11 @@ class VCSEL:
             phi_diff_mutual = phi_t[:, None, :] - phi[:, :, None] - phi_p_mutual
             cos_mutual = np.cos(phi_diff_mutual)
             sin_mutual = np.sin(phi_diff_mutual)
-
-            dS = nd['coupling'] * ((1+n)/denom - 1)*S + beta_n*n + beta_c
+            
+            # intensity dynamics
             dS += nd['coupling'] * 2 * np.sum(kappa_mat[None, :, :] * mutual_amp * cos_mutual, axis=2)
 
             # phase dynamics
-            dphi = nd['coupling'] * (alpha*0.5)*(n - nbar)/denom + delta
             dphi +=nd['coupling'] *  np.sum(kappa_mat[None, :, :] * (sqrtS_t[:, None, :] / sqrtS[:, :, None]) * sin_mutual, axis=2)
 
         # ----------------- SELF-FEEDBACK -----------------
