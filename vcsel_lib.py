@@ -214,8 +214,6 @@ class VCSEL:
         nd['injected_frequency'] = phys.get('injected_frequency', 0.0)* 1e9*(2*np.pi*tau_p)
         nd['kappa_inj'] = kappa_inj / gamma
 
-        print(n_bar)
-
         self.nd = nd
         return nd
 
