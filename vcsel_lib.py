@@ -214,6 +214,7 @@ class VCSEL:
         nd['injected_frequency'] = phys.get('injected_frequency', 0.0)* 1e9*(2*np.pi*tau_p)
         nd['kappa_inj'] = kappa_inj / gamma
 
+        print(n_bar)
 
         self.nd = nd
         return nd
@@ -315,7 +316,7 @@ class VCSEL:
             phi_diff_mutual = phi_t[:, None, :] - phi[:, :, None] - phi_p_mutual
             cos_mutual = np.cos(phi_diff_mutual)
             sin_mutual = np.sin(phi_diff_mutual)
-            
+
             # intensity dynamics
             dS += nd['coupling'] * 2 * np.sum(kappa_mat[None, :, :] * mutual_amp * cos_mutual, axis=2)
 
