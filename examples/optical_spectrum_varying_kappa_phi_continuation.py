@@ -55,7 +55,7 @@ for p in range(1):
 
 
     dt = 0.5*tau_p # 1 ps
-    Tmax = 2e-7 
+    Tmax = 1e-7
 
 
     steps = int(Tmax / dt)
@@ -76,7 +76,7 @@ for p in range(1):
 
 
 
-    phi_p_vals = np.array([1*np.pi])#np.linspace(0,2*np.pi,resolution)
+    phi_p_vals = np.array([0*np.pi])#np.linspace(0,2*np.pi,resolution)
 
     n_iterations = 100
 
@@ -303,7 +303,7 @@ for p in range(1):
         font_size = 22
         f_plot = f_window/tau_p
 
-        if k%1 == 0 or k == len(kappa_c)-1:
+        if k%10 == 0 or k == len(kappa_c)-1:
             # clear_output(wait=True)
             fig = plt.figure(figsize=(18,10), dpi=300)
             gs = fig.add_gridspec(20, 30, height_ratios=[1]*20, width_ratios=[1]*30, hspace=0.3)
@@ -413,7 +413,9 @@ for p in range(1):
             plt.close(fig)
             plt.cla(); plt.clf()
             plt.close('all')
-            clear_output(wait=True)
+            # clear_output(wait=True)
+
+        history = y[:,:,-2*delay_steps:].copy()
 
 
 
