@@ -22,7 +22,6 @@ from scipy.optimize import root
 import time
 
 class VCSEL:
-    print("TESTING")
     """
     Class representing a Vertical-Cavity Surface-Emitting Laser (VCSEL)
     with delayed coupling and optional self-feedback and noise.
@@ -810,7 +809,7 @@ class VCSEL:
             phi[:, 1:] = results[valid_indices, 2*N_lasers : 3*N_lasers - 1] # phi1 = 0
 
             
-            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi + nd['phi_p']))
+            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
             E_tot = np.abs(np.sum(E, axis=1))**2
 
             final_root = results[np.argmax(E_tot)]

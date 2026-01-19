@@ -1,19 +1,21 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vcsel_lib"
+name = "vcsel-lib"   # pip/conda sees this
 version = "0.2.0"
 description = "Functions to Simulate VCSEL Array Dynamics"
 authors = [{ name = "Max Chumley" }]
 readme = "README.md"
 license = { text = "MIT" }
-dependencies = ["numpy",
-                "sympy",
-                "matplotlib",
-                "IPython",
-                "jupyter",
-                "scipy",
-                "tqdm",
-                "latex"]
+dependencies = [
+    "numpy",
+    "sympy",
+    "matplotlib",
+    "IPython",
+    "jupyter",
+    "scipy",
+    "tqdm",
+    "latex"
+]
