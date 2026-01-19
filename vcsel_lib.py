@@ -22,6 +22,7 @@ from scipy.optimize import root
 import time
 
 class VCSEL:
+    print("TESTING")
     """
     Class representing a Vertical-Cavity Surface-Emitting Laser (VCSEL)
     with delayed coupling and optional self-feedback and noise.
@@ -141,6 +142,7 @@ class VCSEL:
         delay_steps = int(tau / dt)
 
         injection = phys.get('injection', False)
+        injection_topology = phys.get('injection_topology', None)
         injected_strength = phys.get('injected_strength', 0.0)
         injected_phase_diff = phys.get('injected_phase_diff', 0.0)
         kappa_inj = phys.get('kappa_injection', 0.0)
@@ -153,10 +155,6 @@ class VCSEL:
         # Use sympy to get numerical solution of the algebraic steady-state system.
         N_bar_sym = symbols('N_bar', real=True)
         S_bar = symbols('S_bar', real=True,positive=True) 
-
-
-
-
 
         # ------------------------------
         # Build nondimensional parameter dictionary
@@ -210,6 +208,7 @@ class VCSEL:
         nd['nbar'] = n_bar
         nd['sbar'] = S_bar
         nd['injection'] = injection
+        nd['injection_topology'] = injection_topology
         nd['injected_strength'] = injected_strength
         nd['injected_frequency'] = phys.get('injected_frequency', 0.0)* 1e9*(2*np.pi*tau_p)
         nd['kappa_inj'] = kappa_inj / gamma
@@ -332,7 +331,11 @@ class VCSEL:
             dphi += nd["self_feedback"] * kappa_diag[None, :] * ((sqrtS_2t / sqrtS) * sin_self)
 
         # ----------------- INJECTION (optional) -----------------
-        if nd.get("injection", False):
+        injection_topology = nd.get("injection_topology", None)
+        if nd.get("injection", False) and injection_topology is not None:
+
+            assert injection_topology.shape == (N,), "injection_topology must be shape (N,) indicating which lasers receive injection."
+
             inj_strength = nd["injected_strength"]
             inj_phase    = nd["injected_phase_diff"]
             omega_inj    = nd["injected_frequency"][j]
@@ -340,6 +343,9 @@ class VCSEL:
             t = j*nd["dt"]
 
             for p in range(N):
+
+                if not injection_topology[p]:
+                    continue
 
                 S0   = S[0, p]
                 phi0 = phi[0, p]
@@ -349,12 +355,16 @@ class VCSEL:
 
                 dS[0, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
                 dphi[0, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
+        elif nd.get("injection", False) and injection_topology is None:
+            raise ValueError("Injection topology must be provided when injection is enabled.")
 
         # ----------------- PACK OUTPUT -----------------
         out = np.empty((n_cases, 3*N))
         out[:, 0::3] = dn
         out[:, 1::3] = dS
         out[:, 2::3] = dphi
+
+
 
         return out
 
