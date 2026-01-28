@@ -33,18 +33,20 @@ I = eta*current_threshold * q/ tau_n * (N0 + 1/(g0*tau_p))
 
 self_feedback = 0.0
 coupling = 1.0
-noise_amplitude = 0.0
+
+
+# np.array([1.0])
 
 
 
     
-detuning = 0.5 # detuning (GHz)
+detuning = 4.0 # detuning (GHz)
 delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
 
 phi_p = 0.0
 
-dt = 0.5*tau_p # 1 ps
-Tmax = 2e-7
+dt = 1*tau_p # 1 ps
+Tmax = 2e-6
 steps = int(Tmax / dt)
 time_arr = np.linspace(0, Tmax, steps)
 delay_steps = int(tau / dt)
@@ -52,17 +54,21 @@ segment_len = int(steps/2)
 segment_start = int(steps/2)
 
 # Kappa ramp
-kappa_c = 5e9
+kappa_c = 8e9
 
 
 ramp_start = 2
 ramp_shape = 100
 
+noise_amplitude = 1#0 * np.exp(-((time_arr - 150*tau) ** 2) / (2 * 10*tau ** 2))#np.hstack([VCSEL.cosine_ramp(time_arr, 2*tau, 50*tau, kappa_initial=0, kappa_final=1),VCSEL.cosine_ramp(time_arr, 2*tau, 50*tau, kappa_initial=1, kappa_final=0)])
 
-N_lasers = 3
 
 
-n_iterations = 1
+
+N_lasers = 2
+
+
+n_iterations = 100
 
 kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme='ATA')
 
@@ -87,7 +93,7 @@ phys = {
     'I': I,
     'q': q,
     'alpha': alpha,
-    'delta': np.sort(np.concatenate([[0.0], [-delta, delta]])),
+    'delta': np.sort(np.concatenate([[0.0],[delta]])),
     'coupling': coupling,
     'self_feedback': self_feedback,
     'noise_amplitude': noise_amplitude,
@@ -98,8 +104,6 @@ phys = {
 }
 
 N_bar_sym, S_bar = symbols('N_bar S_bar')
-
-
 
 
 kappa_max = 20e9
@@ -120,7 +124,7 @@ vcsel = VCSEL(phys)
 nd = vcsel.scale_params()
 
 
-t, y, freqs = vcsel.integrate(history, nd=nd, progress=True)
+t, y, freqs = vcsel.integrate(history, nd=nd, progress=True, max_iter=100)
 
 
 import numpy as np
@@ -167,7 +171,6 @@ pairwise_cos_pd_std = std_cos_pd[np.triu_indices(N_lasers,k=1)[0],np.triu_indice
 
 
 
-
 # ----------------- PLOTTING -----------------
 clear_output(wait=True)
 fig, axs = plt.subplots(3, 1, figsize=(14, 14), dpi=200, sharex=True)
@@ -185,7 +188,7 @@ for i in range(N_lasers):
 axs[0].set_xlabel('Time ($\mu s$)', fontsize=22)
 axs[0].set_ylabel(r'$\dot{\phi}$ (GHz)', fontsize=22)
 axs[0].legend(loc='upper right',fontsize=14)
-axs[0].set_ylim(-4,3)
+axs[0].set_ylim(-1,5)
 axs[0].grid(True, alpha=0.2)
 axs[0].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
 axs[0].tick_params(axis='both', which='major', labelsize=18)
@@ -195,7 +198,7 @@ pairs = list(combinations(range(N_lasers), 2))
 # -------- 2) cos(Δφ) (laser 0 vs 1) --------
 for l, row in enumerate(pairwise_cos_pd_avg):
     std = pairwise_cos_pd_std[l]
-    axs[1].plot(time_plot, row, linewidth=2, label=f'$\cos{{(\Delta \phi_{{{pairs[l][0]+1},{pairs[l][1]+1}}})}}$')
+    axs[1].plot(time_plot, row, linewidth=2, label=f'$ \cos{{(\Delta \phi_{{{pairs[l][0]+1},{pairs[l][1]+1}}})}}$')
     axs[1].fill_between(time_plot, row - std, row + std, alpha=0.15)
 
 axs[1].set_xlabel('Time ($\mu s$)', fontsize=22)

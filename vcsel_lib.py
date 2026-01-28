@@ -346,14 +346,14 @@ class VCSEL:
                 if not injection_topology[p]:
                     continue
 
-                S0   = S[0, p]
-                phi0 = phi[0, p]
+                S0   = S[:, p]
+                phi0 = phi[:, p]
 
                 inj_cos = np.cos(omega_inj*t + inj_phase - phi0)
                 inj_sin = np.sin(omega_inj*t + inj_phase - phi0)
 
-                dS[0, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
-                dphi[0, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
+                dS[:, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
+                dphi[:, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
         elif nd.get("injection", False) and injection_topology is None:
             raise ValueError("Injection topology must be provided when injection is enabled.")
 
@@ -439,39 +439,144 @@ class VCSEL:
         # Return row if input was 1D
         return noise[0] if y_c.shape[0] == 1 else noise
     
-    def integrate(self, history, nd=None, progress=False):
-        """
-        Integrate the nondimensional VCSEL equations.
+    # def integrate(self, history, nd=None, progress=False):
+    #     """
+    #     Integrate the nondimensional VCSEL equations.
 
-        Integration scheme:
-        - Single-step trapezoidal (Heun) predictor-corrector for the deterministic dynamics.
-            * Predictor:   y* = y_n + dt * f(y_n)
-            * Corrector:   y_{n+1} = y_n + (dt/2) * (f(y_n) + f(y*))
-        - Euler-Maruyama (EM) treatment of additive noise:
-            noise is evaluated at the start of the step (y_n) and added after the trapezoid corrector.
-        - Delay terms are obtained directly from the stored history; no multistep bootstrap is required.
+    #     Integration scheme:
+    #     - Single-step trapezoidal (Heun) predictor-corrector for the deterministic dynamics.
+    #         * Predictor:   y* = y_n + dt * f(y_n)
+    #         * Corrector:   y_{n+1} = y_n + (dt/2) * (f(y_n) + f(y*))
+    #     - Euler-Maruyama (EM) treatment of additive noise:
+    #         noise is evaluated at the start of the step (y_n) and added after the trapezoid corrector.
+    #     - Delay terms are obtained directly from the stored history; no multistep bootstrap is required.
 
-        Parameters
-        ----------
-        history : np.ndarray, shape (n_cases, 6, 2*delay_steps)
-            Initial history for t in [-2*tau, 0] in nondimensional units.
-            The integrator requires at least 2*delay_steps columns to provide the
-            necessary delayed states during the first steps.
-        nd : dict or None
-            Nondimensional parameter dictionary (if None, uses self.nd).
-        progress : bool
-            If True, show a progress bar using tqdm.
+    #     Parameters
+    #     ----------
+    #     history : np.ndarray, shape (n_cases, 6, 2*delay_steps)
+    #         Initial history for t in [-2*tau, 0] in nondimensional units.
+    #         The integrator requires at least 2*delay_steps columns to provide the
+    #         necessary delayed states during the first steps.
+    #     nd : dict or None
+    #         Nondimensional parameter dictionary (if None, uses self.nd).
+    #     progress : bool
+    #         If True, show a progress bar using tqdm.
 
-        Returns
-        -------
-        t_dim : np.ndarray
-            Physical time array (seconds) of shape (steps,).
-        y : np.ndarray, shape (n_cases, 6, steps)
-            Time series of the nondimensional state for all cases.
-        freqs : np.ndarray, shape (n_cases, 2, steps)
-            Instantaneous phase time derivatives dphi/dt for both lasers
-            (columns correspond to laser 1 and laser 2).
-        """
+    #     Returns
+    #     -------
+    #     t_dim : np.ndarray
+    #         Physical time array (seconds) of shape (steps,).
+    #     y : np.ndarray, shape (n_cases, 6, steps)
+    #         Time series of the nondimensional state for all cases.
+    #     freqs : np.ndarray, shape (n_cases, 2, steps)
+    #         Instantaneous phase time derivatives dphi/dt for both lasers
+    #         (columns correspond to laser 1 and laser 2).
+    #     """
+
+    #     if nd is None:
+    #         nd = self.nd
+
+    #     n_cases = history.shape[0]
+    #     N_lasers = nd['kappa'].shape[-1]
+    #     dt = nd['dt']
+    #     steps = nd['steps']
+    #     delay_steps = nd['delay_steps']
+    #     noise_amplitude = nd['noise_amplitude']
+
+    #     # Prepare output arrays
+    #     y = np.zeros((n_cases, 3*N_lasers, steps))
+    #     derivs = np.zeros((n_cases, 3*N_lasers, steps))
+    #     freqs = np.zeros((n_cases, N_lasers, steps))
+    #     freqs[:,:,:2*delay_steps] = nd['delta_p'][None,:,None] * np.ones((n_cases, N_lasers, 2*delay_steps))
+    #     # phi_p = np.full(n_cases, nd['phi_p'])
+    #     phi_p = nd['phi_p']
+
+
+
+    #     # Require full delay history
+    #     if history.shape[2] < 2 * delay_steps:
+    #         raise ValueError("history too short for configured delay_steps")
+
+    #     # Put initial history into output buffer
+    #     y[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
+
+    #     # Start integration at the last history index
+    #     start_idx = 2 * delay_steps - 1
+    #     if start_idx >= steps:
+    #         t_dim = np.arange(steps) * dt * nd['tau_p']
+    #         return t_dim, y
+
+    #     # f_hist holds the last 4 derivative evaluations (for diagnostics)
+    #     f_hist = np.zeros((n_cases, 3*N_lasers, 4))
+
+    #     # Precompute delay index arrays for speed
+    #     idx_tau_arr = np.arange(steps) - delay_steps
+    #     idx_2tau_arr = np.arange(steps) - 2 * delay_steps
+    #     idx_tau_arr[idx_tau_arr < 0] = 0
+    #     idx_2tau_arr[idx_2tau_arr < 0] = 0
+
+    #     # ---------- MAIN TRAPEZOIDAL LOOP ----------
+    #     with tqdm(total=steps - 1 - start_idx, desc="Integrating",
+    #             disable=not progress) as pbar:
+
+    #         y_guess = np.empty((n_cases, 3*N_lasers))
+    #         y_c = np.empty((n_cases, 3*N_lasers))
+    #         tmp_noise = np.empty((n_cases, 3*N_lasers))
+
+    #         n = start_idx
+    #         while n < steps - 1:
+    #             y_n = y[:, :, n]
+
+    #             idx_tau = idx_tau_arr[n + 1]
+    #             idx_2tau = idx_2tau_arr[n + 1]
+    #             y_tau = y[:, :, idx_tau]
+    #             y_2tau = y[:, :, idx_2tau]
+
+    #             # --- Trapezoid predictor + corrector (deterministic)
+    #             f_n = self.f_nd(y_n, y_tau, y_2tau, n, phi_p, nd)[:, :3*N_lasers]
+    #             y_guess[:] = y_n + dt * f_n
+    #             f_guess = self.f_nd(y_guess, y_tau, y_2tau, n + 1, phi_p, nd)[:, :3*N_lasers]
+
+    #             y_c[:] = y_n + 0.5 * dt * (f_n + f_guess)
+    #             derivs[:, :, n] = 0.5 * (f_n + f_guess)
+
+    #             # --- Euler–Maruyama noise at y_n
+    #             if noise_amplitude:
+    #                 tmp_noise[:] = self.compute_noise_sample(y_n, noise_amplitude, dt, nd)
+    #             else:
+    #                 tmp_noise.fill(0.0)
+
+    #             y_next = y_c + tmp_noise
+
+    #             # ---- POSITIVITY FIX (minimal change) ----
+    #             eps = 1e-11
+    #             n_idx = np.arange(N_lasers) * 3 + 0
+    #             S_idx = np.arange(N_lasers) * 3 + 1
+    #             # clamp n and S only
+    #             # y_next[:, n_idx] = np.maximum(y_next[:, n_idx], eps)
+    #             y_next[:, S_idx] = np.maximum(y_next[:, S_idx], eps)
+
+
+
+    #             y[:, :, n + 1] = y_next
+
+    #             # --- Update f_hist and freqs
+    #             f_hist = np.roll(f_hist, shift=1, axis=2)
+    #             f_hist[:, :, 0] = derivs[:, :, n] + tmp_noise[:]/np.sqrt(dt)  # include noise contribution in derivative
+
+    #             freq_indices = np.arange(N_lasers) * 3 + 2  # indices of phi variables
+    #             freqs[:, :, n + 1] = f_hist[:, :, 0][:, freq_indices]
+
+
+    #             n += 1
+    #             if progress:
+    #                 pbar.update(1)
+
+    #     # Time array in physical units
+    #     t_dim = np.arange(steps) * dt * nd['tau_p']
+    #     return t_dim, y, freqs
+
+    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5):
 
         if nd is None:
             nd = self.nd
@@ -483,15 +588,15 @@ class VCSEL:
         delay_steps = nd['delay_steps']
         noise_amplitude = nd['noise_amplitude']
 
+        # --- θ parameter 
+        # 0.5 = Crank–Nicolson, 1.0 = implicit Euler
+
         # Prepare output arrays
         y = np.zeros((n_cases, 3*N_lasers, steps))
         derivs = np.zeros((n_cases, 3*N_lasers, steps))
         freqs = np.zeros((n_cases, N_lasers, steps))
-        freqs[:,:,:2*delay_steps] = nd['delta_p'][None,:,None] * np.ones((n_cases, N_lasers, 2*delay_steps))
-        # phi_p = np.full(n_cases, nd['phi_p'])
+        freqs[:, :, :2*delay_steps] = nd['delta_p'][None, :, None]
         phi_p = nd['phi_p']
-
-
 
         # Require full delay history
         if history.shape[2] < 2 * delay_steps:
@@ -500,31 +605,27 @@ class VCSEL:
         # Put initial history into output buffer
         y[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
 
-        # Start integration at the last history index
         start_idx = 2 * delay_steps - 1
         if start_idx >= steps:
             t_dim = np.arange(steps) * dt * nd['tau_p']
             return t_dim, y
 
-        # f_hist holds the last 4 derivative evaluations (for diagnostics)
-        f_hist = np.zeros((n_cases, 3*N_lasers, 4))
-
-        # Precompute delay index arrays for speed
+        # Precompute delay indices
         idx_tau_arr = np.arange(steps) - delay_steps
         idx_2tau_arr = np.arange(steps) - 2 * delay_steps
         idx_tau_arr[idx_tau_arr < 0] = 0
         idx_2tau_arr[idx_2tau_arr < 0] = 0
 
-        # ---------- MAIN TRAPEZOIDAL LOOP ----------
+        # ---------- MAIN LOOP ----------
         with tqdm(total=steps - 1 - start_idx, desc="Integrating",
                 disable=not progress) as pbar:
 
             y_guess = np.empty((n_cases, 3*N_lasers))
-            y_c = np.empty((n_cases, 3*N_lasers))
             tmp_noise = np.empty((n_cases, 3*N_lasers))
-
             n = start_idx
+
             while n < steps - 1:
+
                 y_n = y[:, :, n]
 
                 idx_tau = idx_tau_arr[n + 1]
@@ -532,49 +633,87 @@ class VCSEL:
                 y_tau = y[:, :, idx_tau]
                 y_2tau = y[:, :, idx_2tau]
 
-                # --- Trapezoid predictor + corrector (deterministic)
+                # # --- RHS at y_n
+                # f_n = self.f_nd(
+                #     y_n, y_tau, y_2tau, n, phi_p, nd
+                # )[:, :3*N_lasers]
+
+                # # --- Predictor (explicit Euler)
+                # y_guess[:] = y_n + dt * f_n
+
+                # # --- RHS at predicted state
+                # f_guess = self.f_nd(
+                #     y_guess, y_tau, y_2tau, n + 1, phi_p, nd
+                # )[:, :3*N_lasers]
+
+                # # --- θ-method update
+                # y_c = y_n + dt * ((1.0 - theta) * f_n + theta * f_guess)
+                # derivs[:, :, n] = (1.0 - theta) * f_n + theta * f_guess
+
+                # --- RHS at current step
                 f_n = self.f_nd(y_n, y_tau, y_2tau, n, phi_p, nd)[:, :3*N_lasers]
-                y_guess[:] = y_n + dt * f_n
-                f_guess = self.f_nd(y_guess, y_tau, y_2tau, n + 1, phi_p, nd)[:, :3*N_lasers]
 
-                y_c[:] = y_n + 0.5 * dt * (f_n + f_guess)
-                derivs[:, :, n] = 0.5 * (f_n + f_guess)
+                # --- initial guess (explicit Euler / θ-method predictor)
+                y_guess = y_n + dt * f_n  # works for any θ, good initial guess
 
-                # --- Euler–Maruyama noise at y_n
-                if noise_amplitude:
-                    tmp_noise[:] = self.compute_noise_sample(y_n, noise_amplitude, dt, nd)
-                else:
+                # --- fixed-point iteration for implicit part
+                tol = 1e-10
+                for p in range(max_iter):
+                    f_guess = self.f_nd(y_guess, y_tau, y_2tau, n + 1, phi_p, nd)[:, :3*N_lasers]
+                    
+                    # θ-method update in iteration
+                    y_new = y_n + dt * ((1.0 - theta) * f_n + theta * f_guess)
+                    
+                    # check convergence
+                    if np.max(np.abs(y_new - y_guess)) < tol:
+                        break
+                    
+                    y_guess[:] = y_new
+
+                y_c = y_guess
+
+        
+                derivs[:, :, n] = (1.0 - theta) * f_n + theta * f_guess
+
+                # --- Euler–Maruyama noise
+                if noise_amplitude is None:
                     tmp_noise.fill(0.0)
+                else:
+                    # Scalar or array handling
+                    if np.isscalar(noise_amplitude):
+                        na = noise_amplitude
+                    else:
+                        # Assume array-like
+                        na = noise_amplitude[n] if noise_amplitude.shape == (steps,) else noise_amplitude[0]
+
+                    tmp_noise[:] = self.compute_noise_sample(
+                        y_n, na, dt, nd
+                    )
 
                 y_next = y_c + tmp_noise
 
-                # ---- POSITIVITY FIX (minimal change) ----
+                # ---- POSITIVITY FIX ----
                 eps = 1e-11
-                n_idx = np.arange(N_lasers) * 3 + 0
                 S_idx = np.arange(N_lasers) * 3 + 1
-                # clamp n and S only
-                # y_next[:, n_idx] = np.maximum(y_next[:, n_idx], eps)
                 y_next[:, S_idx] = np.maximum(y_next[:, S_idx], eps)
 
-
+                # ---- PHASE WRAP (important in chaos)
+                phi_idx = np.arange(N_lasers) * 3 + 2
+                y_next[:, phi_idx] = np.mod(y_next[:, phi_idx], 2*np.pi)
 
                 y[:, :, n + 1] = y_next
 
-                # --- Update f_hist and freqs
-                f_hist = np.roll(f_hist, shift=1, axis=2)
-                f_hist[:, :, 0] = derivs[:, :, n] + tmp_noise[:]/np.sqrt(dt)  # include noise contribution in derivative
-
-                freq_indices = np.arange(N_lasers) * 3 + 2  # indices of phi variables
-                freqs[:, :, n + 1] = f_hist[:, :, 0][:, freq_indices]
-
+                # --- Frequencies (use weighted derivative)
+                freqs[:, :, n + 1] = derivs[:, phi_idx, n]
 
                 n += 1
                 if progress:
                     pbar.update(1)
 
-        # Time array in physical units
+
         t_dim = np.arange(steps) * dt * nd['tau_p']
         return t_dim, y, freqs
+
 
     
 
