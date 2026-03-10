@@ -213,5 +213,7 @@ results/
 examples/archive/
 examples/data/
 examples/HTML_files/
+examples/injection_tests/
+
 
 .png
