@@ -209,3 +209,9 @@ __marimo__/
 .DS_Store
 
 results/
+
+examples/archive/
+examples/data/
+examples/HTML_files/
+
+.png
