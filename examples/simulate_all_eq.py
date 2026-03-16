@@ -71,27 +71,27 @@ def unique_roots(results, nd, vcsel, residuals_func, tol=1e-1, max_residual=1e-4
 
 import matplotlib
 # matplotlib.use("Agg")  # disable GUI backend
-%matplotlib inline
+# %matplotlib inline
 import matplotlib.pyplot as plt
+# plt.ioff()
+cmap = plt.colormaps['jet']
+ 
+detuning = 0.01
 
-for detuning in np.linspace(0.0,10,50):
+for phi_p_loop in np.linspace(0.0,2,11):
 
 
     all_eqs = []
     all_order_params = []
     sorted_indices_arr = []
     max_num_eqs = 0
-    kappa_vals = np.linspace(0e9, 20e9, 500)
+    kappa_vals = np.linspace(0e9, 20e9, 100)
+
+ 
 
 
-
-
-
-
-
-
-    folder_name = f"./all_eq_3laser_symmetric_detuning_test"
-    os.makedirs(f"{folder_name}/detuning_{detuning:.2f}", exist_ok=True)
+    folder_name = f"./all_eq_2laser_symmetric_detuning_noise"
+    os.makedirs(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection", exist_ok=True)
     eqs = None
 
     for kappa_ind, kappa_c in enumerate(kappa_vals):
@@ -113,31 +113,41 @@ for detuning in np.linspace(0.0,10,50):
         I = eta * current_threshold * q / tau_n * (N0 + 1/(g0*tau_p))
 
         # Coupling / feedback / detuning
-        self_feedback = 0.0
+        # self_feedback = 0.5
         coupling = 1.0
-        noise_amplitude = 0.0
+        
         # detuning = 0.5
         delta = detuning * 2 * np.pi * 1e9
 
         # Time discretization
-        dt = 0.5 * tau_p#.1e-11
-        Tmax = 2e-7
+        dt = 0.5  * tau_p#.1e-11
+        Tmax = 2.1e-8
         steps = int(Tmax / dt)
         time_arr = np.linspace(0, Tmax, steps)
         delay_steps = int(tau / dt)
+
+        noise_amplitude = 0.0#VCSEL.cosine_ramp(time_arr, 50*tau, 50*tau, kappa_initial=0, kappa_final=1)
+        
+        #np.hstack([VCSEL.cosine_ramp(time_arr[:int(steps/2)], 20*tau, 50*tau, kappa_initial=0, kappa_final=1), VCSEL.cosine_ramp(time_arr[int(steps/2):], 150*tau, 20*tau, kappa_initial=1, kappa_final=1)]) 
+        
+        ##
+        # VCSEL.cosine_ramp(time_arr, 20*tau, 10*tau, kappa_initial=0, kappa_final=1)
 
         # Kappa ramp
 
 
         # kappa_arr = VCSEL.cosine_ramp(time_arr, 5*tau, 100*tau, kappa_initial=kappa_c, kappa_final=kappa_c)
 
-        N_lasers = 3
-        coupling_scheme = 'DECAYED'
+        N_lasers = 2
+        coupling_scheme = 'ATA'
         ramp_start = 0
         ramp_shape = 0.00000001
-        dx = 0.7
+        dx = 1.0
+        n_iterations = 1
 
-        kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
+        kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=kappa_c, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
+
+        self_feedback = 0.0
 
         phys = {
             'tau_p': tau_p,
@@ -148,11 +158,11 @@ for detuning in np.linspace(0.0,10,50):
             's': s,
             'beta': beta,
             'kappa_c_mat': kappa_arr[-1,:,:],
-            'phi_p_mat': np.ones(shape=(N_lasers,N_lasers))*np.pi,
+            'phi_p_mat': np.ones(shape=(N_lasers,N_lasers))*phi_p_loop*np.pi,
             'I': I,
             'q': q,
             'alpha': alpha,
-            'delta': np.sort(np.concatenate([delta*np.linspace(-1,1,N_lasers)])),  # detuning for each laser
+            'delta': np.sort(np.concatenate([delta*np.linspace(0,1,N_lasers)])),  # detuning for each laser
             'coupling': coupling,
             'self_feedback': self_feedback,
             'noise_amplitude': noise_amplitude,
@@ -170,18 +180,12 @@ for detuning in np.linspace(0.0,10,50):
         n_cases = len(nd['phi_p'])
 
 
-
-
-
-
-
-
-        # Example guesses — vary phase difference and omega to find multiple branches
-        # generate guesses over a range of phase differences (and a couple of omega seeds)
-        phase_count = 20
-        max_omg = 10 * 2 * np.pi * 1e9 * tau_p#np.max(np.abs(nd['delta_p']))
-        phase_vals = np.linspace(-2*np.pi, 2*np.pi, phase_count, endpoint=False)
-        omega_seeds = np.linspace(-max_omg, max_omg, 200)#np.linspace(-1*nd['delta_p'], 1*nd['delta_p'], 50)  # try zero and the detuning as initial omega guesses
+        # Example  guesses — vary phase difference and omega to find multiple branches
+        # generate guesses over a range of pha se differences (and a couple of omega seeds)
+        # phase_count = 20
+        # max_omg = 10 * 2 * np.pi * 1e9 * tau_p#np.max(np.abs(nd['delta_p']))
+        # phase_vals = np.linspace(-2*np.pi, 2*np.pi, phase_count, endpoint=False)
+        # omega_seeds = np.linspace(-max_omg, max_omg, 200)#np.linspace(-1*nd['delta_p'], 1*nd['delta_p'], 50)  # try zero and the detuning as initial omega guesses
 
         # guesses = []
         # for phi in phase_vals:
@@ -195,22 +199,22 @@ for detuning in np.linspace(0.0,10,50):
         if eqs is not None:
             for eq_pt in eqs:
                 guesses.append(np.concatenate([
-                    eq_pt[0:2*N_lasers],  # n1, S1, n2, S2, ...
-                    eq_pt[2*N_lasers:(3*N_lasers -1)],                      # φ1, φ2, ...
+                    eq_pt[0:N_lasers],  # n1, S1, n2, S2, ...
+                    eq_pt[N_lasers:(2*N_lasers -1)],                      # φ1, φ2, ...
                     np.array([eq_pt[-1]])                      # ω
                 ]))
         else:
             guesses = []
 
         print("Additional guesses...", len(guesses))
-        eq, results = vcsel.solve_equilibria(nd, guesses=guesses)
+        eq_max, results, _ = vcsel.solve_equilibria(nd, guesses=guesses)
         guesses = []
 
         results = np.array(results)
 
 
-
-        eqs = unique_roots(results, nd, vcsel, vcsel.residuals, tol=1e-3, max_residual=1e-6)
+        eqs = np.unique(results, axis=0)
+        # eqs = unique_roots(results, nd, vcsel, vcsel.residuals, tol=1e-3, max_residual=1e-6)
 
 
         if len(eqs) > max_num_eqs:
@@ -219,54 +223,110 @@ for detuning in np.linspace(0.0,10,50):
 
         if len(eqs) > 0:
 
+            phys['injection'] = False
+
+            phys['injection_topology'] = np.array([1,1])
+
+            phys['injected_strength'] = nd['sbar']  # baseline amplitude
+
+            # Target setpoints from equilibrium
+            omega_target = eq_max[-1]/(2*np.pi*1e9*tau_p)
+
+            phys['injected_phase_diff'] = np.linspace(0,2*np.pi,n_cases)#-phi_diff_target 
+
+            phys['injected_frequency'] = omega_target * np.ones_like(time_arr)
+        
+            peak_time = 50*tau
+            kappa_inj_width = 10*tau
+            kappa_inj_amp = 2 * kappa_c
+            phys['kappa_injection'] = kappa_inj_amp * np.exp(-((time_arr - peak_time) ** 2) / (2 * kappa_inj_width ** 2))
+
+
+
+
             all_eqs.append(eqs)
     
 
 
             # history = eqs[:,:,None].repeat(2*delay_steps, axis=2)  # repeat equilibrium across time/history axis
             length = 2*delay_steps
-            n_cases = eqs.shape[0]
+            
+            n_cases = eqs.shape[0]*n_iterations
             
             history = np.zeros((n_cases, 3*N_lasers, length))
             for k, eq in enumerate(eqs):
                 omega = eq[-1]
-                phase_diff = np.concatenate([[0.0], eq[2*N_lasers:(3*N_lasers -1)]])[:N_lasers]#np.concatenate([[0.0], eq[2*N_lasers:3*N_lasers-1]])
+                phase_diff = np.concatenate([[0.0], eq[2*N_lasers:(3*N_lasers -1)]])[:N_lasers]*np.ones(shape=(n_iterations,N_lasers))#np.concatenate([[0.0], eq[2*N_lasers:3*N_lasers-1]])
 
-                history[k, 0::3, :] = eq[0::2][:N_lasers].reshape(-1,1)*np.ones(shape=(N_lasers,length))         # n1
-                history[k, 1::3, :] = eq[1::2][:N_lasers].reshape(-1,1)*np.ones(shape=(N_lasers,length))            # S1 (nondimensional)
-                history[k, 2::3, :] = omega * nd['dt'] * np.arange(length)*np.ones(shape=(N_lasers,length))       # phi1
-                history[k, 2::3, :] += phase_diff.reshape(-1,1)    
+                history[k*n_iterations:(k+1)*n_iterations, 0::3, :] = eq[0::2][:N_lasers].reshape(-1,1)*np.ones(shape=(n_iterations,N_lasers,length))         # n1
+                history[k*n_iterations:(k+1)*n_iterations, 1::3, :] = eq[1::2][:N_lasers].reshape(-1,1)*np.ones(shape=(n_iterations,N_lasers,length))            # S1 (nondimensional)
+                history[k*n_iterations:(k+1)*n_iterations, 2::3, :] = omega * nd['dt'] * np.arange(length)*np.ones(shape=(n_iterations,N_lasers,length))       # phi1
+                history[k*n_iterations:(k+1)*n_iterations, 2::3, :] += phase_diff.reshape(n_iterations,N_lasers,1)  # add phase differences
 
             phys['kappa_c_mat'] = kappa_arr
             vcsel = VCSEL(phys)
             nd = vcsel.scale_params()
-            t, y, freqs = vcsel.integrate(history, nd=nd, progress=True)
+            nd['injected_phase_diff'] = np.random.uniform(0, 2*np.pi, size=n_cases)#np.linspace(0,2*np.pi,n_cases)
+
+            t, y, freqs = vcsel.integrate(history*1.0, nd=nd, progress=True, theta=0.8, max_iter=100)
+
+            y = y.reshape(eqs.shape[0], n_iterations, 3*N_lasers, y.shape[-1])
+
+            freqs = freqs.reshape(eqs.shape[0], n_iterations, N_lasers, freqs.shape[-1])
+
+            freqs_std = np.std(freqs, axis=1)
+            freqs = freqs.mean(axis=1)
+
+            S = y[:,:, 1::3,:]   # Extract photon numbers for all N_lasers
+            phi = y[:, :, 2::3, :]    # Extract phases for all N_lasers
+
 
             # Extract photon numbers and phases for all N_lasers
-            S = y[:, 1::3, :]  # shape (n_cases, N_lasers, length)
-            phi = y[:, 2::3, :]  # shape (n_cases, N_lasers, length)
+            # S = y[:, 1::3, :]  # shape (n_cases, N_lasers, length)
+            # phi = y[:, 2::3, :]  # shape (n_cases, N_lasers, length)
             
-            dphi = freqs[:, 0::3, :] * 1e-9/(2*np.pi*tau_p)  # shape (n_cases, N_lasers, length)
+            dphi = freqs * 1e-9/(2*np.pi*tau_p)  # shape (n_cases, N_lasers, length)
+            dphi_std = freqs_std * 1e-9/(2*np.pi*tau_p)
             
             # Set initial phase derivatives from equilibrium
             factor = 1e-9 / (2 * np.pi * tau_p)
             prev_vals = (eqs[:, -1] * factor)[:, np.newaxis]
             prev_dphi = np.repeat(prev_vals, 2 * delay_steps, axis=1)
             dphi[:, :, :2*delay_steps] = prev_dphi[:, np.newaxis, :]
-            
+            dphi_std[:, :, :2*delay_steps] = 0.0
             # Compute phase differences relative to first laser
-            phase_diff = np.unwrap(phi - phi[:, 0:1, :], axis=1)
+            phase_diff = np.unwrap(phi - phi[:, :, 0:1, :], axis=3)
             
             # Construct E-fields for all lasers
             E = np.sqrt(S) * (np.cos(phi) + 1j*np.sin(phi))  # shape (n_cases, N_lasers, length)
+        
+
             
-            # Total field intensity
-            full_E_tot = np.abs(np.sum(E, axis=1))**2  # shape (n_cases, length)
+            
+            # # Total field intensity
+            full_E_tot = np.abs(np.sum(E, axis=2))**2  # shape (n_cases, length)
+
+            full_E_tot_std = full_E_tot.std(axis=1)
+
+            full_E_tot = full_E_tot.mean(axis=1)
 
 
-            first_pt = full_E_tot[:, 0]
-            change = np.max(100*np.abs(full_E_tot - first_pt[:, np.newaxis]) / first_pt[:, np.newaxis], axis=1)
-            stable_indices = np.where(change < 5)[0]
+
+            S_hist = history[:, 1::3, :]
+            phi_hist = history[:, 2::3, :]
+            E_hist = np.sqrt(S_hist) * (np.cos(phi_hist) + 1j*np.sin(phi_hist))
+            E_tot_hist = np.abs(np.sum(E_hist, axis=1))**2
+
+
+
+            
+
+            # E_tot_hist_avg = np.mean(E_tot_hist, axis=-1)
+
+
+            # first_pt = full_E_tot[:, 0]
+            # change = np.max(100*np.abs(full_E_tot - first_pt[:, np.newaxis]) / first_pt[:, np.newaxis], axis=1)
+            # stable_indices = np.where(change < 5)[0]
             
             import matplotlib.pyplot as plt
             import matplotlib.cm as cm
@@ -278,31 +338,31 @@ for detuning in np.linspace(0.0,10,50):
             
             # Use first laser's phase derivative for plotting
             dphi1 = dphi[:, 0, :]
+            dphi1_std = dphi_std[:, 0, :]
             # Use phase difference between second and first laser
-            cos_pd = np.cos(phase_diff[:, 1, :]) if N_lasers > 1 else np.cos(phase_diff[:, 0, :])
-
-            # Compute the standard deviation of each row
-
-            # Get indices that sort by std
+            cos_pd = np.cos(np.unwrap(phi - phi[:, :, 0:1, :], axis=3)[:,:,1,:])
+            cos_pd_std = np.std(cos_pd, axis=1)
+            cos_pd = np.mean(cos_pd, axis=1)
             
 
+            order_param = vcsel.order_parameter(y[:,:,:int(steps/2)].mean(axis=1))
+
+            order_param = []
+
+            for i in range(n_iterations):
+                order_param.append(vcsel.order_parameter(y[:,i,:int(steps/2)]))
+
+            order_param = np.array(order_param).mean(axis=0)
+
+
+            order_param_eqs = vcsel.order_parameter(history)
             
-
-            
-
-            # compute time gradient of total intensity (d/dt |E1+E2|^2)
-            # point-to-point absolute differences and average per trajectory
-            # max_pt = np.max(full_E_tot[:, -100000:], axis=1)
-            # min_pt = np.min(full_E_tot[:, -100000:], axis=1)
-            # pt_range = max_pt - min_pt
-
-            order_param = vcsel.order_parameter(y[:,:,-int(steps/2):])
-            sorted_indices = np.argsort((order_param-0.5)**2)
+            sorted_indices = np.argsort(np.abs(order_param-0.5))
             sorted_indices_arr.append(sorted_indices)
             order_param = order_param#[sorted_indices]
             full_E_tot = full_E_tot#[sorted_indices, :]
             dphi1 = dphi1#[sorted_indices, :]
-            # phase_diff = phase_diff
+            phase_diff = phase_diff
             # cos_pd = np.cos(phase_diff)#[sorted_indices, :])
 
             all_order_params.append(order_param)
@@ -313,19 +373,45 @@ for detuning in np.linspace(0.0,10,50):
 
 
             from IPython.display import clear_output
-            clear_output(wait=True)
+            # clear_output(wait=True)
             fig, axs = plt.subplots(3, 1, figsize=(14, 14), dpi=200, sharex=True, clear=True)
             plot_flag = 0
+            subsample = 10  # subsample factor
+
+
+
+            del history
+            del nd
+            del phys
+            del results
+            # del eqs  
+            import gc
+            gc.collect()
+            vcsel.f_nd = None
+            vcsel.compute_noise_sample = None
+            vcsel.__dict__.clear()
+            del vcsel
+            del (
+                y, freqs, freqs_std, dphi, dphi_std,
+                phi, S, E, phase_diff, E_hist
+                
+            )
+
             for j in range(num_traj):
             # for j in stable_indices:
 
+                
+
                 k = sorted_indices[j]
+
+                # if np.any(np.abs((full_E_tot[k][int(steps/4)]-full_E_tot[k][0])/full_E_tot[k][0]) > 0.1):
+                #     continue
 
                 if not plot_flag:
                     axs[0].set_xlabel('Time ($\mu s$)', fontsize=22)
                     axs[0].set_ylabel(r'$\dot{\phi}$ (GHz)', fontsize=22)
                     # axs[0].legend(fontsize=15, loc='lower left')
-                    axs[0].set_ylim(-10,10)
+                    axs[0].set_ylim(-5,5)
                     axs[0].grid(True, alpha=0.2)
                     axs[0].axvspan(0, 2 * delay_steps * dt * 1e6, color='gray', alpha=0.2)
                     axs[0].tick_params(axis='both', which='major', labelsize=18)
@@ -336,38 +422,48 @@ for detuning in np.linspace(0.0,10,50):
 
                 
 
-                time_plot = time_arr[:-1] * 1e6
-                E_tot = full_E_tot[k, :]
+                time_plot = time_arr[:-1][::subsample] * 1e6
+                E_tot = full_E_tot[k, ::subsample]
+                E_tot_std = full_E_tot_std[k, ::subsample]
 
                 # Transparency: lower for oscillatory traces
                 color = colors[k]
-                alpha_t=1
+                alpha_t=1.0
 
                 # --- Plot phase derivatives ---
 
-                axs[0].plot(time_plot, dphi1[k, :-1], color=color, alpha=alpha_t,
+                
+                # axs[0].fill_between(time_plot, dphi1[k, :-1] - dphi1_std[k, :-1], 
+                #                      dphi1[k, :-1] + dphi1_std[k, :-1], 
+                #                      color=color, alpha=0.1, label='_nolegend_', zorder=j-1)
+                axs[0].plot(time_plot, dphi1[k, :-1][::subsample], color=color, alpha=alpha_t,
                                 label='_nolegend_', linewidth=2, zorder=j)
 
                 # --- Plot phase difference ---
-                axs[1].plot(time_plot, cos_pd[k,:-1], color=color,
+                # axs[1].fill_between(time_plot, cos_pd[k,:-1] - cos_pd_std[k,:-1], 
+                #                      cos_pd[k,:-1] + cos_pd_std[k,:-1], 
+                #                      color=color, alpha=0.1, label='_nolegend_', zorder=j-1)
+                axs[1].plot(time_plot, cos_pd[k,:-1][::subsample], color=color,
                             label='_nolegend_', linewidth=2, alpha=alpha_t, zorder=j)
+                
                 axs[1].set_xlabel('Time ($\mu s$)', fontsize=22)
-                axs[1].set_ylabel('Phase Difference', fontsize=22)
+                axs[1].set_ylabel(r'$\cos(\Delta \phi)$', fontsize=22)
                 axs[1].set_ylim(-1,1)
                 axs[1].grid(True, alpha=0.2)
                     
                 axs[1].tick_params(axis='both', which='major', labelsize=18)
 
                 # --- Plot intensity ---
-                time_plot_full = time_arr[:] * 1e6
-
+                time_plot_full = time_arr[::subsample] * 1e6
+                # axs[2].fill_between(time_plot_full, E_tot - E_tot_std, E_tot + E_tot_std, 
+                #                      color=color, alpha=0.1, label='_nolegend_', zorder=j-1)
                 axs[2].plot(time_plot_full, E_tot, color=color, alpha=alpha_t,
                                 label='_nolegend_', linewidth=2, zorder=j)
 
                 axs[2].set_xlabel('Time ($\mu s$)', fontsize=22)
                 axs[2].grid(True, alpha=0.2)
                     
-                axs[2].set_ylim(-5, 50)
+                axs[2].set_ylim(-5, 20)
                 axs[2].tick_params(axis='both', which='major', labelsize=18)
                 axs[2].set_ylabel(r'$|E_{tot}|^2$', fontsize=22)
                 # # Twin axis for kappa
@@ -380,22 +476,18 @@ for detuning in np.linspace(0.0,10,50):
                 # ax2.tick_params(axis='x', labelsize=24, width=2, length=8)
                 
             plt.tight_layout()
-            # plt.savefig(f'./all_eq_delta0.5_3laser_symmetric_decayed0.7/{kappa_ind}.png')
-            # plt.savefig(f'./stable_eqs_delta0.5/{kappa_ind}.png')
-            plt.savefig(f"{folder_name}/detuning_{detuning:.2f}/{kappa_ind}.png")
-            plt.show()
+            plt.savefig(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection/{kappa_ind}.png")
+            # plt.show()
+            fig.clf()
             plt.close(fig)
-            # plt.close('all')
-            # del vcsel
-            # del history
-            # del y
-            # del freqs
-            # del nd
-            # del phys
-            # del results
-            # del eqs
-            # import gc
-            # gc.collect()
+            del fig
+            plt.close('all')
+
+            del (full_E_tot, full_E_tot_std,
+                colors)
+            
+            
+            
 
             
 
@@ -404,10 +496,8 @@ for detuning in np.linspace(0.0,10,50):
             all_eqs.append(np.nan*np.ones((1, 2*N_lasers + (N_lasers - 1) + 1), dtype=np.float64))
             all_order_params.append(np.array([np.nan], dtype=np.float64))
 
-
-
-    
-    %matplotlib inline
+#%%
+    # %matplotlib inline
     import matplotlib.pyplot as plt
 
     for k, eqs in enumerate(all_eqs):
@@ -460,11 +550,11 @@ for detuning in np.linspace(0.0,10,50):
     kappa_plot = kappa_vals * 1e-9                     # ns^-1
 
 
-    cmap = plt.colormaps['jet']
+    
     fig, ax = plt.subplots(figsize=(9, 6), dpi=300)
 
     for b in range(len(kappa_plot)):
-        Et = E_tot[b,:]
+        Et = omega[b,:]/(2*np.pi*1e9*tau_p)
         E_mask =  np.isfinite(Et)
         if not np.any(E_mask):
             continue
@@ -493,10 +583,11 @@ for detuning in np.linspace(0.0,10,50):
     cbar.set_label('Order parameter', fontsize=20)
     cbar.ax.tick_params(labelsize=20)
     plt.xlim(-0.1,20.5)
-    plt.ylim(-0.5,60)
+    plt.ylim(-12,12)
     
     plt.tight_layout()
-    plt.savefig(f'{folder_name}/branches/detuning_{detuning:.2f}_equilibrium_branches.png')
+    plt.savefig(f'{folder_name}/branches/detuning_{detuning:.2f}_equilibrium_branches_self_{self_feedback:.2f}_phi_p{phi_p_loop:.2f}pi.png')
     plt.show()
     plt.close(fig)
+    break
             
