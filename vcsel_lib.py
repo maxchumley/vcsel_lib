@@ -13,7 +13,7 @@ This module is intended for research/teaching use and keeps a clear separation
 between physical parameters (SI units) and nondimensional parameters used by
 the integrator.
 
-Author: Max Chumley with documentation assistance from GitHub Copilot
+Author: Max Chumley with documentation assistance from GitHub Copilot and OpenAI CODEX
 """
 
 import numpy as np
