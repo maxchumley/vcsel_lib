@@ -34,7 +34,7 @@ def simulate_parallel(task):
 
     vcsel = VCSEL(phys)
     nd = vcsel.scale_params()
-    history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=len(nd['phi_p']))
+    history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=len(nd['phi_p']))
     t, y, _ = vcsel.integrate(history, nd=nd, progress=False, theta=0.5, max_iter=1)
     
     order_param_row = vcsel.order_parameter(y[:,:,-int(len(t)/2):])
@@ -237,7 +237,6 @@ if __name__ == "__main__":
 
 
     
-
 
 
 

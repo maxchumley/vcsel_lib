@@ -162,7 +162,7 @@ for detuning in np.linspace(0.0,5,11):
 
 
             if k == 0:
-                history, freq_history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+                history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
                 # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
                 # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
 
@@ -314,7 +314,7 @@ for detuning in np.linspace(0.0,5,11):
             plt.show()
             plt.close(fig)
             i += 1
-            print(f"TRIAL: {i}")
+            print(f"TRIAL: {i}, Detuning: {detuning:.1f} GHz, final_kappa: {final_kappa/1e9:.1f} ns^-1")
         else:
             print(f"Skipping plot for final_kappa={final_kappa/1e9:.1f} due to shape mismatch: avg_freq_diff.shape={avg_freq_diff.shape}")
 

@@ -144,7 +144,7 @@ nd = vcsel.scale_params()
 n_cases = len(nd['phi_p'])
 
 
-history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
 
 
@@ -191,7 +191,7 @@ for k in range(len(kappa_c)-1):
     nd    = vcsel.scale_params()
     if k == 0:
         prev_dphi = np.ones((N_lasers, 2*delay_steps))*phys['delta'].reshape((N_lasers,1)) /(2*np.pi*1e9)
-        history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+        history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
     t, y_scaled, freqs = vcsel.integrate(history, nd=nd, progress=True)
 
     y = y_scaled.copy()
@@ -362,4 +362,3 @@ plt.legend(fontsize=16, loc='upper left')
 plt.tight_layout()
 # plt.savefig('./backward_extrema_3_DECAYED.png', transparent=True)
 plt.show()
-

@@ -142,7 +142,7 @@ for k in range(0, len(kappa_c)):
     nd = vcsel.scale_params()
     nd['phi_p'] = np.array(phys['phi_p_mat'])
     if k ==0:
-        history, freq_history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+        history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
     # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
     # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
 
@@ -371,4 +371,3 @@ plt.legend(fontsize=16, loc='upper left')
 plt.tight_layout()
 plt.savefig('../results/forward_extrema_FR_cont_0.5ghz_decayed_3laser.png', transparent=True)
 plt.show()
-

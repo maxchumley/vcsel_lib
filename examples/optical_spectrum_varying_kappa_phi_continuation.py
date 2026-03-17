@@ -126,7 +126,7 @@ for p in range(1):
     n_cases = len(nd['phi_p'])
 
 
-    history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+    history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
 
 

@@ -118,7 +118,7 @@ nd = vcsel.scale_params()
 n_cases = len(nd['phi_p'])
 
 
-history, freq_hist,_ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+history, freq_hist, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
 #%%
  
@@ -209,7 +209,6 @@ for k in range(0, len(kappa_c)):
         plt.close(fig)
 
     history = y_scaled[:,:,-2*delay_steps:]
-
 
 
 

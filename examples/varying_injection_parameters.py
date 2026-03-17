@@ -51,8 +51,8 @@ self_feedback = 0.0
 coupling = 1.0
 noise_amplitude = 0.0
 
-N_lasers = 2
-coupling_scheme = 'ATA'
+N_lasers = 3
+coupling_scheme = 'NN'
 dx = 0.7
 
 detuning = 3.0# detuning (GHz) 
@@ -65,7 +65,7 @@ omega0 = 2*np.pi*c/lam
 results = None
 
 
-for detuning in np.linspace(2,5,50):
+for detuning in np.linspace(4,5,50):
     delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
     # Create evenly distributed detuning for both even and odd N_lasers
     delta_dist = np.sort(np.concatenate([delta/2 * np.linspace(-1, 1, N_lasers)]))
@@ -75,7 +75,7 @@ for detuning in np.linspace(2,5,50):
 
     phi_p = 0#np.pi
 
-    dt = 2*tau_p# 1 ps
+    dt = 1*tau_p# 1 ps
     Tmax = 1.5e-6
     steps = int(Tmax / dt)
     time_arr = np.linspace(0, Tmax, steps)
@@ -175,7 +175,7 @@ for detuning in np.linspace(2,5,50):
 
     for k in range(0, n_kappa):
 
-        kappa_inj_width = 5 * tau          # width (s) — change this to control the Gaussian spread 
+        kappa_inj_width = 10 * tau          # width (s) — change this to control the Gaussian spread 
         kappa_inj_amp_peak = 2*final_kappa
         kappa_inj_amp = np.linspace(kappa_inj_amp_peak, kappa_inj_amp_peak, n_cases)
 
@@ -207,13 +207,13 @@ for detuning in np.linspace(2,5,50):
                 #         np.array([eq_pt[-1]])                      # ω
                 #     ]))
 
-            history, freq_history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+            history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
             # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
             # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
 
             nd['phi_p'] = np.array([phys['phi_p_mat'][0]])[0,:,:]
             counts = {'phase_count': 20, 'freq_count': 200}
-            eq, results = vcsel.solve_equilibria(nd, counts=counts, guesses=guesses)
+            eq, results, E_tot = vcsel.solve_equilibria(nd, counts=counts, guesses=guesses)
             guesses = []
 
             nd['phi_p'] = phys['phi_p_mat'][0]
@@ -246,6 +246,7 @@ for detuning in np.linspace(2,5,50):
                 phys['injected_frequency'] = np.zeros(len(time_arr))
                 
                 # Create Gaussian peaks for each stable equilibrium
+                stable_indices = stable_indices[np.argsort(E_tot[stable_indices])]
                 for peak_idx, stable_idx in enumerate(stable_indices):
                     eq = results[stable_idx]
                     
@@ -344,7 +345,7 @@ for detuning in np.linspace(2,5,50):
         # dphi_max = np.max(dphi[:, :, :-1])
         # dphi_range = dphi_max - dphi_min
         # axs[0].set_ylim(dphi_min - 0.1 * dphi_range, dphi_max + 0.1 * dphi_range)
-        axs[0].set_ylim(-10,5) 
+        axs[0].set_ylim(-12,5) 
         axs[0].grid(True, alpha=0.2)
         axs[0].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
         axs[0].tick_params(axis='both', which='major', labelsize=18)
@@ -388,10 +389,12 @@ for detuning in np.linspace(2,5,50):
             axs[2].plot(time_plot_full, E_i_mean, linewidth=1.5, label=f'$|E_{i+1}|^2$')
             axs[2].fill_between(time_plot_full, E_i_mean - E_i_std, E_i_mean + E_i_std, alpha=0.15)
 
+        
+
         axs[2].set_xlabel('Time ($\mu$s)', fontsize=22)
         axs[2].grid(True, alpha=0.2)
         axs[2].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
-        axs[2].set_ylim(-5, 40)
+        axs[2].set_ylim(-2, np.max(E_tot_mean+E_tot_std)*1.1)
         axs[2].tick_params(axis='both', which='major', labelsize=18)
         if N_lasers <= 6:
             axs[2].legend(loc='upper left', fontsize=16, ncol=2)
@@ -519,4 +522,3 @@ plt.legend(fontsize=16, loc='upper left')
 plt.tight_layout()
 plt.savefig('./forward_extrema_FR_cont_gaussian_0.2ghz.png', transparent=True)
 plt.show()
-

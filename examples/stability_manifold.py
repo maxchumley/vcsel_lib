@@ -24,8 +24,8 @@ import matplotlib.pyplot as plt
 plt.ioff()
 cmap = plt.colormaps['jet']
 
-detuning = 0.1
-N_lasers = 2
+detuning = 4.0
+N_lasers = 3
 delta = detuning * 2 * np.pi * 1e9
 delta = np.sort(np.concatenate([delta/2*np.linspace(-1,1,N_lasers)]))
 # print(delta/(2*np.pi*1e9))
@@ -46,9 +46,6 @@ for phi_p_loop in phi_p_arr:
     kappa_vals = np.linspace(0.0e9, 20e9, 100)
 
     
-
-
-
 
     folder_name = f"./all_eq_2laser_symmetric_detuning_noise"
     # os.makedirs(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection", exist_ok=True)
@@ -89,7 +86,7 @@ for phi_p_loop in phi_p_arr:
         noise_amplitude = 0.0
 
         
-        coupling_scheme = 'ATA'
+        coupling_scheme = 'NN'
         ramp_start = 0
         ramp_shape = 0.00000001
         dx = 1.0
@@ -136,7 +133,7 @@ for phi_p_loop in phi_p_arr:
                 if np.any(np.isnan(eq_pt)):
                     continue
                 guesses.append(np.concatenate([
-                    eq_pt[0:N_lasers],  # S1, S2, ...
+                    eq_pt[1::2][:N_lasers],  # S1, S2, ...
                     eq_pt[2*N_lasers:3*N_lasers-1],                      # φ1, φ2, ...
                     np.array([eq_pt[-2]])                      # ω
                 ]))
@@ -144,9 +141,9 @@ for phi_p_loop in phi_p_arr:
             guesses = []
 
         # print("Additional guesses...", len(guesses))
-        counts = {'phase_count': 10, 'freq_count': 200}
+        counts = {'phase_count': 10, 'freq_count': 100}
 
-        eq_max, eqs = vcsel.solve_equilibria(nd, guesses=guesses, counts=counts)
+        eq_max, eqs, _ = vcsel.solve_equilibria(nd, guesses=guesses, counts=counts)
         guesses = []
 
         if len(eqs) > max_num_eqs:
@@ -154,19 +151,19 @@ for phi_p_loop in phi_p_arr:
 
         tmp_stable = []
 
-        start = time.time()
-        N = 30
-        n_eigenvalues = N*3*N_lasers - 1
-        # print(len(eqs), n_eigenvalues)
-        tmp_stable = Parallel(n_jobs=-1)(
-            delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
-            for eq_pt in eqs
-        )
-        end = time.time() - start
-        avg_time += end
-        tmp_stable = [result[0] for result in tmp_stable]
+        # start = time.time()
+        # N = 30
+        # n_eigenvalues = N*3*N_lasers - 1
+        # # print(len(eqs), n_eigenvalues)
+        # tmp_stable = Parallel(n_jobs=-1)(
+        #     delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
+        #     for eq_pt in eqs
+        # )
+        # end = time.time() - start
+        # avg_time += end
+        # tmp_stable = [result[0] for result in tmp_stable]
 
-        # tmp_stable = [1 for eq in eqs]
+        tmp_stable = [1 for eq in eqs]
         
 
         eqs = np.column_stack([eqs, np.array(tmp_stable)])  # add stability as last column
@@ -270,6 +267,7 @@ for phi_p_loop in phi_p_arr:
     plt.close(fig)
 
     all_data.append(all_eqs)
+    break
 
 
 
@@ -322,8 +320,8 @@ np.save(f'./data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy'
 
 #%%
 # Load dictionary and extract data
-N_lasers = 2
-detuning = 0.1
+N_lasers = 3
+detuning = 4.0
 save = False
 data_dict = np.load(f'./data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', allow_pickle=True).item()
 all_data_stacked = data_dict['all_data']
