@@ -51,11 +51,9 @@ self_feedback = 0.0
 coupling = 1.0
 noise_amplitude = 0.0
 
-N_lasers = 3
-coupling_scheme = 'NN'
+N_lasers = 2
+coupling_scheme = 'ATA'
 dx = 0.7
-
-detuning = 3.0# detuning (GHz) 
 
 lam = 910e-9
 omega0 = 2*np.pi*c/lam
@@ -65,227 +63,212 @@ omega0 = 2*np.pi*c/lam
 results = None
 
 
-for detuning in np.linspace(4,5,50):
-    delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
-    # Create evenly distributed detuning for both even and odd N_lasers
-    delta_dist = np.sort(np.concatenate([delta/2 * np.linspace(-1, 1, N_lasers)]))
+# for detuning in np.linspace(4,5,50):
+detuning = 4.0
+delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
+# Create evenly distributed detuning for both even and odd N_lasers
+delta_dist = np.sort(np.concatenate([delta/2 * np.linspace(-1, 1, N_lasers)]))
 
 
 
 
-    phi_p = 0#np.pi
+phi_p = 0#np.pi
 
-    dt = 1*tau_p# 1 ps
-    Tmax = 1.5e-6
-    steps = int(Tmax / dt)
-    time_arr = np.linspace(0, Tmax, steps)
-    delay_steps = int(tau / dt)
-    segment_len = int(steps/2)
-    segment_start = int(steps/2)
+dt = 1*tau_p# 1 ps
+Tmax = 1.5e-6
+steps = int(Tmax / dt)
+time_arr = np.linspace(0, Tmax, steps)
+delay_steps = int(tau / dt)
+segment_len = int(steps/2)
+segment_start = int(steps/2)
 
-    n_kappa = 1
-    ramp_start = 10
-    ramp_shape = 20
+n_kappa = 50
+ramp_start = 10
+ramp_shape = 20
 
-    kappa_max = 15e9
+final_kappa_arr = np.linspace(0e9,20e9,50)
 
-    kappa_c = np.linspace(5e9,5e9,n_kappa)
-
-    final_kappa = 20e9#np.linspace(0e9,20e9,500)[448]
-
-    kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=final_kappa, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
+kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=final_kappa_arr[0], N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
 
 
 
 
 
-    n_cases = 1
+n_cases = 1
 
-    phi_p_vals = np.array([0.0])
+phi_p_vals = np.array([0.0])
 
-    phys = {
-        'tau_p': tau_p,
-        'tau_n': tau_n,
-        'g0': g0,
-        'N0': N0,
-        'N_bar': N0 + 1/(g0*tau_p),
-        's': s,
-        'beta': beta,
-        'kappa_c_mat': None,
-        'phi_p_mat': np.ones(shape=(n_cases,N_lasers,N_lasers))*phi_p_vals[:,None,None],
-        'I': I,
-        'q': q,
-        'alpha': alpha,
-        'delta': delta_dist,
-        'coupling': coupling,     
-        'self_feedback': self_feedback, 
-        'noise_amplitude': noise_amplitude,
-        'dt': dt,
-        'Tmax': Tmax,
-        'tau': tau,
-        'N_lasers': N_lasers,
-        'sparse': False
-    }
+phys = {
+    'tau_p': tau_p,
+    'tau_n': tau_n,
+    'g0': g0,
+    'N0': N0,
+    'N_bar': N0 + 1/(g0*tau_p),
+    's': s,
+    'beta': beta,
+    'kappa_c_mat': None,
+    'phi_p_mat': np.ones(shape=(n_cases,N_lasers,N_lasers))*phi_p_vals[:,None,None],
+    'I': I,
+    'q': q,
+    'alpha': alpha,
+    'delta': delta_dist,
+    'coupling': coupling,     
+    'self_feedback': self_feedback, 
+    'noise_amplitude': noise_amplitude,
+    'dt': dt,
+    'Tmax': Tmax,
+    'tau': tau,
+    'N_lasers': N_lasers,
+    'sparse': False
+}
+
+phys['kappa_c_mat'] = kappa_arr[-1,:,:]
+
+
+
+
+phys['injection'] = False
+
+# n_kappa = len(kappa_c)-1
+
+# inj_freqs = np.linspace(-3,3,n_kappa)
+
+# Gaussian kappa injection centered at peak_time with controllable width
+
+peak_time = 200*tau                     # center (s), e.g. peak = 3*tau above
+#30e9
+
+
+extrema = []
+S_idx   = [3*i + 1 for i in range(N_lasers)]
+phi_idx = [3*i + 2 for i in range(N_lasers)]
+# --- Loop over segments of kappa --- 
+# max_tau_inj_width = 200
+
+inj_phases = np.linspace(0,2*np.pi,n_cases)
+
+
+
+for k in range(0, n_kappa):
+
+    final_kappa = final_kappa_arr[k]
+
+
+    kappa_inj_width = 10 * tau          # width (s) — change this to control the Gaussian spread 
+    kappa_inj_amp_peak = 5 *final_kappa
+    kappa_inj_amp = np.linspace(kappa_inj_amp_peak, kappa_inj_amp_peak, n_cases)
+
+    # Slice the ramp for this segment
+    if k > 0:
+        kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=final_kappa, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
 
     phys['kappa_c_mat'] = kappa_arr[-1,:,:]
-
-    # prev_dphi1 = np.zeros(2*delay_steps)
-    # prev_dphi2 = np.ones(2*delay_steps) * phys['delta'][1] /(2*np.pi*1e9)
-
-    # kappa_c = np.linspace(0,kappa_max,n_kappa)
-    # prev_E1 = []
-    # prev_E2 = []
-    # prev_E_tot = []
-    # prev_E_tot_tau = []
-    # prev_dphi1_list = [] 
-    # prev_dphi2_list = []
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
 
 
-    # if eq is not None:
-    #     prev_dphi1 = eq[-1] * 1e-9/(2*np.pi*tau_p) * np.ones(2*delay_steps)
-    #     prev_dphi2 = eq[-1] * 1e-9/(2*np.pi*tau_p) * np.ones(2*delay_steps)
-    # else:
-    #     prev_dphi1 = np.zeros(2*delay_steps)
-    #     prev_dphi2 = np.ones(2*delay_steps) * delta /(2*np.pi*1e9)
+    # if k == 0:
+    if results is not None:
+        results = np.unique(results, axis=0)
+        for eq_pt in results:
+            if np.any(np.isnan(eq_pt)):
+                continue
+            guesses.append(np.concatenate([
+                eq_pt[1::2][:N_lasers],  # S1, S2, ...
+                eq_pt[2*N_lasers:3*N_lasers-1],                      # φ1, φ2, ...
+                np.array([eq_pt[-1]])                      # ω
+            ]))
+    else:
+        guesses = []
+        # guesses.append(np.concatenate([
+        #         eq_pt[1::2][:N_lasers],  # S1, S2, ...
+        #         eq_pt[2*N_lasers:3*N_lasers-1],                      # φ1, φ2, ...
+        #         np.array([eq_pt[-1]])                      # ω
+        #     ]))
 
+    history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+    # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
+    # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
 
+    nd['phi_p'] = np.array([phys['phi_p_mat'][0]])[0,:,:]
+    counts = {'phase_count': 20, 'freq_count': 200}
+    eq, results, E_tot = vcsel.solve_equilibria(nd, counts=counts, guesses=guesses)
+    guesses = []
 
-    phys['injection'] = False
+    if eq is None:
+        print(f"No equilibria found for kappa = {final_kappa*1e-9:.2f} ns^-1")
+        
 
-    # n_kappa = len(kappa_c)-1
-
-    # inj_freqs = np.linspace(-3,3,n_kappa)
-
-    # Gaussian kappa injection centered at peak_time with controllable width
-
-    peak_time = 200*tau                     # center (s), e.g. peak = 3*tau above
-    #30e9
-
-
-    extrema = []
-    S_idx   = [3*i + 1 for i in range(N_lasers)]
-    phi_idx = [3*i + 2 for i in range(N_lasers)]
-    # --- Loop over segments of kappa --- 
-    # max_tau_inj_width = 200
-    n_iterations = 100
-
-    inj_phases = np.linspace(0,2*np.pi,n_cases)
+    nd['phi_p'] = phys['phi_p_mat'][0]
 
 
 
-    for k in range(0, n_kappa):
+    if eq is not None:
+        phys['injection'] = True
 
-        kappa_inj_width = 10 * tau          # width (s) — change this to control the Gaussian spread 
-        kappa_inj_amp_peak = 2*final_kappa
-        kappa_inj_amp = np.linspace(kappa_inj_amp_peak, kappa_inj_amp_peak, n_cases)
+        injection_array = np.zeros(N_lasers)
+        center_idx = (N_lasers-1) // 2
+        injection_array[center_idx] = 1
+        phys['injection_topology'] = injection_array
 
-        # Slice the ramp for this segment
-        if k > 0:
-            kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=final_kappa, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
+        phys['injected_strength'] = nd['sbar']  # baseline amplitude
 
-        phys['kappa_c_mat'] = kappa_arr[-1,:,:]
-        vcsel = VCSEL(phys)
-        nd = vcsel.scale_params()
-
-
-        if k == 0:
-            if results is not None:
-                results = np.unique(results, axis=0)
-                for eq_pt in results:
-                    if np.any(np.isnan(eq_pt)):
-                        continue
-                    guesses.append(np.concatenate([
-                        eq_pt[1::2][:N_lasers],  # S1, S2, ...
-                        eq_pt[2*N_lasers:3*N_lasers-1],                      # φ1, φ2, ...
-                        np.array([eq_pt[-1]])                      # ω
-                    ]))
-            else:
-                guesses = []
-                # guesses.append(np.concatenate([
-                #         eq_pt[1::2][:N_lasers],  # S1, S2, ...
-                #         eq_pt[2*N_lasers:3*N_lasers-1],                      # φ1, φ2, ...
-                #         np.array([eq_pt[-1]])                      # ω
-                #     ]))
-
-            history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
-            # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
-            # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
-
-            nd['phi_p'] = np.array([phys['phi_p_mat'][0]])[0,:,:]
-            counts = {'phase_count': 20, 'freq_count': 200}
-            eq, results, E_tot = vcsel.solve_equilibria(nd, counts=counts, guesses=guesses)
-            guesses = []
-
-            nd['phi_p'] = phys['phi_p_mat'][0]
-
-
-
-        if eq is not None:
-            phys['injection'] = True
-
-            injection_array = np.zeros(N_lasers)
-            center_idx = (N_lasers-1) // 2
-            injection_array[center_idx] = 1
-            phys['injection_topology'] = injection_array
-
-            phys['injected_strength'] = nd['sbar']  # baseline amplitude
-
-            tmp_stable = []
-            N = 30
-            n_eigenvalues = N*3*N_lasers - 1
-            # print(len(eqs), n_eigenvalues)
-            tmp_stable = Parallel(n_jobs=-1)(
-                delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
-                for eq_pt in results
-            )
-            tmp_stable = [result[0] for result in tmp_stable]
-            if tmp_stable.count(1) > 0:
-                stable_indices = np.where(np.array(tmp_stable) == 1.0)[0]
-                # Initialize injection arrays
-                phys['kappa_injection'] = np.zeros((n_cases, len(time_arr)))
-                phys['injected_frequency'] = np.zeros(len(time_arr))
-                
-                # Create Gaussian peaks for each stable equilibrium
-                stable_indices = stable_indices[np.argsort(E_tot[stable_indices])]
-                for peak_idx, stable_idx in enumerate(stable_indices):
-                    eq = results[stable_idx]
-                    
-                    # Target setpoints from equilibrium
-                    phi_diff_target = eq[-2]
-                    omega_target = eq[-1]/(2*np.pi*1e9*tau_p)
-                    
-                    # Peak time for this equilibrium (separated by 100*tau)
-                    current_peak_time = peak_time + peak_idx * 300 * tau
-                    
-                    # Add Gaussian peak centered at current_peak_time
-                    gaussian_peak = kappa_inj_amp[:,None] * np.exp(-((time_arr - current_peak_time) ** 2) / (2 * kappa_inj_width ** 2))
-                    phys['kappa_injection'] += gaussian_peak
-                    
-                    # Set omega_target for the time region starting at 50tau + peak_idx*100tau
-                    jump_time = 100 * tau + peak_idx * 300 * tau
-                    jump_end_time = jump_time + 300 * tau
-                    time_mask = (time_arr >= jump_time) & (time_arr < jump_end_time)
-                    phys['injected_frequency'][time_mask] = omega_target
-                    # phys['injected_frequency'] = omega_target * np.ones(len(time_arr))
-                
-                # Use the last stable equilibrium for phase target
-                if len(stable_indices) > 0:
-                    phys['injected_phase_diff'] = 0.0
-
-                kappa = kappa_inj_amp_peak   # ns^-1 → s^-1
-                g0_si = g0                   # ns^-1 → s^-1
-
-                P_inj = hbar * omega0 * phys['kappa_injection'] * nd['sbar'] / (g0_si * tau_n)
-
-                injection_power_uW = P_inj * 1e6  # Convert to microwatts
-
-
-            nd['phi_p'] = phys['phi_p_mat']
-
+        tmp_stable = []
+        N = 30
+        n_eigenvalues = N*3*N_lasers - 1
+        # print(len(eqs), n_eigenvalues)
+        tmp_stable = Parallel(n_jobs=-1)(
+            delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
+            for eq_pt in results
+        )
+        tmp_stable = [result[0] for result in tmp_stable]
+        if tmp_stable.count(1) > 0:
+            stable_indices = np.where(np.array(tmp_stable) == 1.0)[0]
+            # Initialize injection arrays
+            phys['kappa_injection'] = np.zeros((n_cases, len(time_arr)))
+            phys['injected_frequency'] = np.zeros(len(time_arr))
             
+            # Create Gaussian peaks for each stable equilibrium
+            stable_indices = stable_indices[np.argsort(E_tot[stable_indices])]
+            for peak_idx, stable_idx in enumerate(stable_indices):
+                eq = results[stable_idx]
+                
+                # Target setpoints from equilibrium
+                phi_diff_target = eq[-2]
+                omega_target = eq[-1]/(2*np.pi*1e9*tau_p)
+                
+                # Peak time for this equilibrium (separated by 100*tau)
+                current_peak_time = peak_time + peak_idx * 300 * tau
+                
+                # Add Gaussian peak centered at current_peak_time
+                gaussian_peak = kappa_inj_amp[:,None] * np.exp(-((time_arr - current_peak_time) ** 2) / (2 * kappa_inj_width ** 2))
+                phys['kappa_injection'] += gaussian_peak
+                
+                # Set omega_target for the time region starting at 50tau + peak_idx*100tau
+                jump_time = 100 * tau + peak_idx * 300 * tau
+                jump_end_time = jump_time +300 * tau
+                time_mask = (time_arr >= jump_time) & (time_arr < jump_end_time)
+                phys['injected_frequency'][time_mask] = omega_target
+                # phys['injected_frequency'] = omega_target * np.ones(len(time_arr))
+            
+            # Use the last stable equilibrium for phase target
+            if len(stable_indices) > 0:
+                phys['injected_phase_diff'] = 0.0
 
+            kappa = kappa_inj_amp_peak   # ns^-1 → s^-1
+            g0_si = g0                   # ns^-1 → s^-1
+
+            P_inj = hbar * omega0 * phys['kappa_injection'] * nd['sbar'] / (g0_si * tau_n)
+
+            injection_power_uW = P_inj * 1e6  # Convert to microwatts
+
+
+        nd['phi_p'] = phys['phi_p_mat']
 
         
+
+
+    
         phys['kappa_c_mat'] = kappa_arr
         vcsel = VCSEL(phys)
         nd = vcsel.scale_params()
@@ -345,7 +328,7 @@ for detuning in np.linspace(4,5,50):
         # dphi_max = np.max(dphi[:, :, :-1])
         # dphi_range = dphi_max - dphi_min
         # axs[0].set_ylim(dphi_min - 0.1 * dphi_range, dphi_max + 0.1 * dphi_range)
-        axs[0].set_ylim(-12,5) 
+        axs[0].set_ylim(-5,5) 
         axs[0].grid(True, alpha=0.2)
         axs[0].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
         axs[0].tick_params(axis='both', which='major', labelsize=18)
@@ -394,7 +377,7 @@ for detuning in np.linspace(4,5,50):
         axs[2].set_xlabel('Time ($\mu$s)', fontsize=22)
         axs[2].grid(True, alpha=0.2)
         axs[2].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
-        axs[2].set_ylim(-2, np.max(E_tot_mean+E_tot_std)*1.1)
+        axs[2].set_ylim(-2, 30)
         axs[2].tick_params(axis='both', which='major', labelsize=18)
         if N_lasers <= 6:
             axs[2].legend(loc='upper left', fontsize=16, ncol=2)
@@ -413,12 +396,10 @@ for detuning in np.linspace(4,5,50):
         ax2.tick_params(axis='y', labelcolor='blue', labelsize=20)
 
         plt.tight_layout()
-        # plt.savefig(f'../results/injection_continuation/{N_lasers}_laser_injection_strength_test/{k}.png')
+        plt.savefig(f'../injection_tests/injection_steering_plots/{k}.png')
         # plt.savefig(f'./injection_tests/detuning_test/injection_time_series_kappa{final_kappa/1e9:.1f}_detuning{detuning:.1f}ghz.png', dpi=300)
         plt.show()
         plt.close(fig)
-    break
-
 
 
 
@@ -488,7 +469,6 @@ for detuning in np.linspace(4,5,50):
 
 
 #%%
-%matplotlib inline
 import matplotlib.pyplot as plt
 import matplotlib as mpl
 cmap = cm.get_cmap('jet')

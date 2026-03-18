@@ -178,7 +178,7 @@ for detuning in np.linspace(4,5,50):
             else:
                 guesses = []
 
-            counts = {'phase_count': 5, 'freq_count': 500}
+            counts = {'phase_count': 50, 'freq_count': 500}
             history, freq_history, eq, results = vcsel.generate_history(nd, shape='EQ', n_cases=1, counts=counts)
 
         if eq is not None:

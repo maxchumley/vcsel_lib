@@ -25,7 +25,7 @@ plt.ioff()
 cmap = plt.colormaps['jet']
 
 detuning = 4.0
-N_lasers = 3
+N_lasers = 2
 delta = detuning * 2 * np.pi * 1e9
 delta = np.sort(np.concatenate([delta/2*np.linspace(-1,1,N_lasers)]))
 # print(delta/(2*np.pi*1e9))
@@ -43,7 +43,7 @@ for phi_p_loop in phi_p_arr:
     all_order_params = []
     sorted_indices_arr = []
     max_num_eqs = 0
-    kappa_vals = np.linspace(0.0e9, 20e9, 100)
+    kappa_vals = np.linspace(0.0e9, 50e9, 100)
 
     
 
@@ -86,7 +86,7 @@ for phi_p_loop in phi_p_arr:
         noise_amplitude = 0.0
 
         
-        coupling_scheme = 'NN'
+        coupling_scheme = 'ATA'
         ramp_start = 0
         ramp_shape = 0.00000001
         dx = 1.0
@@ -141,7 +141,7 @@ for phi_p_loop in phi_p_arr:
             guesses = []
 
         # print("Additional guesses...", len(guesses))
-        counts = {'phase_count': 10, 'freq_count': 100}
+        counts = {'phase_count': 5, 'freq_count': 50, 'max_refine':2, 'refine_factor':2}
 
         eq_max, eqs, _ = vcsel.solve_equilibria(nd, guesses=guesses, counts=counts)
         guesses = []
@@ -151,19 +151,19 @@ for phi_p_loop in phi_p_arr:
 
         tmp_stable = []
 
-        # start = time.time()
-        # N = 30
-        # n_eigenvalues = N*3*N_lasers - 1
-        # # print(len(eqs), n_eigenvalues)
-        # tmp_stable = Parallel(n_jobs=-1)(
-        #     delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
-        #     for eq_pt in eqs
-        # )
-        # end = time.time() - start
-        # avg_time += end
-        # tmp_stable = [result[0] for result in tmp_stable]
+        start = time.time()
+        N = 30
+        n_eigenvalues = N*3*N_lasers - 1
+        # print(len(eqs), n_eigenvalues)
+        tmp_stable = Parallel(n_jobs=-1)(
+            delayed(vcsel.compute_stability)(eq_pt, nd, N=N, newton_maxit=10000, threshold=1e-10, sparse=phys['sparse'], spectral_shift=0.01+0.01j, n_eigenvalues=n_eigenvalues)
+            for eq_pt in eqs
+        )
+        end = time.time() - start
+        avg_time += end
+        tmp_stable = [result[0] for result in tmp_stable]
 
-        tmp_stable = [1 for eq in eqs]
+        # tmp_stable = [1 for eq in eqs]
         
 
         eqs = np.column_stack([eqs, np.array(tmp_stable)])  # add stability as last column
@@ -267,7 +267,6 @@ for phi_p_loop in phi_p_arr:
     plt.close(fig)
 
     all_data.append(all_eqs)
-    break
 
 
 
@@ -308,7 +307,7 @@ data_dict = {
     'params': phys
 }
 
-np.save(f'./data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', data_dict)
+np.save(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', data_dict)
 
 ##############################################################################################
 ##############################################################################################
@@ -320,10 +319,10 @@ np.save(f'./data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy'
 
 #%%
 # Load dictionary and extract data
-N_lasers = 3
+N_lasers = 2
 detuning = 4.0
 save = False
-data_dict = np.load(f'./data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', allow_pickle=True).item()
+data_dict = np.load(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', allow_pickle=True).item()
 all_data_stacked = data_dict['all_data']
 kappa_vals = data_dict['kappa_vals']
 kappa_plot = np.array(kappa_vals) * 1e-9

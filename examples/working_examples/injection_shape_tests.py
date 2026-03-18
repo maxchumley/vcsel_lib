@@ -124,7 +124,7 @@ for detuning in np.linspace(0.0,5,11):
 
 
 
-
+ 
         phys['injection'] = False
 
         peak_time = 200*tau                     # center (s), e.g. peak = 3*tau above

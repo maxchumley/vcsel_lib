@@ -635,7 +635,7 @@ class VCSEL:
         return kappa_initial + (kappa_final - kappa_initial) * ramp
 
 
-    def generate_history(self, nd=None, shape='FR', n_cases=1, counts=None):
+    def generate_history(self, nd=None, shape='FR', n_cases=1, counts=None, guesses=None):
         """
         Produce an initial history array required by the delay integrator.
 
@@ -657,6 +657,9 @@ class VCSEL:
             Number of independent cases to tile the history for.
         counts : dict or None
             Optional override for phase and frequency seed counts when
+            shape='EQ'.
+        guesses : list of np.ndarray or None
+            Optional equilibrium guesses passed to solve_equilibria when
             shape='EQ'.
 
         Returns
@@ -720,7 +723,7 @@ class VCSEL:
         elif shape == 'EQ':
             # Steady-state equilibrium histories for all solutions.
             N_lasers = nd.get('N_lasers', 2)
-            eq, results, _ = self.solve_equilibria(nd=nd, counts=counts)
+            eq, results, _ = self.solve_equilibria(nd=nd, counts=counts, guesses=guesses)
 
             if results is None or len(results) == 0:
                 hist = np.zeros((0, 3 * N_lasers, length))
@@ -792,7 +795,12 @@ class VCSEL:
             Optional initial guesses in the form
             [S1, S2, ..., SN, phi_2, ..., phi_N, omega].
         counts : dict or None
-            Optional override for phase and frequency seed counts.
+            Optional override for grid and refinement settings:
+              - phase_count: number of phase samples
+              - freq_count: number of frequency samples
+              - adaptive_grid: whether to refine the grid
+              - refine_factor: multiplier for grid density per refinement
+              - max_refine: number of refinement passes
         phi_p : unused
             Reserved for future phase-dependent seeding.
 
@@ -826,123 +834,124 @@ class VCSEL:
         if counts:
             phase_count = counts.get('phase_count', 30)
             freq_count = counts.get('freq_count', 100)
+            adaptive_grid = counts.get('adaptive_grid', True)
+            refine_factor = counts.get('refine_factor', 2)
+            max_refine = counts.get('max_refine', 3)
         else:
             phase_count = 30
             freq_count = 100
+            adaptive_grid = True
+            refine_factor = 2
+            max_refine = 3
 
         base_omg = 10 * 2 * np.pi * 1e9 * nd['tau_p']
         if guesses:
-            max_guess_omg = max(abs(g[-1]/(2 * np.pi * 1e9 * nd['tau_p'])) for g in guesses)
+            max_guess_omg = max(abs(g[-1]) for g in guesses)
         else:
             max_guess_omg = 0.0
-        max_omg = max(base_omg, 1.1 * max_guess_omg)
-        phase_vals = np.linspace(-2*np.pi, 2*np.pi, phase_count, endpoint=False)
-        omega_seeds = np.linspace(-max_omg, max_omg, freq_count)#np.linspace(-1*nd['delta_p'], 1*nd['delta_p'], 50)  # try zero and the detuning as initial omega guesses
+        max_omg = max(base_omg, 2.0 * max_guess_omg)
 
+        # Start from any user-supplied guesses, then add grid samples per refinement.
+        seed_guesses = list(guesses)
+        prev_count = -1
+        final_root = None
+        results = []
+        E_tot = None
+        # Each refinement multiplies the phase and frequency grid density.
+        refine_steps = max_refine + 1 if adaptive_grid else 1
+        for refine_idx in range(refine_steps):
+            # Effective grid size for this refinement level.
+            phase_count_eff = int(phase_count * (refine_factor ** refine_idx))
+            freq_count_eff = int(freq_count * (refine_factor ** refine_idx))
+            guesses_iter = list(seed_guesses)
 
-        
-        for phi in phase_vals:
-            for omega_guess in omega_seeds:
-                guesses.append(np.concatenate([
-                    np.tile([nd['sbar']], N_lasers),  # n1, S1, n2, S2, ...
-                    np.full(N_lasers-1, phi),                      # φ1, φ2, ...
-                    np.array([omega_guess])                      # ω
-                ]))
-                
-        solutions = Parallel(n_jobs=n_jobs, prefer="threads")(
-            delayed(self.solve_one)(self.residuals, g, nd) for g in guesses
-        )
+            # Build the phase/omega grid and append to the current guess set.
+            phase_vals = np.linspace(-np.pi, np.pi, phase_count_eff, endpoint=False)
+            omega_seeds = np.linspace(-max_omg, max_omg, freq_count_eff)
+            for phi in phase_vals:
+                for omega_guess in omega_seeds:
+                    guesses_iter.append(np.concatenate([
+                        np.tile([nd['sbar']], N_lasers),
+                        np.full(N_lasers-1, phi),
+                        np.array([omega_guess])
+                    ]))
 
-        for sol in solutions:
-            if not sol.success:
-                continue
+            solutions = Parallel(n_jobs=n_jobs)(
+                delayed(self.solve_one)(self.residuals, g, nd) for g in guesses_iter
+            )
 
-            res_norm = np.linalg.norm(sol.fun)
-            if res_norm >= tol:
-                continue
-            
-
-            s = nd['s']
-            p = nd['p']
-
-            S = sol.x[:N_lasers]
-            n = (1 + S/(1 + s * S))**(-1) * (p - S/(1 + s * S))  # invert photon equation to get n
-
-
-            solution = np.zeros(3*N_lasers)
-            solution[0::2][:N_lasers] = n
-            solution[1::2][:N_lasers] = S
-            solution[2*N_lasers:3*N_lasers-1] = sol.x[N_lasers:2*N_lasers-1]
-            solution[-1] = sol.x[-1]
-
-            results.append(solution)
-
-
-        if results:
-            unique = []
-            results = np.array(results)
-
-            for r in results:
-                
-                # wrap phase difference into [0, 2π)
-                r[2*N_lasers:3*N_lasers-1] = r[2*N_lasers:3*N_lasers-1] % (2 * np.pi)
-
-
-                formatted_res = np.concatenate([
-                    r[1::2][:N_lasers],  # S
-                    r[2*N_lasers:3*N_lasers-1],  # phase differences
-                    [r[-1]]  # omega
-                ])
-                # evaluate residual norm
-                res_norm = np.linalg.norm(self.residuals(formatted_res, nd))
-
-                # filter by residual and detuning range
-                if res_norm >= 1e-6:
+            # Collect candidate equilibria from this grid.
+            results_iter = []
+            for sol in solutions:
+                if not sol.success:
+                    continue
+                res_norm = np.linalg.norm(sol.fun)
+                if res_norm >= tol:
                     continue
 
-                # check uniqueness
-                if any(np.allclose(r, u, atol=1e-3, rtol=1e-3) for u in unique):
-                    continue
+                s = nd['s']
+                p = nd['p']
+                S = sol.x[:N_lasers]
+                n = (1 + S/(1 + s * S))**(-1) * (p - S/(1 + s * S))
 
-                # check that all elements are finite
-                if not np.all(r[1::2][:N_lasers] > 0.0) or not np.isfinite(r).all():
-                    continue
+                solution = np.zeros(3*N_lasers)
+                solution[0::2][:N_lasers] = n
+                solution[1::2][:N_lasers] = S
+                solution[2*N_lasers:3*N_lasers-1] = sol.x[N_lasers:2*N_lasers-1]
+                solution[-1] = sol.x[-1]
+                results_iter.append(solution)
 
-                # Extract photon numbers for all lasers
-                photon_nums = r[1::2][:N_lasers]
+            # Deduplicate and filter candidates using residuals and heuristics.
+            if results_iter:
+                unique = []
+                results_arr = np.array(results_iter)
+                for r in results_arr:
+                    r[2*N_lasers:3*N_lasers-1] = r[2*N_lasers:3*N_lasers-1] % (2 * np.pi)
+                    formatted_res = np.concatenate([
+                        r[1::2][:N_lasers],
+                        r[2*N_lasers:3*N_lasers-1],
+                        [r[-1]]
+                    ])
+                    res_norm = np.linalg.norm(self.residuals(formatted_res, nd))
+                    if res_norm >= 1e-6:
+                        continue
+                    if any(np.allclose(r, u, atol=1e-3, rtol=1e-3) for u in unique):
+                        continue
+                    if not np.all(r[1::2][:N_lasers] > 0.0) or not np.isfinite(r).all():
+                        continue
+                    photon_nums = r[1::2][:N_lasers]
+                    epsilon = 1e-12
+                    if photon_nums.max() / (photon_nums.min() + epsilon) > 10:
+                        continue
+                    unique.append(r)
+                results_arr = np.array(unique)
+            else:
+                results_arr = np.array([])
 
-                # Skip if the largest photon number is more than 10x the smallest
-                # (we add a small epsilon to avoid division by zero if one is exactly 0)
-                epsilon = 1e-12
-                if photon_nums.max() / (photon_nums.min() + epsilon) > 10:
-                    continue
+            # Compute total field to pick a representative equilibrium.
+            if results_arr.size > 0:
+                results_arr[:, 2*N_lasers : 3*N_lasers - 1] = (
+                    results_arr[:, 2*N_lasers : 3*N_lasers - 1] % (2.0 * np.pi)
+                )
+                omega = results_arr[:, -1]
+                S = results_arr[:,1::2][:,:N_lasers]
+                valid_indices = np.all(S > 0.0, axis=1)
+                S = S[valid_indices]
+                omega = omega[valid_indices]
+                phi = np.zeros((len(S), N_lasers))
+                phi[:, 1:] = results_arr[valid_indices, 2*N_lasers : 3*N_lasers - 1]
+                E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
+                E_tot_iter = np.abs(np.sum(E, axis=1))**2
+                final_root = results_arr[np.argmax(E_tot_iter)] if results_arr.size else None
+            else:
+                E_tot_iter = None
 
-
-                unique.append(r)
-
-            results = np.array(unique)
-
-            results[:, 2*N_lasers : 3*N_lasers - 1] = results[:, 2*N_lasers : 3*N_lasers - 1] % (2.0 * np.pi)  # wrap phases to [0, 2pi)
-            
-
-            omega = results[:, -1]
-
-            S = results[:,1::2][:,:N_lasers]                # (n_roots, N)
-            valid_indices = np.all(S > 0.0, axis=1)   # only keep roots with all S_i > 0
-            S = S[valid_indices]
-            omega = omega[valid_indices]
-            phi = np.zeros((len(S), N_lasers))
-            phi[:, 1:] = results[valid_indices, 2*N_lasers : 3*N_lasers - 1] # phi1 = 0
-
-            
-            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
-            E_tot = np.abs(np.sum(E, axis=1))**2
-
-
-
-            final_root = results[np.argmax(E_tot)]
-        else:
-            final_root = None
+            # Stop refining if no new equilibria are found.
+            if results_arr.shape[0] <= prev_count:
+                break
+            prev_count = results_arr.shape[0]
+            results = results_arr
+            E_tot = E_tot_iter
 
         return final_root, results, E_tot
 

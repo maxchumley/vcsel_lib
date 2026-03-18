@@ -41,7 +41,7 @@ delta_dist = delta/2 * np.linspace(-1, 1, N_lasers)  # detuning distribution for
 
 
 
-dt = .1*tau_p # 1 ps
+dt = 1*tau_p # 1 ps
 Tmax = 2e-7
 steps = int(Tmax / dt)
 time_arr = np.linspace(0, Tmax, steps)

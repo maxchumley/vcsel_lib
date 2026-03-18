@@ -2,78 +2,21 @@
 # Time series plotting for a VCSEL model
 
 import numpy as np
-from vcsel_lib import VCSEL
-import matplotlib.pyplot as plt
-from matplotlib import rc
 import os
-rc('font', **{'family': 'sans-serif', 'sans-serif': ['Helvetica']})
-rc('text', usetex=True)
-plt.rc('font', family='serif')
-
-
-def unique_roots(results, nd, vcsel, residuals_func, tol=1e-1, max_residual=1e-4):
-    """
-    Filter and return unique steady-state roots with small residuals.
-
-    Parameters
-    ----------
-    results : list or np.ndarray
-        List/array of root vectors (shape (N, 6)).
-    nd : dict
-        Nondimensional parameters (must include 'tau' and 'delta_p').
-    vcsel : object
-        VCSEL instance with an `order_parameter` method.
-    residuals_func : callable
-        Function that computes residuals: residuals_func(x, nd=...).
-    tol : float, optional
-        Maximum element-wise difference to consider roots identical.
-    max_residual : float, optional
-        Discard roots with ||f(x)|| > max_residual.
-
-    Returns
-    -------
-    np.ndarray
-        Array of unique valid roots, shape (n_unique, 6).
-    """
-    N_lasers = nd['N_lasers']
-
-    if len(results) == 0:
-        return np.empty((0, 2*N_lasers + (N_lasers - 1) + 1))
-
-    roots = np.array(results)
-    unique = []
-
-    for r in roots:
-        # wrap phase difference into [0, 2π)
-        r[2*N_lasers:3*N_lasers-1] = r[2*N_lasers:3*N_lasers-1] % (2 * np.pi)
-
-        # evaluate residual norm
-        res_norm = np.linalg.norm(residuals_func(r, nd))
-
-        # filter by residual and detuning range
-        if res_norm >= max_residual:
-            continue
-
-        # check uniqueness
-        if any(np.allclose(r, u, atol=tol, rtol=0) for u in unique):
-            continue
-
-        # # optional: compute order parameter for diagnostics
-        # ss = np.array([[r[0], r[1], r[5] * nd['tau'], r[2], r[3], r[5] * nd['tau'] + r[4]]]).reshape((1, 6, 1))
-        # order_param = vcsel.order_parameter(ss)
-        # # print(f"Accepted root: |res|={res_norm:.2e}, order={order_param:.3f}")
-
-        unique.append(r)
-
-    return np.array(unique)
-
-
-
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import matplotlib.colors as colors
+from matplotlib import rc
+from vcsel_lib import VCSEL
 import matplotlib
 # matplotlib.use("Agg")  # disable GUI backend
 # %matplotlib inline
 import matplotlib.pyplot as plt
-# plt.ioff()
+
+rc('font', **{'family': 'sans-serif', 'sans-serif': ['Helvetica']})
+rc('text', usetex=True)
+plt.rc('font', family='serif')
+
 cmap = plt.colormaps['jet']
  
 detuning = 0.01
@@ -85,13 +28,11 @@ for phi_p_loop in np.linspace(0.0,2,11):
     all_order_params = []
     sorted_indices_arr = []
     max_num_eqs = 0
-    kappa_vals = np.linspace(0e9, 20e9, 100)
+    kappa_vals = np.linspace(0e9, 20e9, 50)
 
  
-
-
-    folder_name = f"./all_eq_2laser_symmetric_detuning_noise"
-    os.makedirs(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection", exist_ok=True)
+    # folder_name = f"./all_eq_2laser_symmetric_detuning_noise"
+    # os.makedirs(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection", exist_ok=True)
     eqs = None
 
     for kappa_ind, kappa_c in enumerate(kappa_vals):
@@ -128,15 +69,6 @@ for phi_p_loop in np.linspace(0.0,2,11):
 
         noise_amplitude = 0.0#VCSEL.cosine_ramp(time_arr, 50*tau, 50*tau, kappa_initial=0, kappa_final=1)
         
-        #np.hstack([VCSEL.cosine_ramp(time_arr[:int(steps/2)], 20*tau, 50*tau, kappa_initial=0, kappa_final=1), VCSEL.cosine_ramp(time_arr[int(steps/2):], 150*tau, 20*tau, kappa_initial=1, kappa_final=1)]) 
-        
-        ##
-        # VCSEL.cosine_ramp(time_arr, 20*tau, 10*tau, kappa_initial=0, kappa_final=1)
-
-        # Kappa ramp
-
-
-        # kappa_arr = VCSEL.cosine_ramp(time_arr, 5*tau, 100*tau, kappa_initial=kappa_c, kappa_final=kappa_c)
 
         N_lasers = 2
         coupling_scheme = 'ATA'
@@ -180,21 +112,6 @@ for phi_p_loop in np.linspace(0.0,2,11):
         n_cases = len(nd['phi_p'])
 
 
-        # Example  guesses — vary phase difference and omega to find multiple branches
-        # generate guesses over a range of pha se differences (and a couple of omega seeds)
-        # phase_count = 20
-        # max_omg = 10 * 2 * np.pi * 1e9 * tau_p#np.max(np.abs(nd['delta_p']))
-        # phase_vals = np.linspace(-2*np.pi, 2*np.pi, phase_count, endpoint=False)
-        # omega_seeds = np.linspace(-max_omg, max_omg, 200)#np.linspace(-1*nd['delta_p'], 1*nd['delta_p'], 50)  # try zero and the detuning as initial omega guesses
-
-        # guesses = []
-        # for phi in phase_vals:
-        #     for omega_guess in omega_seeds:
-        #         guesses.append(np.concatenate([
-        #             np.tile([nd['nbar'], nd['sbar']], N_lasers),  # n1, S1, n2, S2, ...
-        #             np.full(N_lasers-1, phi),                      # φ1, φ2, ...
-        #             np.array([omega_guess])                      # ω
-        #         ]))
 
         if eqs is not None:
             for eq_pt in eqs:
@@ -206,15 +123,12 @@ for phi_p_loop in np.linspace(0.0,2,11):
         else:
             guesses = []
 
-        print("Additional guesses...", len(guesses))
-        eq_max, results, _ = vcsel.solve_equilibria(nd, guesses=guesses)
+        # print("Additional guesses...", len(guesses))
+
+        counts = {'phase_count': 50, 'freq_count': 500}
+        history, freq_history, eq_max, eqs = vcsel.generate_history(nd, shape='EQ', n_cases=1, counts=counts, guesses=guesses)
         guesses = []
 
-        results = np.array(results)
-
-
-        eqs = np.unique(results, axis=0)
-        # eqs = unique_roots(results, nd, vcsel, vcsel.residuals, tol=1e-3, max_residual=1e-6)
 
 
         if len(eqs) > max_num_eqs:
@@ -246,27 +160,16 @@ for phi_p_loop in np.linspace(0.0,2,11):
 
             all_eqs.append(eqs)
     
-
-
-            # history = eqs[:,:,None].repeat(2*delay_steps, axis=2)  # repeat equilibrium across time/history axis
             length = 2*delay_steps
             
             n_cases = eqs.shape[0]*n_iterations
-            
-            history = np.zeros((n_cases, 3*N_lasers, length))
-            for k, eq in enumerate(eqs):
-                omega = eq[-1]
-                phase_diff = np.concatenate([[0.0], eq[2*N_lasers:(3*N_lasers -1)]])[:N_lasers]*np.ones(shape=(n_iterations,N_lasers))#np.concatenate([[0.0], eq[2*N_lasers:3*N_lasers-1]])
-
-                history[k*n_iterations:(k+1)*n_iterations, 0::3, :] = eq[0::2][:N_lasers].reshape(-1,1)*np.ones(shape=(n_iterations,N_lasers,length))         # n1
-                history[k*n_iterations:(k+1)*n_iterations, 1::3, :] = eq[1::2][:N_lasers].reshape(-1,1)*np.ones(shape=(n_iterations,N_lasers,length))            # S1 (nondimensional)
-                history[k*n_iterations:(k+1)*n_iterations, 2::3, :] = omega * nd['dt'] * np.arange(length)*np.ones(shape=(n_iterations,N_lasers,length))       # phi1
-                history[k*n_iterations:(k+1)*n_iterations, 2::3, :] += phase_diff.reshape(n_iterations,N_lasers,1)  # add phase differences
 
             phys['kappa_c_mat'] = kappa_arr
             vcsel = VCSEL(phys)
             nd = vcsel.scale_params()
             nd['injected_phase_diff'] = np.random.uniform(0, 2*np.pi, size=n_cases)#np.linspace(0,2*np.pi,n_cases)
+
+            
 
             t, y, freqs = vcsel.integrate(history*1.0, nd=nd, progress=True, theta=0.8, max_iter=100)
 
@@ -317,21 +220,8 @@ for phi_p_loop in np.linspace(0.0,2,11):
             E_hist = np.sqrt(S_hist) * (np.cos(phi_hist) + 1j*np.sin(phi_hist))
             E_tot_hist = np.abs(np.sum(E_hist, axis=1))**2
 
-
-
             
-
-            # E_tot_hist_avg = np.mean(E_tot_hist, axis=-1)
-
-
-            # first_pt = full_E_tot[:, 0]
-            # change = np.max(100*np.abs(full_E_tot - first_pt[:, np.newaxis]) / first_pt[:, np.newaxis], axis=1)
-            # stable_indices = np.where(change < 5)[0]
             
-            import matplotlib.pyplot as plt
-            import matplotlib.cm as cm
-            import matplotlib.colors as colors
-            import numpy as np
             
             num_traj = eqs.shape[0]
             cmap = plt.colormaps['jet']
@@ -383,7 +273,6 @@ for phi_p_loop in np.linspace(0.0,2,11):
             del history
             del nd
             del phys
-            del results
             # del eqs  
             import gc
             gc.collect()
@@ -398,14 +287,9 @@ for phi_p_loop in np.linspace(0.0,2,11):
             )
 
             for j in range(num_traj):
-            # for j in stable_indices:
 
-                
-
+        
                 k = sorted_indices[j]
-
-                # if np.any(np.abs((full_E_tot[k][int(steps/4)]-full_E_tot[k][0])/full_E_tot[k][0]) > 0.1):
-                #     continue
 
                 if not plot_flag:
                     axs[0].set_xlabel('Time ($\mu s$)', fontsize=22)
@@ -466,18 +350,10 @@ for phi_p_loop in np.linspace(0.0,2,11):
                 axs[2].set_ylim(-5, 20)
                 axs[2].tick_params(axis='both', which='major', labelsize=18)
                 axs[2].set_ylabel(r'$|E_{tot}|^2$', fontsize=22)
-                # # Twin axis for kappa
-                # ax2 = axs[2].twinx()
-                # ax2.plot(time_plot_full, kappa_arr[-len(time_plot_full):] * 1e-9,
-                #          'b--', alpha=0.5, linewidth=2)
-                # ax2.set_ylabel('kappa ($ns^{-1}$)', color='blue', fontsize=28, labelpad=18)
-                # ax2.set_ylim(0, kappa_max * 1e-9)
-                # ax2.tick_params(axis='y', labelcolor='blue', labelsize=24, width=2, length=8)
-                # ax2.tick_params(axis='x', labelsize=24, width=2, length=8)
                 
             plt.tight_layout()
-            plt.savefig(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection/{kappa_ind}.png")
-            # plt.show()
+            # plt.savefig(f"{folder_name}/detuning_{detuning:.2f}_0self_phi_p{phi_p_loop:.2f}pi_ramp_noise_injection/{kappa_ind}.png")
+            plt.show()
             fig.clf()
             plt.close(fig)
             del fig
@@ -485,109 +361,104 @@ for phi_p_loop in np.linspace(0.0,2,11):
 
             del (full_E_tot, full_E_tot_std,
                 colors)
-            
-            
-            
-
-            
+        
 
         else:
             print(f"No valid equilibria found for kappa_c = {kappa_c*1e-9:.2f} ns^-1") 
             all_eqs.append(np.nan*np.ones((1, 2*N_lasers + (N_lasers - 1) + 1), dtype=np.float64))
             all_order_params.append(np.array([np.nan], dtype=np.float64))
 
-#%%
-    # %matplotlib inline
-    import matplotlib.pyplot as plt
-
-    for k, eqs in enumerate(all_eqs):
-        # pad eqs with nan rows if needed so all entries have length max_num_eqs 
-        if eqs.shape[0] < max_num_eqs:
-            eq_diff = max_num_eqs - eqs.shape[0]
-            expected_cols = 2*N_lasers + (N_lasers - 1) + 1
-            pad_rows = np.nan*np.ones((eq_diff, expected_cols), dtype=eqs.dtype)
-            eqs = np.vstack([eqs, pad_rows]) 
-
-            pad_order_params = np.nan*np.ones((eq_diff,), dtype=np.float64)
-            all_order_params[k] = np.hstack([all_order_params[k], pad_order_params])
-            all_eqs[k] = eqs
-
-
-
-    all_eqs = np.array(all_eqs)
-    all_order_params = np.array(all_order_params)
-
-
-
-
-    # n1, S1, n2, S2, phase_diff, omega
-    S = all_eqs[:,:,1::2][:,:,:N_lasers]
-
-    omega = all_eqs[:,:,-1]
-
-    phi = omega[:,:,None]*tau + np.concatenate((np.zeros(shape=(len(kappa_vals), max_num_eqs, 1)), all_eqs[:,:,2*N_lasers:3*N_lasers-1]), axis=2)
-
-
-    E = np.sqrt(S) * (np.cos(phi) + 1j*np.sin(phi))
-
-
-
-    E_tot = np.abs(np.sum(E, axis=2))**2
-
-
-
-    import matplotlib.pyplot as plt
-    import matplotlib as mpl
-    import matplotlib.pyplot as plt
-    import matplotlib as mpl
-    
-
-    n_kappa = all_eqs.shape[0]
-    n_branches = all_eqs.shape[1]
-
-    # reconstruct kappa values used in the loop (in Hz) and convert to ns^-1 for plotting
-    # kappa_vals = np.linspace(1e9, 5e9, n_kappa)        # Hz
-    kappa_plot = kappa_vals * 1e-9                     # ns^-1
-
-
-    
-    fig, ax = plt.subplots(figsize=(9, 6), dpi=300)
-
-    for b in range(len(kappa_plot)):
-        Et = omega[b,:]/(2*np.pi*1e9*tau_p)
-        E_mask =  np.isfinite(Et)
-        if not np.any(E_mask):
-            continue
-        Et = Et[E_mask]
-        ordp = all_order_params[b,:]
-        mask =  np.isfinite(ordp)
-        alpha_vals = (2*(ordp - 0.5)**2).astype(float)
-        if not np.any(mask):
-            continue
-        ax.scatter(kappa_plot[b]*np.ones_like(Et), Et,
-                c=ordp[mask], cmap=cmap, vmin=0.0, vmax=1.0,
-                s=5, edgecolors='none')
-        #, alpha=alpha_vals[mask]
-
-    ax.set_xlabel(r'$\kappa_c$ (ns$^{-1}$)', fontsize=20)
-    ax.set_ylabel(r'$|E_{\mathrm{tot}}|^2$', fontsize=20)
-    ax.set_title(rf'$\delta = {detuning:.2f}$ GHz', fontsize=22, pad=20)
-    # increase tick label sizes
-    ax.tick_params(axis='both', which='major', labelsize=20)
-    ax.grid(alpha=0.25)
-
-    # colorbar for order parameter with larger font
-    sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=0.0, vmax=1.0))
-    sm.set_array([])
-    cbar = fig.colorbar(sm, ax=ax, pad=0.02)
-    cbar.set_label('Order parameter', fontsize=20)
-    cbar.ax.tick_params(labelsize=20)
-    plt.xlim(-0.1,20.5)
-    plt.ylim(-12,12)
-    
-    plt.tight_layout()
-    plt.savefig(f'{folder_name}/branches/detuning_{detuning:.2f}_equilibrium_branches_self_{self_feedback:.2f}_phi_p{phi_p_loop:.2f}pi.png')
-    plt.show()
-    plt.close(fig)
     break
+
+#%%
+# %matplotlib inline
+import matplotlib.pyplot as plt
+
+for k, eqs in enumerate(all_eqs):
+    # pad eqs with nan rows if needed so all entries have length max_num_eqs 
+    if eqs.shape[0] < max_num_eqs:
+        eq_diff = max_num_eqs - eqs.shape[0]
+        expected_cols = 2*N_lasers + (N_lasers - 1) + 1
+        pad_rows = np.nan*np.ones((eq_diff, expected_cols), dtype=eqs.dtype)
+        eqs = np.vstack([eqs, pad_rows]) 
+
+        pad_order_params = np.nan*np.ones((eq_diff,), dtype=np.float64)
+        all_order_params[k] = np.hstack([all_order_params[k], pad_order_params])
+        all_eqs[k] = eqs
+
+
+
+all_eqs = np.array(all_eqs)
+all_order_params = np.array(all_order_params)
+
+# n1, S1, n2, S2, phase_diff, omega
+S = all_eqs[:,:,1::2][:,:,:N_lasers]
+
+omega = all_eqs[:,:,-1]
+
+phi = omega[:,:,None]*tau + np.concatenate((np.zeros(shape=(len(kappa_vals), max_num_eqs, 1)), all_eqs[:,:,2*N_lasers:3*N_lasers-1]), axis=2)
+
+
+E = np.sqrt(S) * (np.cos(phi) + 1j*np.sin(phi))
+
+
+
+E_tot = np.abs(np.sum(E, axis=2))**2
+
+
+
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+
+
+n_kappa = all_eqs.shape[0]
+n_branches = all_eqs.shape[1]
+
+# reconstruct kappa values used in the loop (in Hz) and convert to ns^-1 for plotting
+# kappa_vals = np.linspace(1e9, 5e9, n_kappa)        # Hz
+kappa_plot = kappa_vals * 1e-9                     # ns^-1
+
+
+
+fig, ax = plt.subplots(figsize=(9, 6), dpi=300)
+
+for b in range(len(kappa_plot)):
+    Et = E_tot[b,:]#omega[b,:]/(2*np.pi*1e9*tau_p)
+    E_mask =  np.isfinite(Et)
+    if not np.any(E_mask):
+        continue
+    Et = Et[E_mask]
+    ordp = all_order_params[b,:]
+    mask =  np.isfinite(ordp)
+    alpha_vals = (2*(ordp - 0.5)**2).astype(float)
+    if not np.any(mask):
+        continue
+    ax.scatter(kappa_plot[b]*np.ones_like(Et), Et,
+            c=ordp[mask], cmap=cmap, vmin=0.0, vmax=1.0,
+            s=5, edgecolors='none')
+    #, alpha=alpha_vals[mask]
+
+ax.set_xlabel(r'$\kappa_c$ (ns$^{-1}$)', fontsize=20)
+ax.set_ylabel(r'$|E_{\mathrm{tot}}|^2$', fontsize=20)
+ax.set_title(rf'$\delta = {detuning:.2f}$ GHz', fontsize=22, pad=20)
+# increase tick label sizes
+ax.tick_params(axis='both', which='major', labelsize=20)
+ax.grid(alpha=0.25)
+
+# colorbar for order parameter with larger font
+sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=0.0, vmax=1.0))
+sm.set_array([])
+cbar = fig.colorbar(sm, ax=ax, pad=0.02)
+cbar.set_label('Order parameter', fontsize=20)
+cbar.ax.tick_params(labelsize=20)
+plt.xlim(-0.1,20.5)
+# plt.ylim(-12,12)
+
+plt.tight_layout()
+# plt.savefig(f'{folder_name}/branches/detuning_{detuning:.2f}_equilibrium_branches_self_{self_feedback:.2f}_phi_p{phi_p_loop:.2f}pi.png')
+plt.show()
+plt.close(fig)
+# break
             

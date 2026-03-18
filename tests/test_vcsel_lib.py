@@ -113,7 +113,20 @@ def test_generate_history_shapes():
     nd_eq = dict(nd)
     nd_eq["kappa"] = nd["kappa"][-1]
     nd_eq["phi_p"] = nd["phi_p"][0]
-    history, freq_hist, eq, results = vcsel.generate_history(nd_eq, shape="EQ", n_cases=1)
+    # Force single-threaded solver in tests to avoid joblib process issues.
+    orig_solve = vcsel.solve_equilibria
+    def _solve_one_job(*args, **kwargs):
+        kwargs["n_jobs"] = 1
+        return orig_solve(*args, **kwargs)
+    vcsel.solve_equilibria = _solve_one_job
+    history, freq_hist, eq, results = vcsel.generate_history(
+        nd_eq,
+        shape="EQ",
+        n_cases=1,
+        counts={"phase_count": 6, "freq_count": 6},
+        guesses=[],
+    )
+    vcsel.solve_equilibria = orig_solve
     
     assert history.shape[0] == 2
     assert history.shape[1] == 3 * nd["N_lasers"]
