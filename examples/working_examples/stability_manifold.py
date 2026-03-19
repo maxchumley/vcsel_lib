@@ -43,7 +43,7 @@ for phi_p_loop in phi_p_arr:
     all_order_params = []
     sorted_indices_arr = []
     max_num_eqs = 0
-    kappa_vals = np.linspace(0.0e9, 50e9, 100)
+    kappa_vals = np.linspace(0.0e9, 80e9, 200)
 
     
 

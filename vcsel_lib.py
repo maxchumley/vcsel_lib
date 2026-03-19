@@ -132,7 +132,7 @@ class VCSEL:
         phi_p = phys['phi_p_mat']
         alpha = phys['alpha']
         delta = phys['delta']
-        I = phys.get('I', None)
+        current_I = phys.get('I', None)
         q = phys['q']
         coupling = phys.get('coupling', 1.0)
         self_feedback = phys.get('self_feedback', 0.0)
@@ -148,7 +148,7 @@ class VCSEL:
         injection = phys.get('injection', False)
         injection_topology = phys.get('injection_topology', None)
         injected_strength = phys.get('injected_strength', 0.0)
-        injected_phase_diff = phys.get('injected_phase_diff', 0.0)
+        # injected_phase_diff is handled in nd when injection is enabled
         kappa_inj = phys.get('kappa_injection', 0.0)
 
         # ------------------------------
@@ -174,7 +174,7 @@ class VCSEL:
         nd['s'] = s * gamma_e / g0
         nd['kappa'] = kappa / gamma  # nondimensional coupling (kappa / gamma)
         # Pump parameter p (normalized excess pump above threshold)
-        p = g0 * tau_p * (I * tau_n / (q) - N0) - 1
+        p = g0 * tau_p * (current_I * tau_n / (q) - N0) - 1
         nd['p'] = p
         nd['alpha'] = alpha
         nd['phi_p'] = phi_p
@@ -251,11 +251,9 @@ class VCSEL:
         S   = X[:, :, 1]
         phi = X[:, :, 2]
 
-        n_t   = X_tau[:, :, 0]
         S_t   = X_tau[:, :, 1]
         phi_t = X_tau[:, :, 2]
 
-        n_2t   = X_2tau[:, :, 0]
         S_2t   = X_2tau[:, :, 1]
         phi_2t = X_2tau[:, :, 2]
 
@@ -989,7 +987,10 @@ class VCSEL:
         nd = nd if nd is not None else self.nd
 
         # Unpack parameters
-        T = nd['T']; s = nd['s']; nbar = nd['nbar']; p = nd['p']
+        T = nd['T']
+        s = nd['s']
+        nbar = nd['nbar']
+        p = nd['p']
         delta = nd.get('delta_p', 0.0)
         beta_n = nd.get('beta_n', 0.0)
         beta_const = nd.get('beta_const', 0.0)
@@ -1342,7 +1343,6 @@ class VCSEL:
         beta_n = nd["beta_n"]
         alpha  = nd["alpha"]
 
-        tau    = nd["tau"]
         phi_p = np.array(nd["phi_p"])
         if phi_p.ndim == 3:
             if verbose:
