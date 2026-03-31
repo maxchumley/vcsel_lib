@@ -55,7 +55,7 @@ for p in range(1):
 
 
     dt = 0.5*tau_p # 1 ps
-    Tmax = 1e-7
+    Tmax = 1e-6
 
 
     steps = int(Tmax / dt)
@@ -72,11 +72,11 @@ for p in range(1):
 
     dx=1.0
 
-    kappa_c = np.linspace(0e9,20e9,resolution)
+    kappa_c = np.linspace(0e9,40e9,resolution)
 
 
 
-    phi_p_vals = np.array([0*np.pi])#np.linspace(0,2*np.pi,resolution)
+    phi_p_vals = np.array([0.0])#np.linspace(0,2*np.pi,resolution)#
 
     n_iterations = 100
 
@@ -105,6 +105,7 @@ for p in range(1):
 
 
 
+
     # t, y, freqs = vcsel.integrate(history, nd=nd, progress=True)
 
 
@@ -125,7 +126,7 @@ for p in range(1):
     n_cases = len(nd['phi_p'])
 
 
-    history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+    history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
 
 
@@ -170,13 +171,13 @@ for p in range(1):
         phys['kappa_c_mat'] = kappa_arr
         vcsel = VCSEL(phys)
         nd = vcsel.scale_params()
-        t, y_scaled, freqs = vcsel.integrate(history, nd=nd, progress=False)
+        t, y_scaled, freqs = vcsel.integrate(history, nd=nd, progress=False, max_iter=1)
 
         y = y_scaled.copy()#vcsel.invert_scaling(y_scaled.copy(), phys)
         S = []
         phi = []
         dphi = []
-
+  
         for i in range(N_lasers):
             # Your original indexing used:
             #   Laser 1 → y[:, 1, :]
@@ -326,6 +327,7 @@ for p in range(1):
             ax0.set_ylabel(r'$\kappa_c~(\mathrm{ns}^{-1})$', fontsize=font_size)
             ax0.set_xlabel(r'Time (ns)', fontsize=font_size)
             ax0.set_title(r'$\phi_p={:+.2f}\pi$'.format(phi_p[0,0]/np.pi), fontsize=font_size, pad=16)
+            # ax0.set_title(r'$\phi_p\in[0,2\pi]$', fontsize=font_size, pad=16)
             ax0.set_yticks(np.linspace(kappa_c[0]*1e-9, kappa_c[-1]*1e-9, 6))
             ax0.tick_params(axis='both', labelsize=font_size)
 

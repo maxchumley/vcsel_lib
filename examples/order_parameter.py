@@ -34,8 +34,8 @@ def simulate_parallel(task):
 
     vcsel = VCSEL(phys)
     nd = vcsel.scale_params()
-    history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=len(nd['phi_p']))
-    t, y, _ = vcsel.integrate(history, nd=nd, progress=False)
+    history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=len(nd['phi_p']))
+    t, y, _ = vcsel.integrate(history, nd=nd, progress=False, theta=0.5, max_iter=1)
     
     order_param_row = vcsel.order_parameter(y[:,:,-int(len(t)/2):])
     return kappa_c_index, order_param_row
@@ -75,7 +75,7 @@ if __name__ == "__main__":
     N_lasers = 2
     
 
-    Tmax = 5e-7
+    Tmax = 1e-6
     dt = 0.5*tau_p
 
 
@@ -88,7 +88,7 @@ if __name__ == "__main__":
     segment_start = int(steps/2)
 
 
-    resolution = 30
+    resolution = 100
 
     # for ramp_start in np.linspace(2, 10, 100):
     ramp_start = 2
@@ -108,7 +108,7 @@ if __name__ == "__main__":
 
 
     avg_order_param = np.zeros(shape=(resolution, resolution))
-    n_iterations = 100
+    n_iterations = 20
 
     phi_p_vals = np.linspace(0,2*np.pi,resolution)
 
@@ -237,7 +237,6 @@ if __name__ == "__main__":
 
 
     
-
 
 
 

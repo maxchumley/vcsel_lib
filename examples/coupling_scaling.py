@@ -118,7 +118,7 @@ nd = vcsel.scale_params()
 n_cases = len(nd['phi_p'])
 
 
-history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
 #%%
 
@@ -149,7 +149,7 @@ for di, detuning in enumerate(detuning_arr):
     vcsel = VCSEL(phys)
     
     nd = vcsel.scale_params()
-    history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+    history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
 
     for k in range(0, len(kappa_c)):
         if reverse: 

@@ -5,21 +5,26 @@ VCSEL simulation utilities.
 
 Provides a VCSEL class that encapsulates physical parameters, nondimensional
 scaling, the nondimensional rate equations (with delay and optional noise),
-integration routines (Trapezoidal predictor corrector with Euler-Maruyama noise), utilities to generate histories and compute
-equilibria (beta), and small helpers (cosine ramp, order parameter, invert scaling).
+integration routines (trapezoidal predictor-corrector with Euler-Maruyama noise),
+utilities to generate histories and compute equilibria, and small helpers
+(cosine ramp, order parameter, invert scaling).
 
 This module is intended for research/teaching use and keeps a clear separation
 between physical parameters (SI units) and nondimensional parameters used by
 the integrator.
 
-Author: Max Chumley with documentation assistance from GitHub Copilot
+Author: Max Chumley with documentation assistance from GitHub Copilot and OpenAI CODEX
 """
 
 import numpy as np
+import warnings
 from sympy import symbols, Eq, solve
 from tqdm import tqdm
 from scipy.optimize import root
-import time
+from joblib import Parallel, delayed
+import scipy.sparse as sp
+import scipy.sparse.linalg as spla
+
 
 class VCSEL:
     """
@@ -33,7 +38,7 @@ class VCSEL:
     Usage:
       vcsel = VCSEL(phys_dict)
       nd = vcsel.scale_params()            # create nondimensional parameters
-      history = vcsel.generate_history(nd, shape='FR')
+      history, freq_hist, eq, results = vcsel.generate_history(nd, shape='FR')
       t_dim, y, freqs = vcsel.integrate(history, nd, progress=True)
 
     Notes on units and nondimensionalization:
@@ -97,7 +102,8 @@ class VCSEL:
         -----------------------
         - nondimensional time: t' = t / tau_p  (photon lifetime used as time scale)
         - nondimensional carrier offset:
-             n' = g0 * tau_p * (N - N0)  (so nbar ~ O(1) at steady-state)
+             n' = g0 * tau_p * (N - N0 - 1/(g0*tau_p))
+             (so n + n0 + 1 = g0 * tau_p * N for noise prefactors)
         - nondimensional photon number:
              s' = g0 * tau_n * S
         - gain parameter: Gs = g0 * tau_p
@@ -127,7 +133,7 @@ class VCSEL:
         phi_p = phys['phi_p_mat']
         alpha = phys['alpha']
         delta = phys['delta']
-        I = phys.get('I', None)
+        current_I = phys.get('I', None)
         q = phys['q']
         coupling = phys.get('coupling', 1.0)
         self_feedback = phys.get('self_feedback', 0.0)
@@ -135,6 +141,8 @@ class VCSEL:
         dt = phys.get('dt', 1e-12)
         Tmax = phys.get('Tmax', 3e-6)
         tau = phys.get('tau', 1e-9)  # feedback delay in seconds
+        save_every = phys.get('save_every', 1)
+        max_output_gb = phys.get('max_output_gb', 10.0)
 
         # Derived discrete parameters
         steps = int(Tmax / dt)
@@ -143,7 +151,7 @@ class VCSEL:
         injection = phys.get('injection', False)
         injection_topology = phys.get('injection_topology', None)
         injected_strength = phys.get('injected_strength', 0.0)
-        injected_phase_diff = phys.get('injected_phase_diff', 0.0)
+        # injected_phase_diff is handled in nd when injection is enabled
         kappa_inj = phys.get('kappa_injection', 0.0)
 
         # ------------------------------
@@ -169,7 +177,7 @@ class VCSEL:
         nd['s'] = s * gamma_e / g0
         nd['kappa'] = kappa / gamma  # nondimensional coupling (kappa / gamma)
         # Pump parameter p (normalized excess pump above threshold)
-        p = g0 * tau_p * (I * tau_n / (q) - N0) - 1
+        p = g0 * tau_p * (current_I * tau_n / (q) - N0) - 1
         nd['p'] = p
         nd['alpha'] = alpha
         nd['phi_p'] = phi_p
@@ -185,6 +193,8 @@ class VCSEL:
         nd['coupling'] = coupling
         nd['self_feedback'] = self_feedback
         nd['noise_amplitude'] = noise_amplitude
+        nd['save_every'] = save_every
+        nd['max_output_gb'] = max_output_gb
         # nondimensional time step and total time
         nd['dt'] = dt / tau_p
         nd['Tmax'] = Tmax / tau_p
@@ -246,11 +256,9 @@ class VCSEL:
         S   = X[:, :, 1]
         phi = X[:, :, 2]
 
-        n_t   = X_tau[:, :, 0]
         S_t   = X_tau[:, :, 1]
         phi_t = X_tau[:, :, 2]
 
-        n_2t   = X_2tau[:, :, 0]
         S_2t   = X_2tau[:, :, 1]
         phi_2t = X_2tau[:, :, 2]
 
@@ -278,13 +286,19 @@ class VCSEL:
             # Account for multiple phi_p cases (n_cases, N, N)
             phi_p = np.array(phi_p)
             if phi_p.shape != (n_cases, N, N):
-                raise ValueError("phi_p must be scalar or shape (N,N) or (n_cases,N,N)")
+                raise ValueError(f"phi_p must be scalar or shape (N,N) or (n_cases,N,N), got shape {phi_p.shape}")
             
         phi_p_self = phi_p[:, np.arange(N), np.arange(N)]
         phi_p_mutual = phi_p - np.diag(phi_p_self[0,:])[None,:,:]
 
         # Time-varying coupling
-        kappa_mat = np.array(nd["kappa"][j])        # shape (N,N)
+        kappa_val = np.asarray(nd["kappa"])
+        if kappa_val.ndim == 3:
+            kappa_mat = np.array(kappa_val[j])        # shape (N,N)
+        elif kappa_val.ndim == 2:
+            kappa_mat = np.array(kappa_val)           # constant (N,N)
+        else:
+            kappa_mat = np.ones((N, N)) * kappa_val   # scalar
         kappa_diag = np.diag(kappa_mat)             # self-feedback (length N)
         kappa_mat = kappa_mat - np.diag(kappa_diag) # zero diagonal for mutual coupling
 
@@ -317,7 +331,9 @@ class VCSEL:
             dS += nd['coupling'] * 2 * np.sum(kappa_mat[None, :, :] * mutual_amp * cos_mutual, axis=2)
 
             # phase dynamics
-            dphi +=nd['coupling'] *  np.sum(kappa_mat[None, :, :] * (sqrtS_t[:, None, :] / sqrtS[:, :, None]) * sin_mutual, axis=2)
+            ratio = sqrtS_t[:, None, :] / sqrtS[:, :, None]
+            ratio = np.clip(ratio, 0, 10)
+            dphi +=nd['coupling'] *  np.sum(kappa_mat[None, :, :] * (ratio) * sin_mutual, axis=2)
 
         # ----------------- SELF-FEEDBACK -----------------
 
@@ -337,8 +353,12 @@ class VCSEL:
 
             inj_strength = nd["injected_strength"]
             inj_phase    = nd["injected_phase_diff"]
-            omega_inj    = nd["injected_frequency"][j]
-            kappa_inj    = nd["kappa_inj"][j]
+            omega_src = nd["injected_frequency"]
+            if isinstance(omega_src, np.ndarray):
+                omega_inj = omega_src[:, j] if omega_src.ndim == 2 else omega_src[j]
+            else:
+                omega_inj = omega_src
+            kappa_inj    = nd["kappa_inj"].T[j]
             t = j*nd["dt"]
 
             for p in range(N):
@@ -351,12 +371,12 @@ class VCSEL:
 
                 inj_cos = np.cos(omega_inj*t + inj_phase - phi0)
                 inj_sin = np.sin(omega_inj*t + inj_phase - phi0)
-
                 dS[:, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
                 dphi[:, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
         elif nd.get("injection", False) and injection_topology is None:
             raise ValueError("Injection topology must be provided when injection is enabled.")
 
+        dphi[S < 1e-8] = 0
         # ----------------- PACK OUTPUT -----------------
         out = np.empty((n_cases, 3*N))
         out[:, 0::3] = dn
@@ -439,144 +459,36 @@ class VCSEL:
         # Return row if input was 1D
         return noise[0] if y_c.shape[0] == 1 else noise
     
-    # def integrate(self, history, nd=None, progress=False):
-    #     """
-    #     Integrate the nondimensional VCSEL equations.
 
-    #     Integration scheme:
-    #     - Single-step trapezoidal (Heun) predictor-corrector for the deterministic dynamics.
-    #         * Predictor:   y* = y_n + dt * f(y_n)
-    #         * Corrector:   y_{n+1} = y_n + (dt/2) * (f(y_n) + f(y*))
-    #     - Euler-Maruyama (EM) treatment of additive noise:
-    #         noise is evaluated at the start of the step (y_n) and added after the trapezoid corrector.
-    #     - Delay terms are obtained directly from the stored history; no multistep bootstrap is required.
+    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5, smooth_freqs=True):
+        """
+        Integrate the nondimensional DDE system with a trapezoidal predictor-corrector.
 
-    #     Parameters
-    #     ----------
-    #     history : np.ndarray, shape (n_cases, 6, 2*delay_steps)
-    #         Initial history for t in [-2*tau, 0] in nondimensional units.
-    #         The integrator requires at least 2*delay_steps columns to provide the
-    #         necessary delayed states during the first steps.
-    #     nd : dict or None
-    #         Nondimensional parameter dictionary (if None, uses self.nd).
-    #     progress : bool
-    #         If True, show a progress bar using tqdm.
+        Parameters
+        ----------
+        history : np.ndarray, shape (n_cases, 3*N_lasers, 2*delay_steps)
+            Initial history over [-2*tau, 0] in nondimensional units.
+        nd : dict or None
+            Nondimensional parameters (if None uses self.nd).
+        progress : bool
+            If True, show a tqdm progress bar.
+        theta : float
+            Trapezoidal blend parameter (0.5 is Crank-Nicolson).
+        max_iter : int
+            Maximum fixed-point iterations per step.
 
-    #     Returns
-    #     -------
-    #     t_dim : np.ndarray
-    #         Physical time array (seconds) of shape (steps,).
-    #     y : np.ndarray, shape (n_cases, 6, steps)
-    #         Time series of the nondimensional state for all cases.
-    #     freqs : np.ndarray, shape (n_cases, 2, steps)
-    #         Instantaneous phase time derivatives dphi/dt for both lasers
-    #         (columns correspond to laser 1 and laser 2).
-    #     """
-
-    #     if nd is None:
-    #         nd = self.nd
-
-    #     n_cases = history.shape[0]
-    #     N_lasers = nd['kappa'].shape[-1]
-    #     dt = nd['dt']
-    #     steps = nd['steps']
-    #     delay_steps = nd['delay_steps']
-    #     noise_amplitude = nd['noise_amplitude']
-
-    #     # Prepare output arrays
-    #     y = np.zeros((n_cases, 3*N_lasers, steps))
-    #     derivs = np.zeros((n_cases, 3*N_lasers, steps))
-    #     freqs = np.zeros((n_cases, N_lasers, steps))
-    #     freqs[:,:,:2*delay_steps] = nd['delta_p'][None,:,None] * np.ones((n_cases, N_lasers, 2*delay_steps))
-    #     # phi_p = np.full(n_cases, nd['phi_p'])
-    #     phi_p = nd['phi_p']
-
-
-
-    #     # Require full delay history
-    #     if history.shape[2] < 2 * delay_steps:
-    #         raise ValueError("history too short for configured delay_steps")
-
-    #     # Put initial history into output buffer
-    #     y[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
-
-    #     # Start integration at the last history index
-    #     start_idx = 2 * delay_steps - 1
-    #     if start_idx >= steps:
-    #         t_dim = np.arange(steps) * dt * nd['tau_p']
-    #         return t_dim, y
-
-    #     # f_hist holds the last 4 derivative evaluations (for diagnostics)
-    #     f_hist = np.zeros((n_cases, 3*N_lasers, 4))
-
-    #     # Precompute delay index arrays for speed
-    #     idx_tau_arr = np.arange(steps) - delay_steps
-    #     idx_2tau_arr = np.arange(steps) - 2 * delay_steps
-    #     idx_tau_arr[idx_tau_arr < 0] = 0
-    #     idx_2tau_arr[idx_2tau_arr < 0] = 0
-
-    #     # ---------- MAIN TRAPEZOIDAL LOOP ----------
-    #     with tqdm(total=steps - 1 - start_idx, desc="Integrating",
-    #             disable=not progress) as pbar:
-
-    #         y_guess = np.empty((n_cases, 3*N_lasers))
-    #         y_c = np.empty((n_cases, 3*N_lasers))
-    #         tmp_noise = np.empty((n_cases, 3*N_lasers))
-
-    #         n = start_idx
-    #         while n < steps - 1:
-    #             y_n = y[:, :, n]
-
-    #             idx_tau = idx_tau_arr[n + 1]
-    #             idx_2tau = idx_2tau_arr[n + 1]
-    #             y_tau = y[:, :, idx_tau]
-    #             y_2tau = y[:, :, idx_2tau]
-
-    #             # --- Trapezoid predictor + corrector (deterministic)
-    #             f_n = self.f_nd(y_n, y_tau, y_2tau, n, phi_p, nd)[:, :3*N_lasers]
-    #             y_guess[:] = y_n + dt * f_n
-    #             f_guess = self.f_nd(y_guess, y_tau, y_2tau, n + 1, phi_p, nd)[:, :3*N_lasers]
-
-    #             y_c[:] = y_n + 0.5 * dt * (f_n + f_guess)
-    #             derivs[:, :, n] = 0.5 * (f_n + f_guess)
-
-    #             # --- Euler–Maruyama noise at y_n
-    #             if noise_amplitude:
-    #                 tmp_noise[:] = self.compute_noise_sample(y_n, noise_amplitude, dt, nd)
-    #             else:
-    #                 tmp_noise.fill(0.0)
-
-    #             y_next = y_c + tmp_noise
-
-    #             # ---- POSITIVITY FIX (minimal change) ----
-    #             eps = 1e-11
-    #             n_idx = np.arange(N_lasers) * 3 + 0
-    #             S_idx = np.arange(N_lasers) * 3 + 1
-    #             # clamp n and S only
-    #             # y_next[:, n_idx] = np.maximum(y_next[:, n_idx], eps)
-    #             y_next[:, S_idx] = np.maximum(y_next[:, S_idx], eps)
-
-
-
-    #             y[:, :, n + 1] = y_next
-
-    #             # --- Update f_hist and freqs
-    #             f_hist = np.roll(f_hist, shift=1, axis=2)
-    #             f_hist[:, :, 0] = derivs[:, :, n] + tmp_noise[:]/np.sqrt(dt)  # include noise contribution in derivative
-
-    #             freq_indices = np.arange(N_lasers) * 3 + 2  # indices of phi variables
-    #             freqs[:, :, n + 1] = f_hist[:, :, 0][:, freq_indices]
-
-
-    #             n += 1
-    #             if progress:
-    #                 pbar.update(1)
-
-    #     # Time array in physical units
-    #     t_dim = np.arange(steps) * dt * nd['tau_p']
-    #     return t_dim, y, freqs
-
-    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5):
+        Returns
+        -------
+        t_dim : np.ndarray
+            Dimensional time array (seconds).
+        y : np.ndarray
+            State time series, shape (n_cases, 3*N_lasers, steps).
+        freqs : np.ndarray
+            Instantaneous phase derivatives, shape (n_cases, N_lasers, steps).
+        smooth_freqs : bool
+            If True (default), apply a moving-average window over one delay to
+            smooth the returned frequency estimates.
+        """
 
         if nd is None:
             nd = self.nd
@@ -587,132 +499,353 @@ class VCSEL:
         steps = nd['steps']
         delay_steps = nd['delay_steps']
         noise_amplitude = nd['noise_amplitude']
-
-        # --- θ parameter 
-        # 0.5 = Crank–Nicolson, 1.0 = implicit Euler
-
-        # Prepare output arrays
-        y = np.zeros((n_cases, 3*N_lasers, steps))
-        derivs = np.zeros((n_cases, 3*N_lasers, steps))
-        freqs = np.zeros((n_cases, N_lasers, steps))
-        freqs[:, :, :2*delay_steps] = nd['delta_p'][None, :, None]
         phi_p = nd['phi_p']
+        save_every = int(max(1, nd.get('save_every', 1)))
+        smooth_window_delays = nd.get("smooth_window_delays", 1.0)
+        delay_interp = nd.get('delay_interp', None)
+        max_output_gb = nd.get('max_output_gb', None)
+        if max_output_gb is not None:
+            bytes_per_step = n_cases * (4 * N_lasers) * 8
+            est_bytes = bytes_per_step * steps
+            max_bytes = max_output_gb * 1e9
+            save_every_req = int(np.ceil(est_bytes / max_bytes)) if est_bytes > max_bytes else 1
+            save_every = max(save_every, save_every_req)
+            nd['save_every'] = save_every
+            if save_every_req > 1:
+                est_gb = est_bytes / 1e9
+                print(
+                    f"Estimated output size ~{est_gb:.2f} GB; "
+                    f"using save_every={save_every} to cap output."
+                )
 
         # Require full delay history
         if history.shape[2] < 2 * delay_steps:
             raise ValueError("history too short for configured delay_steps")
 
-        # Put initial history into output buffer
-        y[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
+        use_stream = save_every > 1
+        if use_stream:
+            buffer_len = 2 * delay_steps + 1
+            y_buf = np.zeros((n_cases, 3 * N_lasers, buffer_len))
+            freqs_buf = np.zeros((n_cases, N_lasers, buffer_len))
+            y_buf[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
+            keep_idx = []
+            y_keep = []
+            f_keep = []
+
+            def should_store(idx):
+                return idx % save_every == 0
+
+            for idx in range(min(2 * delay_steps, steps)):
+                if should_store(idx):
+                    keep_idx.append(idx)
+                    y_keep.append(history[:, :, idx].copy())
+                    f_keep.append(np.zeros((n_cases, N_lasers)))
+            keep_pos = {idx: pos for pos, idx in enumerate(keep_idx)}
+        else:
+            # ----------------- allocate outputs -----------------
+            y = np.zeros((n_cases, 3*N_lasers, steps))
+            freqs = np.zeros((n_cases, N_lasers, steps))
+            y[:, :, :2*delay_steps] = history[:, :, :2*delay_steps]
 
         start_idx = 2 * delay_steps - 1
         if start_idx >= steps:
             t_dim = np.arange(steps) * dt * nd['tau_p']
-            return t_dim, y
+            if use_stream:
+                return t_dim, history[:, :, :steps], np.zeros((n_cases, N_lasers, steps))
+            return t_dim, y, freqs
 
-        # Precompute delay indices
+        # ----------------- precompute indices -----------------
         idx_tau_arr = np.arange(steps) - delay_steps
         idx_2tau_arr = np.arange(steps) - 2 * delay_steps
         idx_tau_arr[idx_tau_arr < 0] = 0
         idx_2tau_arr[idx_2tau_arr < 0] = 0
+        if delay_interp in ("linear", "cubic"):
+            tau_steps = nd["tau"] / dt
+            k0 = int(np.floor(tau_steps))
+            frac = tau_steps - k0
+            tau2_steps = 2.0 * nd["tau"] / dt
+            k0_2 = int(np.floor(tau2_steps))
+            frac2 = tau2_steps - k0_2
 
-        # ---------- MAIN LOOP ----------
-        with tqdm(total=steps - 1 - start_idx, desc="Integrating",
+        S_idx = np.arange(N_lasers) * 3 + 1
+        phi_idx = np.arange(N_lasers) * 3 + 2
+
+        # ----------------- initialize frequency history -----------------
+        hist_len = min(2 * delay_steps, steps)
+        for n in range(hist_len):
+            if use_stream:
+                y_n = y_buf[:, :, n % buffer_len]
+                y_tau = y_buf[:, :, idx_tau_arr[n] % buffer_len]
+                y_2tau = y_buf[:, :, idx_2tau_arr[n] % buffer_len]
+            else:
+                y_n = y[:, :, n]
+                y_tau = y[:, :, idx_tau_arr[n]]
+                y_2tau = y[:, :, idx_2tau_arr[n]]
+
+            f_n = self.f_nd(
+                y_n, y_tau, y_2tau, n, phi_p, nd
+            )[:, :3*N_lasers]
+
+            deriv_n = f_n
+            if use_stream:
+                freqs_buf[:, :, n % buffer_len] = deriv_n[:, phi_idx]
+                pos = keep_pos.get(n)
+                if pos is not None:
+                    f_keep[pos] = deriv_n[:, phi_idx].copy()
+            else:
+                freqs[:, :, n] = deriv_n[:, phi_idx]
+
+        # ----------------- noise normalization -----------------
+        if noise_amplitude is None:
+            noise_arr = None
+            noise_mode = "none"
+        elif callable(noise_amplitude):
+            noise_arr = noise_amplitude
+            noise_mode = "callable"
+        elif np.isscalar(noise_amplitude):
+            noise_arr = noise_amplitude
+            noise_mode = "scalar"
+        else:
+            noise_arr = np.asarray(noise_amplitude)
+            noise_mode = "array"
+
+        # ----------------- work buffers -----------------
+        y_guess = np.empty((n_cases, 3*N_lasers))
+        y_new   = np.empty_like(y_guess)
+        tmp_noise = np.empty_like(y_guess)
+        noise_substeps = int(max(1, nd.get("noise_substeps", 1)))
+
+        # ----------------- main loop -----------------
+        with tqdm(total=steps - 1 - start_idx,
+                desc="Integrating",
                 disable=not progress) as pbar:
 
-            y_guess = np.empty((n_cases, 3*N_lasers))
-            tmp_noise = np.empty((n_cases, 3*N_lasers))
-            n = start_idx
+            for n in range(start_idx, steps - 1):
 
-            while n < steps - 1:
+                if use_stream:
+                    y_n = y_buf[:, :, n % buffer_len]
+                    if delay_interp in ("linear", "cubic"):
+                        idx_hi = max(n - k0, 0)
+                        idx_lo = max(n - k0 - 1, 0)
+                        y_tau_hi = y_buf[:, :, idx_hi % buffer_len]
+                        y_tau_lo = y_buf[:, :, idx_lo % buffer_len]
+                        if delay_interp == "cubic":
+                            idx_p0 = max(idx_lo - 1, 0)
+                            idx_p3 = max(idx_hi + 1, 0)
+                            p0 = y_buf[:, :, idx_p0 % buffer_len]
+                            p1 = y_tau_lo
+                            p2 = y_tau_hi
+                            p3 = y_buf[:, :, idx_p3 % buffer_len]
+                            t = 1.0 - frac
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
 
-                y_n = y[:, :, n]
+                        idx_hi2 = max(n - k0_2, 0)
+                        idx_lo2 = max(n - k0_2 - 1, 0)
+                        y_2tau_hi = y_buf[:, :, idx_hi2 % buffer_len]
+                        y_2tau_lo = y_buf[:, :, idx_lo2 % buffer_len]
+                        if delay_interp == "cubic":
+                            idx_p0_2 = max(idx_lo2 - 1, 0)
+                            idx_p3_2 = max(idx_hi2 + 1, 0)
+                            p0 = y_buf[:, :, idx_p0_2 % buffer_len]
+                            p1 = y_2tau_lo
+                            p2 = y_2tau_hi
+                            p3 = y_buf[:, :, idx_p3_2 % buffer_len]
+                            t = 1.0 - frac2
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_2tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                    else:
+                        idx_tau = idx_tau_arr[n + 1]
+                        idx_2tau = idx_2tau_arr[n + 1]
+                        y_tau = y_buf[:, :, max(idx_tau, 0) % buffer_len]
+                        y_2tau = y_buf[:, :, max(idx_2tau, 0) % buffer_len]
+                else:
+                    y_n = y[:, :, n]
+                    if delay_interp in ("linear", "cubic"):
+                        idx_hi = max(n - k0, 0)
+                        idx_lo = max(n - k0 - 1, 0)
+                        y_tau_hi = y[:, :, idx_hi]
+                        y_tau_lo = y[:, :, idx_lo]
+                        if delay_interp == "cubic":
+                            idx_p0 = max(idx_lo - 1, 0)
+                            idx_p3 = max(idx_hi + 1, 0)
+                            p0 = y[:, :, idx_p0]
+                            p1 = y_tau_lo
+                            p2 = y_tau_hi
+                            p3 = y[:, :, idx_p3]
+                            t = 1.0 - frac
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+                        idx_hi2 = max(n - k0_2, 0)
+                        idx_lo2 = max(n - k0_2 - 1, 0)
+                        y_2tau_hi = y[:, :, idx_hi2]
+                        y_2tau_lo = y[:, :, idx_lo2]
+                        if delay_interp == "cubic":
+                            idx_p0_2 = max(idx_lo2 - 1, 0)
+                            idx_p3_2 = max(idx_hi2 + 1, 0)
+                            p0 = y[:, :, idx_p0_2]
+                            p1 = y_2tau_lo
+                            p2 = y_2tau_hi
+                            p3 = y[:, :, idx_p3_2]
+                            t = 1.0 - frac2
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_2tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                    else:
+                        y_tau = y[:, :, idx_tau_arr[n + 1]]
+                        y_2tau = y[:, :, idx_2tau_arr[n + 1]]
 
-                idx_tau = idx_tau_arr[n + 1]
-                idx_2tau = idx_2tau_arr[n + 1]
-                y_tau = y[:, :, idx_tau]
-                y_2tau = y[:, :, idx_2tau]
+                # RHS at current step
+                f_n = self.f_nd(
+                    y_n, y_tau, y_2tau, n, phi_p, nd
+                )[:, :3*N_lasers]
 
-                # # --- RHS at y_n
-                # f_n = self.f_nd(
-                #     y_n, y_tau, y_2tau, n, phi_p, nd
-                # )[:, :3*N_lasers]
+                # initial guess (explicit Euler)
+                y_guess[:] = y_n
+                y_guess += dt * f_n
 
-                # # --- Predictor (explicit Euler)
-                # y_guess[:] = y_n + dt * f_n
+                # fixed-point iteration
+                for _ in range(max_iter):
 
-                # # --- RHS at predicted state
-                # f_guess = self.f_nd(
-                #     y_guess, y_tau, y_2tau, n + 1, phi_p, nd
-                # )[:, :3*N_lasers]
-
-                # # --- θ-method update
-                # y_c = y_n + dt * ((1.0 - theta) * f_n + theta * f_guess)
-                # derivs[:, :, n] = (1.0 - theta) * f_n + theta * f_guess
-
-                # --- RHS at current step
-                f_n = self.f_nd(y_n, y_tau, y_2tau, n, phi_p, nd)[:, :3*N_lasers]
-
-                # --- initial guess (explicit Euler / θ-method predictor)
-                y_guess = y_n + dt * f_n  # works for any θ, good initial guess
-
-                # --- fixed-point iteration for implicit part
-                tol = 1e-10
-                for p in range(max_iter):
                     f_guess = self.f_nd(y_guess, y_tau, y_2tau, n + 1, phi_p, nd)[:, :3*N_lasers]
-                    
-                    # θ-method update in iteration
-                    y_new = y_n + dt * ((1.0 - theta) * f_n + theta * f_guess)
-                    
-                    # check convergence
-                    if np.max(np.abs(y_new - y_guess)) < tol:
+
+                    y_new[:] = y_n
+                    y_new += dt * ((1.0 - theta) * f_n + theta * f_guess)
+
+                    if np.max(np.abs(y_new - y_guess)) < 1e-10:
                         break
-                    
+
                     y_guess[:] = y_new
 
                 y_c = y_guess
 
-        
-                derivs[:, :, n] = (1.0 - theta) * f_n + theta * f_guess
-
-                # --- Euler–Maruyama noise
-                if noise_amplitude is None:
-                    tmp_noise.fill(0.0)
+                # derivative used for frequency
+                deriv_n = (1.0 - theta) * f_n + theta * f_guess
+                if use_stream:
+                    freqs_buf[:, :, (n + 1) % buffer_len] = deriv_n[:, phi_idx]
                 else:
-                    # Scalar or array handling
-                    if np.isscalar(noise_amplitude):
-                        na = noise_amplitude
+                    freqs[:, :, n + 1] = deriv_n[:, phi_idx]
+
+                # Euler–Maruyama noise (optionally substepped)
+                if noise_mode == "none":
+                    y_next = y_c
+                else:
+                    if noise_mode == "scalar":
+                        na = noise_arr
+                    elif noise_mode == "callable":
+                        na = noise_arr(n * dt * nd["tau_p"])
                     else:
-                        # Assume array-like
-                        na = noise_amplitude[n] if noise_amplitude.shape == (steps,) else noise_amplitude[0]
+                        na = noise_arr[n]
 
-                    tmp_noise[:] = self.compute_noise_sample(
-                        y_n, na, dt, nd
-                    )
+                    if noise_substeps == 1:
+                        tmp_noise[:] = self.compute_noise_sample(
+                            y_c, na, dt, nd
+                        )
+                        y_next = y_c + tmp_noise
+                        y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
+                    else:
+                        y_next = y_c.copy()
+                        dt_sub = dt / noise_substeps
+                        for _ in range(noise_substeps):
+                            tmp_noise[:] = self.compute_noise_sample(
+                                y_next, na, dt_sub, nd
+                            )
+                            y_next += tmp_noise
+                            y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
 
-                y_next = y_c + tmp_noise
+                if use_stream:
+                    y_buf[:, :, (n + 1) % buffer_len] = y_next
+                    if should_store(n + 1):
+                        keep_idx.append(n + 1)
+                        y_keep.append(y_next.copy())
+                        f_keep.append(freqs_buf[:, :, (n + 1) % buffer_len].copy())
+                else:
+                    y[:, :, n + 1] = y_next
 
-                # ---- POSITIVITY FIX ----
-                eps = 1e-11
-                S_idx = np.arange(N_lasers) * 3 + 1
-                y_next[:, S_idx] = np.maximum(y_next[:, S_idx], eps)
-
-                # ---- PHASE WRAP (important in chaos)
-                phi_idx = np.arange(N_lasers) * 3 + 2
-                y_next[:, phi_idx] = np.mod(y_next[:, phi_idx], 2*np.pi)
-
-                y[:, :, n + 1] = y_next
-
-                # --- Frequencies (use weighted derivative)
-                freqs[:, :, n + 1] = derivs[:, phi_idx, n]
-
-                n += 1
                 if progress:
                     pbar.update(1)
 
+        if use_stream:
+            keep_idx = np.array(keep_idx, dtype=int)
+            order = np.argsort(keep_idx)
+            keep_idx = keep_idx[order]
+            y_out = np.stack([y_keep[i] for i in order], axis=2)
+            freqs_out = np.stack([f_keep[i] for i in order], axis=2)
+            t_dim = keep_idx * dt * nd['tau_p']
+
+            window = max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+            window = min(window, freqs_out.shape[2])
+            if smooth_freqs and window > 1:
+                kernel = np.ones(window) / window
+                pad = window // 2
+                freqs_sm = np.empty_like(freqs_out)
+                for i in range(n_cases):
+                    for j in range(N_lasers):
+                        series = freqs_out[i, j, :]
+                        if pad > 0:
+                            series = np.pad(series, (pad, pad), mode="edge")
+                        smoothed = np.convolve(series, kernel, mode="valid")
+                        freqs_sm[i, j, :] = smoothed[:freqs_out.shape[2]]
+                        if pad > 0:
+                            freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+                freqs_out = freqs_sm
+
+            return t_dim, y_out, freqs_out
+
+        if smooth_freqs:
+            window = max(1, int(round(delay_steps * smooth_window_delays)))
+            window = min(window, steps)
+            kernel = np.ones(window) / window
+            freqs_sm = np.empty_like(freqs)
+            pad = window // 2
+            for i in range(n_cases):
+                for j in range(N_lasers):
+                    series = freqs[i, j, :]
+                    if pad > 0:
+                        series = np.pad(series, (pad, pad), mode="edge")
+                    smoothed = np.convolve(series, kernel, mode="valid")
+                    freqs_sm[i, j, :] = smoothed[:steps]
+                    if pad > 0:
+                        freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+            freqs = freqs_sm
 
         t_dim = np.arange(steps) * dt * nd['tau_p']
         return t_dim, y, freqs
+
+
+    
+    
 
 
     
@@ -761,18 +894,16 @@ class VCSEL:
         # ramp is the normalized ramp value (0.0 to 1.0)
         ramp = 0.5 - 0.5 * np.cos(np.pi * u)
         
-        # The final step uses broadcasting:
-        # ramp is broadcast against (kappa_final - kappa_initial) and kappa_initial.
-        # The result's shape will be the broadcast shape of t and the kappas.
         return kappa_initial + (kappa_final - kappa_initial) * ramp
 
-    def generate_history(self, nd=None, shape='FR', n_cases=1):
+
+    def generate_history(self, nd=None, shape='FR', n_cases=1, counts=None, guesses=None):
         """
         Produce an initial history array required by the delay integrator.
 
         The integrator expects inputs for times t in [-2*tau, 0]. This routine
-        returns an array shaped (n_cases, 6, 2*delay_steps) in nondimensional
-        units.
+        returns arrays shaped (n_cases, 3*N_lasers, 2*delay_steps) in
+        nondimensional units.
 
         Parameters
         ----------
@@ -783,19 +914,38 @@ class VCSEL:
               - 'FR' : free-running steady-state history (steady carriers and
                        steady photon numbers, linear phase ramp from detuning)
               - 'ZF' : zero-field history (all fields zero except phase ramp)
+              - 'EQ' : equilibrium histories for all steady-state solutions
         n_cases : int
             Number of independent cases to tile the history for.
+        counts : dict or None
+            Optional override for phase and frequency seed counts when
+            shape='EQ'.
+        guesses : list of np.ndarray or None
+            Optional equilibrium guesses passed to solve_equilibria when
+            shape='EQ'.
 
         Returns
         -------
-        history : np.ndarray, shape (n_cases, 6, 2*delay_steps)
+        history : np.ndarray, shape (n_cases, 3*N_lasers, 2*delay_steps)
             History suitable as input to integrate().
+        freq_hist : np.ndarray, shape (n_cases, N_lasers, 2*delay_steps)
+            Frequency history (rad/s) inferred from the detuning or equilibrium.
+        eq : np.ndarray or None
+            Final equilibrium when shape='EQ', otherwise None.
+        results : np.ndarray or None
+            All equilibrium solutions (None for non-'EQ' shapes).
+
+        Notes
+        -----
+        This method always returns four values. For non-'EQ' shapes, results
+        is None.
         """
         if nd is None:
             nd = self.nd
         ds = nd['delay_steps']
         length = 2 * ds
         eq = None
+        results = None
 
         N_lasers = nd.get('N_lasers', 2)
 
@@ -833,35 +983,53 @@ class VCSEL:
                     hist[3*p+2, :] = delta_p * np.arange(length) * nd['dt']  
                     freq_hist[p, :] = delta_p * np.ones(length) / (2*np.pi*1e9*nd['tau_p'])  # convert back to rad/s
         elif shape == 'EQ':
-            # Steady-state equilibrium
+            # Steady-state equilibrium histories for all solutions.
             N_lasers = nd.get('N_lasers', 2)
-            hist = np.zeros((n_cases, 3*N_lasers, length))
-            freq_hist = np.zeros((n_cases, N_lasers, 2*nd['delay_steps']))
-            for k, phi_p in enumerate(nd['phi_p']):
-                eq, _ = self.solve_equilibria(nd=nd, phi_p=phi_p)
+            eq, results, _ = self.solve_equilibria(nd=nd, counts=counts, guesses=guesses)
 
-                if eq is not None:
-                    omega = eq[-1]
-                    phase_diff = np.concatenate([[0.0], eq[2*N_lasers:(3*N_lasers -1)]])[:N_lasers]#np.concatenate([[0.0], eq[2*N_lasers:3*N_lasers-1]])
+            if results is None or len(results) == 0:
+                hist = np.zeros((0, 3 * N_lasers, length))
+                freq_hist = np.zeros((0, N_lasers, length))
+                return hist, freq_hist, eq, results
 
-                    hist[k, 0::3, :] = eq[0::2][:N_lasers].reshape(-1,1)*np.ones(shape=(N_lasers,length))         # n1
-                    hist[k, 1::3, :] = eq[1::2][:N_lasers].reshape(-1,1)*np.ones(shape=(N_lasers,length))            # S1 (nondimensional)
-                    hist[k, 2::3, :] = omega * nd['dt'] * np.arange(length)*np.ones(shape=(N_lasers,length))       # phi1
-                    hist[k, 2::3, :] += phase_diff.reshape(-1,1)  
-                    freq_hist[k, :, :] = omega * np.ones((N_lasers, length)) / (2*np.pi*1e9*nd['tau_p'])  # convert back to rad/s
+            n_cases_out = results.shape[0]
+            kappa = nd.get("kappa", None)
+            if isinstance(kappa, (list, tuple, np.ndarray)):
+                kappa_arr = np.array(kappa)
+                if kappa_arr.ndim == 3:
+                    nd["kappa"] = np.repeat(kappa_arr[-1][None, :, :], kappa_arr.shape[0], axis=0)
+            phi_p = nd.get("phi_p", 0.0)
+            if np.isscalar(phi_p):
+                nd["phi_p"] = np.full((n_cases_out, N_lasers, N_lasers), phi_p)
+            else:
+                phi_p_arr = np.array(phi_p)
+                if phi_p_arr.ndim == 2 and phi_p_arr.shape == (N_lasers, N_lasers):
+                    nd["phi_p"] = np.tile(phi_p_arr[None, :, :], (n_cases_out, 1, 1))
+                elif phi_p_arr.ndim == 3 and phi_p_arr.shape == (1, N_lasers, N_lasers):
+                    nd["phi_p"] = np.tile(phi_p_arr, (n_cases_out, 1, 1))
+                elif phi_p_arr.ndim == 3 and phi_p_arr.shape == (n_cases_out, N_lasers, N_lasers):
+                    nd["phi_p"] = phi_p_arr
                 else:
-                    hist[k, 0, :] = nd['nbar']         # n1
-                    hist[k, 1, :] = nd['sbar']         # S1 (nondimensional)
-                    hist[k, 2, :] = 0.0       # phi1
-                    hist[k, 3, :] = nd['nbar']         # n2
-                    hist[k, 4, :] = nd['sbar']         # S2
-                    # phi2: linear ramp consistent with delta (nondimensional)
-                    hist[k, 5, :] = nd['delta_p'] * np.arange(length) * nd['dt']
+                    warnings.warn(
+                        "phi_p has an unexpected shape; leaving nd['phi_p'] unchanged.",
+                        RuntimeWarning,
+                    )
 
+            hist = np.zeros((n_cases_out, 3 * N_lasers, length))
+            freq_hist = np.zeros((n_cases_out, N_lasers, length))
+            t_arr = np.arange(length) * nd["dt"]
 
+            for k, root in enumerate(results):
+                omega = root[-1]
+                phase_diff = np.concatenate([[0.0], root[2 * N_lasers:(3 * N_lasers - 1)]])[:N_lasers]
 
-            # history = np.tile(hist[np.newaxis, :, :], (n_cases, 1, 1))
-            return hist, freq_hist, eq
+                hist[k, 0::3, :] = root[0::2][:N_lasers].reshape(-1, 1)
+                hist[k, 1::3, :] = root[1::2][:N_lasers].reshape(-1, 1)
+                hist[k, 2::3, :] = omega * t_arr
+                hist[k, 2::3, :] += phase_diff.reshape(-1, 1)
+                freq_hist[k, :, :] = omega / (2 * np.pi * 1e9 * nd["tau_p"])
+
+            return hist, freq_hist, eq, results
 
         else:
             raise ValueError("unsupported history shape")
@@ -869,9 +1037,15 @@ class VCSEL:
         # Tile for multiple cases
         history = np.tile(hist[np.newaxis, :, :], (n_cases, 1, 1))
         freq_hist = np.tile(freq_hist[np.newaxis, :, :], (n_cases, 1, 1))
-        return history, freq_hist, eq
-    
-    def solve_equilibria(self, nd, phi_p=None, guesses=None):
+        return history, freq_hist, eq, results
+
+
+    def solve_one(self,resid, guess, nd, phi_p=None):
+
+        sol = root(resid, guess, args=(nd,), tol=1e-10, method='hybr',)
+        return sol
+
+    def solve_equilibria(self, nd, phi_p=None, guesses=None, counts=None, n_jobs=-1):
         """
         Solve for steady-state roots of the coupled VCSEL system.
 
@@ -879,19 +1053,30 @@ class VCSEL:
         ----------
         nd : dict
             Nondimensional parameters.
-        residuals_func : callable
-            Function of the form residuals(x, nd=...).
         guesses : list of np.ndarray
-            List of initial guesses, each shape (6,).
-        tol : float
-            Tolerance for solver convergence.
+            Optional initial guesses in the form
+            [S1, S2, ..., SN, phi_2, ..., phi_N, omega].
+        counts : dict or None
+            Optional override for grid and refinement settings:
+              - phase_count: number of phase samples
+              - freq_count: number of frequency samples
+              - adaptive_grid: whether to refine the grid
+              - refine_factor: multiplier for grid density per refinement
+              - max_refine: number of refinement passes
+        phi_p : unused
+            Reserved for future phase-dependent seeding.
 
         Returns
         -------
-        results : list of dict
-            Each dict contains {'x': root_vector, 'success': bool, 'res_norm': float}.
+        final_root : np.ndarray or None
+            Selected equilibrium vector [n1, S1, ..., nN, SN, phi_2..phi_N, omega].
+        results : np.ndarray
+            Candidate equilibria with the same ordering as final_root.
+        E_tot : np.ndarray or None
+            Total field intensity used to select final_root.
         """
         results = []
+        E_tot = None
 
         if nd is None:
             nd = self.nd
@@ -908,76 +1093,156 @@ class VCSEL:
         # ----------------------------
         tol = 1e-10
 
-        phase_count = 20
-        max_omg = 10 * 2 * np.pi * 1e9 * nd['tau_p']#np.max(np.abs(nd['delta_p']))
-        phase_vals = np.linspace(-2*np.pi, 2*np.pi, phase_count, endpoint=False)
-        omega_seeds = np.linspace(-max_omg, max_omg, 200)#np.linspace(-1*nd['delta_p'], 1*nd['delta_p'], 50)  # try zero and the detuning as initial omega guesses
-
-        
-        for phi in phase_vals:
-            for omega_guess in omega_seeds:
-                guesses.append(np.concatenate([
-                    np.tile([nd['nbar'], nd['sbar']], N_lasers),  # n1, S1, n2, S2, ...
-                    np.full(N_lasers-1, phi),                      # φ1, φ2, ...
-                    np.array([omega_guess])                      # ω
-                ]))
-
-        
-
-        for i, guess in enumerate(guesses):
-            sol = root(self.residuals, guess, args=(nd,phi_p,), tol=tol, method='hybr',)
-            res_norm = np.linalg.norm(sol.fun)
-            # from scipy.optimize import least_squares
-            if res_norm < tol and sol.success:
-                results.append(sol.x)
-
-
-        if results:
-            results = np.array(results)
-
-            results[:, 2*N_lasers : 3*N_lasers - 1] = results[:, 2*N_lasers : 3*N_lasers - 1] % (2.0 * np.pi)  # wrap phases to [0, 2pi)
-            
-
-            omega = results[:, -1]
-
-            S = results[:,1::2][:,:N_lasers]                # (n_roots, N)
-            valid_indices = np.all(S > 0.0, axis=1)   # only keep roots with all S_i > 0
-            S = S[valid_indices]
-            omega = omega[valid_indices]
-            phi = np.zeros((len(S), N_lasers))
-            phi[:, 1:] = results[valid_indices, 2*N_lasers : 3*N_lasers - 1] # phi1 = 0
-
-            
-            E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
-            E_tot = np.abs(np.sum(E, axis=1))**2
-
-            final_root = results[np.argmax(E_tot)]
+        if counts:
+            phase_count = counts.get('phase_count', 30)
+            freq_count = counts.get('freq_count', 100)
+            adaptive_grid = counts.get('adaptive_grid', True)
+            refine_factor = counts.get('refine_factor', 2)
+            max_refine = counts.get('max_refine', 3)
         else:
-            final_root = None
+            phase_count = 30
+            freq_count = 100
+            adaptive_grid = True
+            refine_factor = 2
+            max_refine = 3
 
-        return final_root, results
+        base_omg = 10 * 2 * np.pi * 1e9 * nd['tau_p']
+        if guesses:
+            max_guess_omg = max(abs(g[-1]) for g in guesses)
+        else:
+            max_guess_omg = 0.0
+        max_omg = max(base_omg, 2.0 * max_guess_omg)
 
-    def residuals(self, x, nd=None, phi_p_override=None):
+        # Start from any user-supplied guesses, then add grid samples per refinement.
+        seed_guesses = list(guesses)
+        prev_count = -1
+        final_root = None
+        results = []
+        E_tot = None
+        # Each refinement multiplies the phase and frequency grid density.
+        refine_steps = max_refine + 1 if adaptive_grid else 1
+        for refine_idx in range(refine_steps):
+            # Effective grid size for this refinement level.
+            phase_count_eff = int(phase_count * (refine_factor ** refine_idx))
+            freq_count_eff = int(freq_count * (refine_factor ** refine_idx))
+            guesses_iter = list(seed_guesses)
+
+            # Build the phase/omega grid and append to the current guess set.
+            phase_vals = np.linspace(-np.pi, np.pi, phase_count_eff, endpoint=False)
+            omega_seeds = np.linspace(-max_omg, max_omg, freq_count_eff)
+            for phi in phase_vals:
+                for omega_guess in omega_seeds:
+                    guesses_iter.append(np.concatenate([
+                        np.tile([nd['sbar']], N_lasers),
+                        np.full(N_lasers-1, phi),
+                        np.array([omega_guess])
+                    ]))
+
+            solutions = Parallel(n_jobs=n_jobs)(
+                delayed(self.solve_one)(self.residuals, g, nd) for g in guesses_iter
+            )
+
+            # Collect candidate equilibria from this grid.
+            results_iter = []
+            for sol in solutions:
+                if not sol.success:
+                    continue
+                res_norm = np.linalg.norm(sol.fun)
+                if res_norm >= tol:
+                    continue
+
+                s = nd['s']
+                p = nd['p']
+                S = sol.x[:N_lasers]
+                n = (1 + S/(1 + s * S))**(-1) * (p - S/(1 + s * S))
+
+                solution = np.zeros(3*N_lasers)
+                solution[0::2][:N_lasers] = n
+                solution[1::2][:N_lasers] = S
+                solution[2*N_lasers:3*N_lasers-1] = sol.x[N_lasers:2*N_lasers-1]
+                solution[-1] = sol.x[-1]
+                results_iter.append(solution)
+
+            # Deduplicate and filter candidates using residuals and heuristics.
+            if results_iter:
+                unique = []
+                results_arr = np.array(results_iter)
+                for r in results_arr:
+                    r[2*N_lasers:3*N_lasers-1] = r[2*N_lasers:3*N_lasers-1] % (2 * np.pi)
+                    formatted_res = np.concatenate([
+                        r[1::2][:N_lasers],
+                        r[2*N_lasers:3*N_lasers-1],
+                        [r[-1]]
+                    ])
+                    res_norm = np.linalg.norm(self.residuals(formatted_res, nd))
+                    if res_norm >= 1e-6:
+                        continue
+                    if any(np.allclose(r, u, atol=1e-3, rtol=1e-3) for u in unique):
+                        continue
+                    if not np.all(r[1::2][:N_lasers] > 0.0) or not np.isfinite(r).all():
+                        continue
+                    photon_nums = r[1::2][:N_lasers]
+                    epsilon = 1e-12
+                    if photon_nums.max() / (photon_nums.min() + epsilon) > 10:
+                        continue
+                    unique.append(r)
+                results_arr = np.array(unique)
+            else:
+                results_arr = np.array([])
+
+            # Compute total field to pick a representative equilibrium.
+            if results_arr.size > 0:
+                results_arr[:, 2*N_lasers : 3*N_lasers - 1] = (
+                    results_arr[:, 2*N_lasers : 3*N_lasers - 1] % (2.0 * np.pi)
+                )
+                omega = results_arr[:, -1]
+                S = results_arr[:,1::2][:,:N_lasers]
+                valid_indices = np.all(S > 0.0, axis=1)
+                S = S[valid_indices]
+                omega = omega[valid_indices]
+                phi = np.zeros((len(S), N_lasers))
+                phi[:, 1:] = results_arr[valid_indices, 2*N_lasers : 3*N_lasers - 1]
+                E = np.sqrt(S) * np.exp(1j * (omega[:, None] * tau + phi))
+                E_tot_iter = np.abs(np.sum(E, axis=1))**2
+                final_root = results_arr[np.argmax(E_tot_iter)] if results_arr.size else None
+            else:
+                E_tot_iter = None
+
+            # Stop refining if no new equilibria are found.
+            if results_arr.shape[0] <= prev_count:
+                break
+            prev_count = results_arr.shape[0]
+            results = results_arr
+            E_tot = E_tot_iter
+
+        return final_root, results, E_tot
+
+    def residuals(self, x, nd=None, verbose=False):
         """
         Compute vector residuals for steady-state equations of coupled VCSELs,
         including proper phase wrapping and delay-phase correction.
 
-        x = [n1, S1, n2, S2, phase_diff, omega]
-        returns residuals [dn1, dS1, dn2, dS2, dphi2 - dphi1, dphi1 - omega]
-        """
-        import numpy as np
+        x = [S1, S2, ..., SN, phi_2, ..., phi_N, omega]
+        returns residuals [dS1..dSN, dphi2-dphi1 .. dphiN-dphi1, mean(dphi)-omega]
 
+        Parameters
+        ----------
+        x : np.ndarray
+            State vector [S1..SN, phi_2..phi_N, omega].
+        nd : dict or None
+            Nondimensional parameters (if None uses self.nd).
+        verbose : bool
+            If True, emit warnings when time-varying or stacked parameters are
+            reduced to a single matrix.
+        """
         N_lasers = nd['N_lasers']
 
-        n = x[0:2*N_lasers][::2]
-        S = x[1:2*N_lasers][::2]
-        # phase_diff = np.zeros((N_lasers, N_lasers))
-        # phase_diff[np.triu_indices(N_lasers, k=1)] = x[2*N_lasers:(2*N_lasers + np.sum(np.arange(N_lasers)))]
-        # phase_diff = phase_diff + phase_diff.T
+        S = x[:N_lasers]
+        n = (1 + S/(1 + nd['s'] * S))**(-1) * (nd['p'] - S/(1 + nd['s'] * S))  # invert photon equation to get n
 
         # Steady-state phase offsets φ̃_i
         phi_tilde = np.zeros(N_lasers)
-        phi_tilde[1:] = x[2*N_lasers : 3*N_lasers - 1]
+        phi_tilde[1:] = x[N_lasers : 2*N_lasers - 1]
 
 
         omega = x[-1]
@@ -986,7 +1251,10 @@ class VCSEL:
         nd = nd if nd is not None else self.nd
 
         # Unpack parameters
-        T = nd['T']; s = nd['s']; nbar = nd['nbar']; p = nd['p']
+        T = nd['T']
+        s = nd['s']
+        nbar = nd['nbar']
+        p = nd['p']
         delta = nd.get('delta_p', 0.0)
         beta_n = nd.get('beta_n', 0.0)
         beta_const = nd.get('beta_const', 0.0)
@@ -994,16 +1262,37 @@ class VCSEL:
         tau = nd.get('tau', 0.0)
         coupling = nd.get('coupling', 0.0)
         self_fb = nd.get('self_feedback', 0.0)
-        kappa_c = nd['kappa'] if isinstance(nd.get('kappa'), (list, tuple, np.ndarray)) else nd.get('kappa', 0.0)
+        kappa_c = nd.get('kappa', 0.0)
+        if isinstance(kappa_c, (list, tuple, np.ndarray)):
+            kappa_arr = np.array(kappa_c)
+            if kappa_arr.ndim == 3:
+                if verbose:
+                    warnings.warn(
+                        "kappa provided as a time series; using the last entry.",
+                        RuntimeWarning,
+                    )
+                kappa_c = kappa_arr[-1]
+            else:
+                kappa_c = kappa_arr
 
         
 
-        # Choose phi_p
-        if phi_p_override is not None:
-            phi_p = phi_p_override
-        else:
-            phi_p = nd.get('phi_p', 0.0)
-            #float(phi_p_val[-1]) if isinstance(phi_p_val, (list, tuple, np.ndarray)) else float(phi_p_val)
+        phi_p = nd.get('phi_p', 0.0)
+        if isinstance(phi_p, (list, tuple)) and len(phi_p) > 0:
+            if np.ndim(phi_p[0]) == 2:
+                if verbose:
+                    warnings.warn(
+                        "phi_p provided as a list of matrices; using the first entry.",
+                        RuntimeWarning,
+                    )
+                phi_p = np.array(phi_p[0])
+        elif isinstance(phi_p, np.ndarray) and phi_p.ndim == 3:
+            if verbose:
+                warnings.warn(
+                    "phi_p provided as a stack of matrices; using the first entry.",
+                    RuntimeWarning,
+                )
+            phi_p = phi_p[0]
 
         
         # Safety clip
@@ -1029,6 +1318,7 @@ class VCSEL:
             dn[i] = inv_T * (
                 p - n[i] - (1.0 + n[i]) * S_c[i] / (1.0 + s * S_c[i])
             )
+
 
             # -----------------------------
             # Photon equation: self-feedback
@@ -1065,10 +1355,9 @@ class VCSEL:
                 # Phase equation
                 dphi[i] += kappa_c[i,j] * coupling * sqrt_S[j] / sqrt_S[i] * sin_ij
         
-        out = np.zeros(2*N_lasers + (N_lasers - 1) + 1)  # dn1, dS1, dn2, dS2, dphi2- dphi1, dphi1 - omega
-        out[0:2*N_lasers][::2] = dn
-        out[0:2*N_lasers][1::2] = dS
-        out[2*N_lasers:3*N_lasers-1] = dphi[1:] - dphi[0]
+        out = np.zeros(N_lasers + (N_lasers - 1) + 1)
+        out[:N_lasers] = dS
+        out[N_lasers:2*N_lasers-1] = dphi[1:] - dphi[0]
 
         out[-1] = np.mean(dphi) - omega
 
@@ -1139,8 +1428,8 @@ class VCSEL:
 
         Parameters
         ----------
-        y : np.ndarray, shape (n_cases, 6, steps)
-            Nondimensional state time series to be converted (converted in-place).
+        y : np.ndarray, shape (n_cases, 3*N_lasers, steps)
+            Nondimensional state time series for N_lasers.
         phys : dict
             Original physical parameter dictionary; required keys: g0, tau_p, tau_n, N0.
 
@@ -1154,29 +1443,48 @@ class VCSEL:
         tau_n = phys['tau_n']
         N0 = phys['N0']
 
-        # In-place conversion of carriers and photon numbers back to SI units
-        y[:, 0, :] = y[:, 0, :] / (g0 * tau_p) + N0 + 1.0 / (g0 * tau_p)  # n1 -> N1
-        y[:, 1, :] = y[:, 1, :] / (g0 * tau_n)  # S1 -> physical photon number
-        # phi1 unchanged
-        y[:, 3, :] = y[:, 3, :] / (g0 * tau_p) + N0 + 1.0 / (g0 * tau_p)  # n2 -> N2
-        y[:, 4, :] = y[:, 4, :] / (g0 * tau_n)  # S2 -> physical photon number
-        # phi2 unchanged
+        # In-place conversion of carriers and photon numbers back to SI units.
+        n_idx = slice(0, None, 3)
+        s_idx = slice(1, None, 3)
+        y[:, n_idx, :] = y[:, n_idx, :] / (g0 * tau_p) + N0 + 1.0 / (g0 * tau_p)
+        y[:, s_idx, :] = y[:, s_idx, :] / (g0 * tau_n)
+        # phase components remain unchanged
         return y
     
     @staticmethod
     def build_coupling_matrix(time_arr, kappa_initial, kappa_final, N_lasers, ramp_start, ramp_shape, tau, scheme='ATA', aMAT=None, dx=None, plot=False):
         """
-        Build the coupling matrix for two VCSELs from time-dependent coupling array.
+        Build a time-dependent coupling matrix for N_lasers with a cosine ramp.
 
         Parameters
         ----------
-        kappa_arr : np.ndarray, shape (steps,)
-            Time-dependent coupling strength array.
+        time_arr : np.ndarray, shape (steps,)
+            Time axis (seconds).
+        kappa_initial : float
+            Initial coupling strength.
+        kappa_final : float
+            Final coupling strength.
+        N_lasers : int
+            Number of lasers.
+        ramp_start : float
+            Ramp start time in units of tau.
+        ramp_shape : float
+            10-90 rise time in units of tau.
+        tau : float
+            Delay time (seconds).
+        scheme : str
+            Coupling scheme ('ATA', 'NN', 'CUSTOM', 'RANDOM', 'DECAYED').
+        aMAT : np.ndarray or None
+            Adjacency matrix for CUSTOM/RANDOM schemes.
+        dx : float or None
+            Spatial decay parameter for DECAYED scheme.
+        plot : bool
+            If True, display a plot of the final coupling matrix.
 
         Returns
         -------
-        kappa_mat : np.ndarray, shape (steps, 2)
-            Coupling matrix for the two VCSELs.
+        kappa_mat : np.ndarray, shape (steps, N_lasers, N_lasers)
+            Coupling matrix time series.
         """
 
         kappa_initial = np.ones(shape=(N_lasers,N_lasers))* kappa_initial
@@ -1245,127 +1553,455 @@ class VCSEL:
             plt.xticks([0, N_lasers - 1], ['1', str(N_lasers)], fontsize=14)
             plt.yticks([0, N_lasers - 1], ['1', str(N_lasers)], fontsize=14)
             plt.tight_layout()
-            # plt.savefig(f'decayed_coupling/coupling_dx_{dx:.2f}.png', dpi=300)
             plt.show()
 
         
         return kappa_mat
 
+    def compute_jacobians(self, x, nd, verbose=False):
+        """
+        Analytic Jacobians of the nondimensional VCSEL DDE
+        evaluated at a ROTATING-FRAME EQUILIBRIUM.
 
-# If executed as a script, run a short example demonstrating the usage of VCSEL
-if __name__ == "__main__":
-    import numpy as np
-    import matplotlib.pyplot as plt
-    from matplotlib import rc
-    from sympy import symbols, Eq, solve
-    from itertools import combinations
+        Parameters
+        ----------
+        x : (3N,) array
+            Steady-state vector ordered as
+            [n1, S1, ..., nN, SN, phi_2..phi_N, omega].
+        nd : dict
+            Parameters
+        verbose : bool
+            If True, emit warnings when time-varying matrices are reduced to a single matrix.
+        verbose : bool
+            If True, emit warnings when time-varying parameters are reduced to
+            a single matrix.
 
-    alpha = 2
-    tau_p = 5.4e-12
-    tau_n = 0.25e-9
-    g0 = 8.75e-4 * 1e9
-    N0 = 2.86e5
-    s = 4e-6 
-    q = 1.602e-19
-    beta = 1.e-3
-    # kappa_c = 12e9
-    tau = 1e-9  # delay (s)
-    eta = 0.9
-    current_threshold = 3
-    I = eta*current_threshold * q/ tau_n * (N0 + 1/(g0*tau_p))
+        Returns
+        -------
+        A0, A1, A2 : (3N, 3N)
+            Instantaneous, tau-delay, 2tau-delay Jacobians
+        """
+
+        omega = x[-1]
+        eps = 1e-12
+        N = len(x)//3
+        dim = 3*N
+
+        n = x[0::2][:N]
+        S = np.maximum(x[1::2][:N], eps)
+        phi = np.zeros(N)
+        phi[1:] = x[2*N : 3*N - 1]   
+        
+
+        sqrtS = np.sqrt(S)
+
+        sqrtS_tau  = sqrtS  # assume constant S at equilibrium
+        sqrtS_2tau = sqrtS
+
+        # =========================================================
+        # parameters
+        # =========================================================
+        T      = nd["T"]
+        s      = nd["s"]
+        nbar   = nd["nbar"]
+        beta_n = nd["beta_n"]
+        alpha  = nd["alpha"]
+
+        phi_p = np.array(nd["phi_p"])
+        if phi_p.ndim == 3:
+            if verbose:
+                warnings.warn(
+                    "phi_p provided as a time series; using the last entry.",
+                    RuntimeWarning,
+                )
+            phi_p = phi_p[-1]
+        kappa_full = np.array(nd["kappa"])
+        if kappa_full.ndim == 3:
+            if verbose:
+                warnings.warn(
+                    "kappa provided as a time series; using the last entry.",
+                    RuntimeWarning,
+                )
+            kappa_full = kappa_full[-1]
+        kappa_diag = np.diag(kappa_full)
+        kappa_mat  = kappa_full - np.diag(kappa_diag)
+
+        coupling = nd["coupling"]
+        self_fb  = nd["self_feedback"]
+
+        phi_p_self   = np.diag(phi_p)
+        phi_p_mutual = phi_p - np.diag(phi_p_self)
+
+        denom = 1 + s*S
+
+        # =========================================================
+        # allocate
+        # =========================================================
+        A0 = np.zeros((dim,dim))
+        A1 = np.zeros((dim,dim))
+        A2 = np.zeros((dim,dim))
+
+        def idx(i,v):
+            #i = laser index
+            #v = variable index (0=n,1=S,2=phi)
+            return 3*i + v
+
+        # =========================================================
+        # A0 : intrinsic physics (ALL VERIFIED)
+        # =========================================================
+        for i in range(N):
+            A0[idx(i,0),idx(i,0)] = -1/T - S[i]/(T*denom[i]) # dn_i/dn_i
+            A0[idx(i,0),idx(i,1)] = -1/T * ((denom[i]*(1+n[i]) - (1+n[i])*S[i]*s)/(denom[i]**2)) # dn_i/dS_i
+            A0[idx(i,1),idx(i,0)] = S[i]/denom[i] + beta_n # dS_i/dn_i
+            A0[idx(i,1),idx(i,1)] = (denom[i]*(1+n[i]) - (1+n[i])*S[i]*s)/(denom[i]**2) - 1 # dS_i/dS_i
+            A0[idx(i,2),idx(i,0)] = alpha*0.5/denom[i] # dphi_i/dn_i
+            A0[idx(i,2),idx(i,1)] = -alpha*0.5*(n[i]-nbar)*s/(denom[i]**2) # dphi_i/dS_i
+
+        # =========================================================
+        # delayed + instantaneous coupling (ALL VERIFIED)
+        # =========================================================
+        if coupling > 0.0:
+            for i in range(N):
+                for j in range(N):
+                    kap = kappa_mat[i,j]
+                    if i == j:
+                        # skip diagonal (self-feedback handled later)
+                        continue
+
+                    # rotating-frame phase difference
+                    dphi = phi[j] - phi[i] - phi_p_mutual[i,j] - omega * nd["tau"]
+                    c = np.cos(dphi)
+                    s_ = np.sin(dphi)
+
+                    # A1 (tau-delay)
+                    A1[idx(i,1),idx(j,1)] += coupling*kap*c*sqrtS[i]/sqrtS_tau[j] # dS_i/dS_j
+                    A1[idx(i,1),idx(j,2)] += -2*coupling*kap*sqrtS[i]*sqrtS_tau[j]*s_ # dS_i/dphi_j
+                    A1[idx(i,2),idx(j,1)] += coupling*kap*s_/(2*sqrtS[i]*sqrtS_tau[j]) # dphi_i/dS_j
+                    A1[idx(i,2),idx(j,2)] += coupling*kap*(sqrtS_tau[j]/sqrtS[i])*c # dphi_i/dphi_j
+
+                    # A0 instantaneous
+                    A0[idx(i,1),idx(i,1)] += coupling*kap*c*sqrtS_tau[j]/sqrtS[i] # dS_i/dS_i
+                    A0[idx(i,1),idx(i,2)] += 2*coupling*kap*sqrtS[i]*sqrtS_tau[j]*s_ # dS_i/dphi_i
+                    A0[idx(i,2),idx(i,2)] += -coupling*kap*(sqrtS_tau[j]/sqrtS[i])*c # dphi_i/dphi_i
+                    A0[idx(i,2),idx(i,1)] += -0.5*coupling*kap*s_ * sqrtS_tau[j]/(sqrtS[i]**3) # dphi_i/dS_i
+
+        # =========================================================
+        # A2 : self-feedback (INCOMPLETE)
+        # =========================================================
+        if self_fb > 0.0:
+            for i in range(N):
+                kap = kappa_diag[i]
+                dphi =  - 2*phi_p_self[i] - 2*omega * nd["tau"]
+                c = np.cos(dphi)
+                s_ = np.sin(dphi)
+
+                A2[idx(i,1),idx(i,1)] += self_fb*kap*c*sqrtS[i]/sqrtS_2tau[i]
+                A2[idx(i,1),idx(i,2)] += -2*self_fb*kap*sqrtS[i]*sqrtS_2tau[i]*s_
+                A2[idx(i,2),idx(i,1)] += self_fb*kap*s_/(2*sqrtS[i]*sqrtS_2tau[i])
+                A2[idx(i,2),idx(i,2)] += self_fb*kap*(sqrtS_2tau[i]/sqrtS[i])
+
+                # instantaneous contribution to A0
+                A0[idx(i,1),idx(i,2)] += 2*self_fb*kap*sqrtS[i]*sqrtS_2tau[i]*s_
+                A0[idx(i,2),idx(i,2)] += -self_fb*kap*(sqrtS_2tau[i]/sqrtS[i])
+
+        return A0, A1, A2
 
 
 
-    self_feedback = 0.0
-    coupling = 1.0
-    noise_amplitude = 0.0
+
+    def compute_spectrum(self, A_list, tau_list, N,
+                     newton_maxit=20,
+                     newton_tol=1e-10,
+                     stable_margin=-2.0, sparse=False, spectral_shift=0.0, n_eigenvalues=10,
+                     verbose=False):
+        """
+        Cached dense Chebyshev collocation spectrum solver.
+        Reuses Pi, Chebyshev matrix, and static Sigma structure.
+
+        Parameters
+        ----------
+        A_list : list of np.ndarray
+            Jacobian matrices for each delay term.
+        tau_list : list of float
+            Delay values (same ordering as A_list).
+        N : int
+            Chebyshev polynomial order.
+        newton_maxit : int
+            Maximum Newton iterations for eigenvalue refinement.
+        newton_tol : float
+            Convergence tolerance for Newton refinement.
+        stable_margin : float or None
+            If set, eigenvalues below this real part are accepted without refinement.
+        sparse : bool
+            If True, use sparse shift-invert for the generalized eigenproblem.
+        spectral_shift : float
+            Shift for shift-invert mode.
+        n_eigenvalues : int
+            Number of eigenvalues to compute in sparse mode.
+        verbose : bool
+            If True, emit warnings when time-varying matrices are reduced to a single matrix.
+        """
+
+        from scipy.linalg import eig
+        from scipy.special import chebyt
+
+        # ---------------------------------------------------------
+        # Setup
+        # ---------------------------------------------------------
+        normalized = []
+        for A in A_list:
+            A_arr = np.array(A)
+            if A_arr.ndim == 3:
+                if verbose:
+                    warnings.warn(
+                        "A_list contains time-varying matrices; using the last entry.",
+                        RuntimeWarning,
+                    )
+                A_arr = A_arr[-1]
+            normalized.append(A_arr.astype(complex))
+        A_list = normalized
+        tau = np.array(tau_list, dtype=float)
+        tau_max = np.max(tau)
+
+        n = A_list[0].shape[0]
+        m = len(A_list)
+        size = n * (N + 1)
+
+        I_n = np.eye(n, dtype=complex)
+
+        # ---------------------------------------------------------
+        # CACHE CHECK
+        # ---------------------------------------------------------
+        rebuild_cache = (
+            not hasattr(self, "_spec_cache") or
+            self._spec_cache["N"] != N or
+            self._spec_cache["tau_max"] != tau_max or
+            self._spec_cache["n"] != n or
+            self._spec_cache["m"] != m
+        )
+
+        if rebuild_cache:
+
+            # ----- Build Pi once -----
+            b = np.zeros((N+1, N+1), dtype=float)
+            b[0, :] = 4.0 / tau_max
+            b[1, 0:3] = [2, 0, -1]
+
+            for i in range(2, N):
+                b[i, i-1:i+2] = [1/i, 0, -1/i]
+
+            b[N, N-1:N+1] = [1/N, 0]
+            b *= tau_max / 4.0
+
+            Pi = np.kron(b, I_n)
+
+            # ----- Precompute Chebyshev matrix -----
+            x_vals = -2*(tau[1:] / tau_max) + 1
+            T = np.array([[chebyt(k)(x) for k in range(N+1)] for x in x_vals])
+
+            # ----- Prebuild static Sigma structure -----
+            Sigma_template = np.eye(size, dtype=complex)
+            Sigma_template[0:n, 0:n] = 0.0
+
+            # Cache everything
+            self._spec_cache = {
+                "N": N,
+                "tau_max": tau_max,
+                "n": n,
+                "m": m,
+                "Pi": Pi,
+                "T": T,
+                "Sigma_template": Sigma_template
+            }
+
+        cache = self._spec_cache
+        Pi = cache["Pi"]
+        T = cache["T"]
+
+        # Copy template (cheap compared to rebuilding)
+        Sigma = cache["Sigma_template"].copy()
+
+        # ---------------------------------------------------------
+        # Only rebuild FIRST BLOCK ROW
+        # ---------------------------------------------------------
+        for k in range(N+1):
+
+            block = A_list[0].copy()
+
+            for j in range(1, m):
+                block += A_list[j] * T[j-1, k]
+
+            col_slice = slice(k*n, (k+1)*n)
+            Sigma[0:n, col_slice] = block
+
+        # ---------------------------------------------------------
+        # Dense QZ (robust)
+        # ---------------------------------------------------------
+        if not sparse:
+            eigenvalues = eig(Sigma, Pi, right=False, overwrite_a=True, overwrite_b=True)
+        else:
+            sigma = spectral_shift  # shift for shift-invert (tune if needed)
+            # Convert to sparse if needed
+            if not sp.issparse(Sigma):
+                Sigma = sp.csc_matrix(Sigma)
+            else:
+                Sigma = Sigma.tocsc()
+
+            if not sp.issparse(Pi):
+                Pi = sp.csc_matrix(Pi)
+            else:
+                Pi = Pi.tocsc()
+
+            n = Sigma.shape[0]
+
+            M = Sigma - sigma * Pi
+
+            # Sparse LU
+            lu = spla.splu(M)
+
+            def shift_invert(v):
+                return lu.solve(Pi @ v)
+
+            OP = spla.LinearOperator((n, n), matvec=shift_invert)
+
+            mu = spla.eigs(OP, k=n_eigenvalues, which='LM', return_eigenvectors=False)
+
+            lambdas = sigma + 1.0 / mu
+
+            # Filter infinite/huge eigenvalues
+            mask = np.isfinite(lambdas) & (np.abs(lambdas) < 1e8)
+
+            eigenvalues = lambdas[mask]
 
 
+
+        # ---------------------------------------------------------
+        # Newton correction
+        # ---------------------------------------------------------
+        corrected = []
+
+        A0 = A_list[0]
+        if m > 1:
+            A1 = A_list[1]
+            tau1 = tau[1]
+
+        for lam in eigenvalues:
+
+            if stable_margin is not None and np.real(lam) < stable_margin:
+                corrected.append(lam)
+                continue
+
+            lam_k = lam
+
+            for _ in range(newton_maxit):
+
+                if m > 1 and np.real(-lam_k * tau1) > 700:
+                    break
+
+                M = lam_k * I_n - A0
+
+                if m > 1:
+                    exp_term = np.exp(-lam_k * tau1)
+                    M -= A1 * exp_term
+                    dM = I_n + tau1 * A1 * exp_term
+                else:
+                    dM = I_n
+
+                try:
+                    X = np.linalg.solve(M, dM)
+                    trace_term = np.trace(X)
+
+                    if not np.isfinite(trace_term) or abs(trace_term) < 1e-14:
+                        break
+
+                    lam_new = lam_k - 1.0 / trace_term
+
+                    if not np.isfinite(lam_new) or abs(lam_new - lam_k) < newton_tol:
+                        lam_k = lam_new
+                        break
+
+                    lam_k = lam_new
+
+                except np.linalg.LinAlgError:
+                    break
+
+            corrected.append(lam_k)
+
+        return np.array(corrected)
+
+
+    
+
+    def compute_stability(self, x_eq, nd, N=20, newton_maxit=20, threshold=0.0, sparse=False, spectral_shift=0.0, n_eigenvalues=10, verbose=False):
+        """
+        Compute stability eigenvalues of a steady-state equilibrium.
+
+        Parameters
+        ----------
+        x_eq : (3N,) array
+            Steady-state vector ordered as
+            [n1, S1, ..., nN, SN, phi_2..phi_N, omega].
+        nd : dict
+            Parameters
+
+        Returns
+        -------
+        stable : float
+            1.0 if stable, 0.0 if unstable.
+        eigvals : np.ndarray
+            Eigenvalues of the linearized DDE system.
+        """
+
+        stable = None
+
+        nd_local = nd
+        kappa_val = nd.get("kappa")
+        phi_p_val = nd.get("phi_p")
+        if isinstance(kappa_val, (list, tuple, np.ndarray)):
+            kappa_arr = np.array(kappa_val)
+            if kappa_arr.ndim == 3:
+                nd_local = dict(nd_local)
+                nd_local["kappa"] = kappa_arr[-1]
+        if isinstance(phi_p_val, (list, tuple, np.ndarray)):
+            phi_p_arr = np.array(phi_p_val)
+            if phi_p_arr.ndim == 3:
+                if nd_local is nd:
+                    nd_local = dict(nd_local)
+                nd_local["phi_p"] = phi_p_arr[-1]
+
+        A0, A1, A2 = self.compute_jacobians(x_eq, nd_local, verbose=verbose)
+        
+        if nd_local['self_feedback'] > 0.0:
+            tau_list = [0.0, nd_local['tau'], 2*nd_local['tau']]
+            A_list = [A0, A1, A2]
+        else:
+            tau_list = [0.0, nd_local['tau']]
+            A_list = [A0, A1]
+
+        eigvals = self.compute_spectrum(
+            A_list,
+            tau_list,
+            N=N,
+            newton_maxit=newton_maxit,
+            newton_tol=1e-10,
+            sparse=sparse,
+            spectral_shift=spectral_shift,
+            n_eigenvalues=n_eigenvalues,
+            verbose=verbose,
+        )
 
         
-    detuning = 0.5 # detuning (GHz)
-    delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
 
-    phi_p = 0.0
+        # Filter out eigenvalues near zero (numerical artifacts)
+        eigvals = eigvals[np.abs(eigvals) > 1e-10]
 
-    dt = 0.5*tau_p # 1 ps
-    Tmax = 2e-7
-    steps = int(Tmax / dt)
-    time_arr = np.linspace(0, Tmax, steps)
-    delay_steps = int(tau / dt)
-    segment_len = int(steps/2)
-    segment_start = int(steps/2)
-
-    # Kappa ramp
-    kappa_c = 5e9
+        if eigvals.size == 0:
+            return 1.0, eigvals
 
 
-    ramp_start = 2
-    ramp_shape = 100
-
-
-    N_lasers = 2
-
-
-    n_iterations = 1
-
-    kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c, N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme='ATA')
-
-
-
-
-    phi_p_vals = np.array([np.pi])
-
-    phys = {
-        'tau_p': tau_p,
-        'tau_n': tau_n,
-        'g0': g0,
-        'N0': N0,
-        'N_bar': N0 + 1/(g0*tau_p),
-        's': s,
-        'beta': beta,
-        'kappa_c_mat': kappa_arr,
-        'phi_p_mat': np.ones(shape=(n_iterations,N_lasers,N_lasers))*phi_p_vals[:,None,None],
-        'I': I,
-        'q': q,
-        'alpha': alpha,
-        'delta': np.sort(np.concatenate([[0.0], [delta]])),
-        'coupling': coupling,
-        'self_feedback': self_feedback,
-        'noise_amplitude': noise_amplitude,
-        'dt': dt,
-        'Tmax': Tmax,
-        'tau': tau,
-        'N_lasers': N_lasers
-    }
-
-    N_bar_sym, S_bar = symbols('N_bar S_bar')
-
-
-
-
-    kappa_max = 20e9
-
-    vcsel = VCSEL(phys)
-    nd = vcsel.scale_params()
-    n_cases = len(nd['phi_p'])
-    nd['N_lasers'] = N_lasers
-
-    nd['kappa'] = nd['kappa'][-1]
-
-    history, freq_hist, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_iterations)
-
-    vcsel = VCSEL(phys)
-    nd = vcsel.scale_params()
-
-
-    t, y, freqs = vcsel.integrate(history, nd=nd, progress=True)
-    E_tot = np.abs(np.sum(np.sqrt(y[:, 1::3, :]) * (np.cos(y[:, 2::3, :]) + 1j * np.sin(y[:, 2::3, :])), axis=1))**2
-    plt.figure(figsize=(10, 6), dpi=90)
-    plt.plot(t * 1e9, E_tot[0,:], label=r'$|E_1 + E_2|^2$', linewidth=2)
-    plt.xlabel('Time (ns)')
-    plt.ylabel('Scaled $|E_{tot}|^2$')
-    plt.legend(loc='upper left')
-    plt.grid()
-    plt.tight_layout()
-    plt.show()
+        if np.max(eigvals.real) > 0.0:
+            stable = 0.0
+        else:
+            stable = 1.0
+        
+        return stable, eigvals

@@ -25,6 +25,13 @@ rc('text', usetex=True)
 plt.rc('text', usetex=True)
 plt.rc('font', family='serif')
 
+if not os.path.exists('../results'):
+    os.makedirs('../results')
+
+if not os.path.exists('../results/injection_continuation'):
+    os.makedirs('../results/injection_continuation')
+
+
 # --- Parameters ---
 alpha = 2
 tau_p = 5.4e-12
@@ -53,19 +60,19 @@ coupling_scheme = 'DECAYED'
 dx = 0.7
 n_cases = 1
 
-detuning = 0.5 # detuning (GHz) 
+detuning = 0.2 # detuning (GHz) 
 delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
 phi_p = 0#np.pi
 
 dt = .5*tau_p# 1 ps
-Tmax = 2e-7
+Tmax = 5e-7
 steps = int(Tmax / dt)
 time_arr = np.linspace(0, Tmax, steps)
 delay_steps = int(tau / dt)
 segment_len = int(steps/2)
 segment_start = int(steps/2)
 
-n_kappa = 500
+n_kappa = 100
 ramp_start = 2
 ramp_shape = 10
 
@@ -113,8 +120,8 @@ phys['injection'] = False
 
 # Gaussian kappa injection centered at peak_time with controllable width
 kappa_inj_width = 10 * tau          # width (s) — change this to control the Gaussian spread
-peak_time = 50*tau                     # center (s), e.g. peak = 3*tau above
-kappa_inj_amp = 30e9
+peak_time = 150*tau                     # center (s), e.g. peak = 3*tau above
+kappa_inj_amp = 100e9
 
 
 %matplotlib inline
@@ -122,7 +129,7 @@ extrema = []
 S_idx   = [3*i + 1 for i in range(N_lasers)]
 phi_idx = [3*i + 2 for i in range(N_lasers)]
 # --- Loop over segments of kappa --- 
-for k in range(0, len(kappa_c)-1): 
+for k in range(0, len(kappa_c)): 
 
     
 
@@ -135,35 +142,27 @@ for k in range(0, len(kappa_c)-1):
     nd = vcsel.scale_params()
     nd['phi_p'] = np.array(phys['phi_p_mat'])
     if k ==0:
-        history, freq_history, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
+        history, freq_history, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
     # eq_history, freq_hist = vcsel.generate_history(nd, shape='FR', n_cases=n_cases, des_phase_diff = 0*np.pi)
     # nd['phi_p'] = np.array([phys['phi_p_mat'][0]])*n_iterations
 
-    eq, results = vcsel.solve_equilibria(nd)
+    # eq, results = vcsel.solve_equilibria(nd)
     
 
-    if eq is not None:
-        phys['injection'] = True
-        phys['injected_strength'] = nd['sbar']  # baseline amplitude
+    # if eq is not None:
+    #     phys['injection'] = True
+    #     phys['injected_strength'] = nd['sbar']  # baseline amplitude
 
-        # Target setpoints from equilibrium
-        phi_diff_target = eq[-2]
-        omega_target = eq[-1]/(2*np.pi*1e9*tau_p)
+    #     # Target setpoints from equilibrium
+    #     phi_diff_target = eq[-2]
+    #     omega_target = eq[-1]/(2*np.pi*1e9*tau_p)
 
-        # Proportional control updates
-        phys['injected_phase_diff'] = np.random.uniform(0,2*np.pi)#-phi_diff_target 
+    #     # Proportional control updates
+    #     phys['injected_phase_diff'] = np.random.uniform(0,2*np.pi)
+
+    #     phys['injected_frequency'] = omega_target * np.ones_like(time_arr)
         
-
-
-
-        phys['injected_frequency'] = omega_target * np.ones_like(time_arr)
-
-
-
-        # prev_dphi1[-1] + (omega_target - prev_dphi1[-1])** np.exp(-((time_arr - peak_time) ** 2) / (2 * kappa_inj_width ** 2))
-        
-
-        phys['kappa_injection'] = kappa_inj_amp * np.exp(-((time_arr - peak_time) ** 2) / (2 * kappa_inj_width ** 2))
+    #     phys['kappa_injection'] = kappa_inj_amp * np.exp(-((time_arr - peak_time) ** 2) / (2 * kappa_inj_width ** 2))
 
 
    
@@ -203,13 +202,14 @@ for k in range(0, len(kappa_c)-1):
     clear_output(wait=True)
     fig, axs = plt.subplots(3, 1, figsize=(14, 14), dpi=200, sharex=True)
 
+    time_plot = time_arr[:-1]*1e6
 
     if phys['injection']:
         axs[0].plot(time_plot, phys['injected_frequency'][:-1], 'k--', linewidth=2, label=r'$\dot{\phi}_{inj}$', alpha=0.5)
         axs[0].legend(loc='upper right', fontsize=18)
 
     # --- dphi for each laser ---
-    time_plot = time_arr[:-1]*1e6
+    
     for i in range(N_lasers):
         style = '--' if i % 2 else '-'
         axs[0].plot(time_plot, dphi[i, :-1], style, linewidth=2, label=fr'$\dot{{\phi}}_{i+1}$')
@@ -222,7 +222,7 @@ for k in range(0, len(kappa_c)-1):
     axs[0].grid(True, alpha=0.2)
     axs[0].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
     axs[0].tick_params(axis='both', which='major', labelsize=18)
-    axs[0].set_title(f'kappa_c = {kappa_c[k+1]*1e-9:.2f} ns$^{{-1}}$', fontsize=24)
+    axs[0].set_title(f'kappa_c = {kappa_c[k]*1e-9:.2f} ns$^{{-1}}$', fontsize=24)
 
     
 
@@ -265,11 +265,11 @@ for k in range(0, len(kappa_c)-1):
     if phys['injection']:
         ax2.plot(time_plot_full, phys['kappa_injection']*1e-9, 'k--', alpha=0.5, linewidth=2)
     ax2.set_ylabel('kappa ($ns^{-1}$)', color='blue', fontsize=24)
-    ax2.set_ylim(0, 30e9*1e-9)
+    ax2.set_ylim(0, 150e9*1e-9)
     ax2.tick_params(axis='y', labelcolor='blue', labelsize=20)
 
     plt.tight_layout()
-    # plt.savefig(f'./{N_lasers}_laser_injection_continuation/{k}.png')
+    plt.savefig(f'../results/injection_continuation/{N_lasers}_laser_continuation/{k}.png')
     plt.show()
     plt.close(fig)
     
@@ -289,35 +289,35 @@ for k in range(0, len(kappa_c)-1):
 
     
     # # take second half of the series
-    # tail = np.mean(np.abs(E_tot)**2, axis=0)[-int(len(E_tot[0,:]) / 2):]
+    tail = E_tot[-int(len(E_tot) / 2):]
 
-    # order = max(1, int(len(tail) * 0.01))
+    order = max(1, int(len(tail) * 0.01))
  
-    # if len(tail) >= 3:
-    #     local_max_idx = argrelextrema(tail, np.greater, order=order)[0]
-    #     local_min_idx = argrelextrema(tail, np.less, order=order)[0]
-    # else:
-    #     local_max_idx = np.array([], dtype=int)
-    #     local_min_idx = np.array([], dtype=int)
+    if len(tail) >= 3:
+        local_max_idx = argrelextrema(tail, np.greater, order=order)[0]
+        local_min_idx = argrelextrema(tail, np.less, order=order)[0]
+    else:
+        local_max_idx = np.array([], dtype=int)
+        local_min_idx = np.array([], dtype=int)
 
-    # # remove duplicate values (unique extrema)
-    # max_vals, unique_max_idx = np.unique(np.round(tail[local_max_idx]/1e-2)*1e-2, return_index=True)
-    # min_vals, unique_min_idx = np.unique(np.round(tail[local_min_idx]/1e-2)*1e-2, return_index=True)
+    # remove duplicate values (unique extrema)
+    max_vals, unique_max_idx = np.unique(np.round(tail[local_max_idx]/1e-2)*1e-2, return_index=True)
+    min_vals, unique_min_idx = np.unique(np.round(tail[local_min_idx]/1e-2)*1e-2, return_index=True)
 
-    # # recover original indices
-    # local_max_idx = local_max_idx[unique_max_idx]
-    # local_min_idx = local_min_idx[unique_min_idx]
+    # recover original indices
+    local_max_idx = local_max_idx[unique_max_idx]
+    local_min_idx = local_min_idx[unique_min_idx]
 
-    # # convert to indices relative to the full E_tot array
-    # offset = len(E_tot) - len(tail)
-    # max_idx_global = (local_max_idx + offset).tolist()
-    # min_idx_global = (local_min_idx + offset).tolist()
+    # convert to indices relative to the full E_tot array
+    offset = len(E_tot) - len(tail)
+    max_idx_global = (local_max_idx + offset).tolist()
+    min_idx_global = (local_min_idx + offset).tolist()
 
     
-    # # for val in max_vals:
-    # #     extrema.append((kappa_c[k]*1e-9, val))
-    # # for val in min_vals:
-    # #     extrema.append((kappa_c[k]*1e-9, val))
+    for val in max_vals:
+        extrema.append((kappa_c[k]*1e-9, val))
+    for val in min_vals:
+        extrema.append((kappa_c[k]*1e-9, val))
 
     # vals = []
     # for val in max_vals:
@@ -338,21 +338,23 @@ for k in range(0, len(kappa_c)-1):
 %matplotlib inline
 import matplotlib.pyplot as plt
 import matplotlib as mpl
+import os
 cmap = cm.get_cmap('jet')
 forward_extrema_array = np.array(extrema)
 # backward_extrema_array = np.array(extrema)
 
 
 fig, ax = plt.subplots(figsize=(9, 6), dpi=300)
-plt.scatter(forward_extrema_array[:, 0], forward_extrema_array[:, 1], color='red', label='Forward', s=1)
+plt.scatter(forward_extrema_array[:, 0], forward_extrema_array[:, 1], color='red', label='Forward', s=10)
 # plt.scatter(backward_extrema_array[:, 0], backward_extrema_array[:, 1], color='blue', label='Backward', s=1)
 
 ax.set_xlabel(r'$\kappa_c$ (ns$^{-1}$)', fontsize=20)
-ax.set_ylabel(r'$|E_1 + E_2|^2$', fontsize=20)
+ax.set_ylabel(r'$|E_{\mathrm{tot}}|^2$', fontsize=20)
 
 # increase tick label sizes
 ax.tick_params(axis='both', which='major', labelsize=20)
 ax.grid(alpha=0.25) 
+ax.set_title(rf'$\delta = {detuning:.2f}$ GHz', fontsize=22, pad=20)
 
 # colorbar for order parameter with larger font
 sm = mpl.cm.ScalarMappable(cmap=cmap, norm=mpl.colors.Normalize(vmin=0.0, vmax=1.0))
@@ -362,11 +364,10 @@ cbar.set_label('Order parameter', fontsize=20)
 cbar.ax.tick_params(labelsize=20)
 
 
-plt.xlim(0,20.5)
-plt.ylim(-0.5,20)
+plt.xlim(-0.1,20.5)
+# plt.ylim(-0.5,60)
 plt.legend(fontsize=16, loc='upper left')
  
 plt.tight_layout()
-plt.savefig('./forward_extrema_FR_cont_gaussian_0.2ghz.png', transparent=True)
+plt.savefig('../results/forward_extrema_FR_cont_0.5ghz_decayed_3laser.png', transparent=True)
 plt.show()
-
