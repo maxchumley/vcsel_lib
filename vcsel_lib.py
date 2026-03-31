@@ -528,7 +528,6 @@ class VCSEL:
             y_buf = np.zeros((n_cases, 3 * N_lasers, buffer_len))
             freqs_buf = np.zeros((n_cases, N_lasers, buffer_len))
             y_buf[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
-            tail_start = max(0, steps - 2 * delay_steps)
             keep_idx = []
             y_keep = []
             f_keep = []
@@ -617,7 +616,6 @@ class VCSEL:
         noise_substeps = int(max(1, nd.get("noise_substeps", 1)))
 
         # ----------------- main loop -----------------
-        f_prev = None
         with tqdm(total=steps - 1 - start_idx,
                 desc="Integrating",
                 disable=not progress) as pbar:
