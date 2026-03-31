@@ -81,10 +81,12 @@ time_arr = np.linspace(0, Tmax, steps)
 delay_steps = int(tau / dt)
 segment_len = int(steps/2)
 segment_start = int(steps/2)
+plot_stride = 1
+cos_smooth_tau = 0.5
 
 n_kappa = 50
 ramp_start = 10
-ramp_shape = 20
+ramp_shape = 50
 
 final_kappa_arr = np.linspace(0e9,20e9,50)
 
@@ -119,7 +121,8 @@ phys = {
     'Tmax': Tmax,
     'tau': tau,
     'N_lasers': N_lasers,
-    'sparse': False
+    'sparse': False,
+    'save_every':1
 }
 
 phys['kappa_c_mat'] = kappa_arr[-1,:,:]
@@ -150,12 +153,13 @@ inj_phases = np.linspace(0,2*np.pi,n_cases)
 
 
 for k in range(0, n_kappa):
+    k=49
 
     final_kappa = final_kappa_arr[k]
 
 
     kappa_inj_width = 10 * tau          # width (s) — change this to control the Gaussian spread 
-    kappa_inj_amp_peak = 5 *final_kappa
+    kappa_inj_amp_peak = 10 *final_kappa
     kappa_inj_amp = np.linspace(kappa_inj_amp_peak, kappa_inj_amp_peak, n_cases)
 
     # Slice the ramp for this segment
@@ -278,7 +282,7 @@ for k in range(0, n_kappa):
 
 
 
-        t, y, freqs = vcsel.integrate(history, nd=nd, progress=True, theta=0.5, max_iter=1)
+        t, y, freqs = vcsel.integrate(history, nd=nd, progress=True, theta=0.5, max_iter=1, smooth_freqs=True)
 
 
         # intensities S[i,:]
@@ -295,8 +299,11 @@ for k in range(0, n_kappa):
         # for i in range(N_lasers):
         #     dphi[i, :2*delay_steps] = prev_dphi[i]
 
-        # nearest-neighbor phase differences
-        phase_diff = np.unwrap(phi[:, :-1, :] - phi[:, 1:, :], axis=1)  # shape (N_lasers-1, time)
+        # phase differences across all laser pairs (same approach as simple_example)
+        delta_phi_all = phi[:, None, :, :] - phi[:, :, None, :]
+        cos_pd_all = np.cos(delta_phi_all)
+        cos_pd_mean = np.mean(cos_pd_all, axis=0)
+        cos_pd_std = np.std(cos_pd_all, axis=0)
 
         # ---------------------------------------------------------
         # ---------               PLOTTING               ----------
@@ -306,18 +313,18 @@ for k in range(0, n_kappa):
         fig, axs = plt.subplots(3, 1, figsize=(14, 14), dpi=200, sharex=True)
 
 
-        time_plot = time_arr[:-1]*1e6
+        time_plot = time_arr[:-1:plot_stride]*1e6
 
         if eq is not None:
-            axs[0].plot(time_plot, phys['injected_frequency'][:-1], 'k--', linewidth=2, label=r'$\dot{\phi}_{inj}$', alpha=0.5, zorder=10)
+            axs[0].plot(time_plot, phys['injected_frequency'][:-1:plot_stride], 'k--', linewidth=2, label=r'$\dot{\phi}_{inj}$', alpha=0.5, zorder=10)
             axs[0].legend(loc='upper right', fontsize=18)
 
         # --- dphi for each laser ---
 
         for i in range(N_lasers):
             style = '--' if i % 2 else '-'
-            mean_dphi = np.mean(dphi[:,i, :-1], axis=0)
-            std_dphi = np.std(dphi[:,i, :-1], axis=0)
+            mean_dphi = np.mean(dphi[:,i, :-1:plot_stride], axis=0)
+            std_dphi = np.std(dphi[:,i, :-1:plot_stride], axis=0)
             axs[0].plot(time_plot, mean_dphi, style, linewidth=2, label=fr'$\dot{{\phi}}_{i+1}$')
             axs[0].fill_between(time_plot, mean_dphi - std_dphi, mean_dphi + std_dphi, alpha=0.15)
 
@@ -343,8 +350,9 @@ for k in range(0, n_kappa):
 
         # --- nearest-neighbor phase differences ---
         for i in range(N_lasers-1):
-            mean_cos = np.mean(np.cos(phase_diff[:,i, :-1]), axis=0)
-            std_cos = np.std(np.cos(phase_diff[:,i, :-1]), axis=0)
+            mean_cos = cos_pd_mean[i, i + 1, :-1:plot_stride]
+            std_cos = cos_pd_std[i, i + 1, :-1:plot_stride]
+            # no smoothing for cos(Δφ)
             axs[1].plot(time_plot, mean_cos, linewidth=2, label=fr'$\cos(\phi_{i+1}-\phi_{i+2})$')
             axs[1].fill_between(time_plot, mean_cos - std_cos, mean_cos + std_cos, alpha=0.15)
 
@@ -359,25 +367,26 @@ for k in range(0, n_kappa):
 
         # --- total field ---
         E = np.sqrt(S) * np.exp(1j*phi)
-        time_plot_full = time_arr[:] * 1e6
-        E_tot_mean = np.mean(np.abs(E.sum(axis=1))**2, axis=0)
-        E_tot_std = np.std(np.abs(E.sum(axis=1))**2, axis=0)
+        time_plot_full = time_arr[::plot_stride] * 1e6
+        intensity_to_mW = 1e3 * hbar * omega0 / (g0 * tau_n * tau_p)
+        E_tot_mean = np.mean(np.abs(E.sum(axis=1))**2, axis=0)[::plot_stride] * intensity_to_mW
+        E_tot_std = np.std(np.abs(E.sum(axis=1))**2, axis=0)[::plot_stride] * intensity_to_mW
 
-        axs[2].plot(time_plot_full, E_tot_mean, linewidth=2, alpha=0.5, label='$|E_{tot}|^2$')
+        axs[2].plot(time_plot_full, E_tot_mean, linewidth=2, alpha=0.5, label=r'$P_{\rm tot}$')
         axs[2].fill_between(time_plot_full, E_tot_mean - E_tot_std, E_tot_mean + E_tot_std, alpha=0.15)
 
         for i in range(N_lasers):
-            E_i_mean = np.mean(np.abs(E[:,i, :]**2), axis=0)
-            E_i_std = np.std(np.abs(E[:,i, :]**2), axis=0)
-            axs[2].plot(time_plot_full, E_i_mean, linewidth=1.5, label=f'$|E_{i+1}|^2$')
+            E_i_mean = np.mean(np.abs(E[:, i, :]**2), axis=0)[::plot_stride] * intensity_to_mW
+            E_i_std = np.std(np.abs(E[:, i, :]**2), axis=0)[::plot_stride] * intensity_to_mW
+            axs[2].plot(time_plot_full, E_i_mean, linewidth=1.5, label=f'$P_{i+1}$')
             axs[2].fill_between(time_plot_full, E_i_mean - E_i_std, E_i_mean + E_i_std, alpha=0.15)
 
         
 
         axs[2].set_xlabel('Time ($\mu$s)', fontsize=22)
+        axs[2].set_ylabel('Power (mW)', fontsize=22)
         axs[2].grid(True, alpha=0.2)
         axs[2].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
-        axs[2].set_ylim(-2, 30)
         axs[2].tick_params(axis='both', which='major', labelsize=18)
         if N_lasers <= 6:
             axs[2].legend(loc='upper left', fontsize=16, ncol=2)
@@ -388,18 +397,19 @@ for k in range(0, n_kappa):
         ax2.plot(time_plot_full, P_c, 'b--', alpha=0.5, linewidth=2)
         if phys['injection']:
             for i in range(n_cases):
-                ax2.plot(time_plot_full, injection_power_uW[i], alpha=0.5, linewidth=2)
+                ax2.plot(time_plot_full, injection_power_uW[i][::plot_stride], 'b--', alpha=0.5, linewidth=2)
         # ax2.set_ylabel('kappa ($ns^{-1}$)', color='blue', fontsize=24)
-        ax2.set_ylabel('Power ($\\mu$W)', color='blue', fontsize=24)
+        ax2.set_ylabel('Injection Power ($\\mu$W)', color='blue', fontsize=24)
         # ax2.set_ylim(0, 40e9*1e-9)
-        ax2.set_ylim(0, 250)
+        # ax2.set_ylim(0, 1000)
         ax2.tick_params(axis='y', labelcolor='blue', labelsize=20)
 
         plt.tight_layout()
-        plt.savefig(f'../injection_tests/injection_steering_plots/{k}.png')
+        # plt.savefig(f'../injection_tests/injection_steering_plots/{k}.png')
         # plt.savefig(f'./injection_tests/detuning_test/injection_time_series_kappa{final_kappa/1e9:.1f}_detuning{detuning:.1f}ghz.png', dpi=300)
         plt.show()
         plt.close(fig)
+        break
 
 
 

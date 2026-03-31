@@ -37,16 +37,17 @@ I = eta * current_threshold * q / tau_n * (N0 + 1 / (g0 * tau_p))
 
 self_feedback = 0.0
 coupling = 1.0
-noise_amplitude = 0.0
+noise_amplitude = 1.0
 
 N_lasers = 2
 coupling_scheme = "ATA"
 dx = 0.7
 
 # --- Sweep controls ---
-detuning_vals_ghz = np.linspace(0.0, 5.0, 10)
-kappa_vals = np.linspace(0.001e9, 20e9, 10)
-n_cases = 100
+detuning_vals_ghz = np.linspace(0.0, 5.0, 2)
+kappa_vals = np.linspace(0.001e9, 20e9, 2)
+n_cases = 100  # number of noise iterations
+n_freq_offsets = 100
 freq_min_ghz = -0.5
 freq_max_ghz = 0.5
 
@@ -72,8 +73,8 @@ tag_fs = 20
 save_running_plots = True
 plot_dir = Path("../injection_tests/injection_freq_phase")
 
-inj_phases = np.linspace(-np.pi, np.pi, n_cases)
-freq_offsets = np.linspace(freq_min_ghz, freq_max_ghz, n_cases)
+injected_phase = 0.0
+freq_offsets = np.linspace(freq_min_ghz, freq_max_ghz, n_freq_offsets)
 
 
 def run_sweep(detuning_ghz, final_kappa):
@@ -163,17 +164,18 @@ def run_sweep(detuning_ghz, final_kappa):
     phys["kappa_injection"] = kappa_inj_scale * final_kappa * np.exp(
         -((time_arr - peak_time) ** 2) / (2 * kappa_inj_width**2)
     )
-    phys["kappa_injection"] = np.tile(phys["kappa_injection"], (n_cases, 1))
+    n_freq = len(freq_offsets)
+    phys["kappa_injection"] = np.tile(phys["kappa_injection"], (n_freq, 1))
 
     vcsel = VCSEL(phys)
     nd = vcsel.scale_params()
 
-    history, freq_history, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=n_cases)
-    nd["phi_p"] = np.tile(phys["phi_p_mat"][0], (n_cases, 1, 1))
+    history, freq_history, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=n_freq)
+    nd["phi_p"] = np.tile(phys["phi_p_mat"][0], (n_freq, 1, 1))
 
-    def run_phase(phase):
+    def run_noise_iteration(_iter_idx):
         nd_local = dict(nd)
-        nd_local["injected_phase_diff"] = phase * np.ones(n_cases)
+        nd_local["injected_phase_diff"] = injected_phase * np.ones(n_freq)
         nd_local["injected_frequency"] = (
             np.tile(omega_target + freq_offsets, (len(time_arr), 1)).T
             * 1e9
@@ -209,15 +211,17 @@ def run_sweep(detuning_ghz, final_kappa):
 
     with tqdm_joblib(
         tqdm(
-            total=len(inj_phases),
-            desc=f"Phases (Δ={detuning_ghz:.2f}, κ={final_kappa/1e9:.2f})",
+            total=n_cases,
+            desc=f"Noise iters (Δ={detuning_ghz:.2f}, κ={final_kappa/1e9:.2f})",
         )
     ):
-        phase_results = Parallel(n_jobs=n_jobs, prefer="processes", batch_size='auto')(
-            delayed(run_phase)(phase) for phase in inj_phases
+        iter_results = Parallel(n_jobs=n_jobs, prefer="processes", batch_size='auto')(
+            delayed(run_noise_iteration)(it) for it in range(n_cases)
         )
-    avg_freq_diff = np.array([res[0] for res in phase_results])
-    std_freq_diff = np.array([res[1] for res in phase_results])
+    avg_matrix = np.array([res[0] for res in iter_results])  # (n_cases, n_freq)
+    std_matrix = np.array([res[1] for res in iter_results])  # (n_cases, n_freq)
+    avg_freq_diff = avg_matrix.mean(axis=0, keepdims=True)
+    std_freq_diff = std_matrix.mean(axis=0, keepdims=True)
     return avg_freq_diff, std_freq_diff
 
 
@@ -225,63 +229,6 @@ running_avg = None
 running_std = None
 count = 0
 
-def plot_running(avg_data, std_data, tag, step, filename=None):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5), dpi=200)
-
-    avg_color_max = np.ceil(np.max(avg_data) * 10) / 10
-    std_color_max = np.ceil(np.max(std_data) * 10) / 10
-
-    im1 = axes[0].imshow(
-        avg_data,
-        aspect="auto",
-        cmap=plot_cmap,
-        origin="lower",
-        extent=[freq_offsets[0], freq_offsets[-1], -1.0, 1.0],
-        vmin=0,
-        vmax=avg_color_max,
-    )
-    cbar1 = fig.colorbar(im1, ax=axes[0])
-    cbar1.set_ticks([0, avg_color_max])
-    cbar1.set_label(r"$\mu$", fontsize=label_fs)
-    cbar1.ax.tick_params(labelsize=cbar_tick_fs)
-    axes[0].set_xlabel(r"Uniform $\Delta \omega$ (GHz)", fontsize=label_fs)
-    axes[0].set_ylabel(r"Injection Phase / $\pi$", fontsize=label_fs)
-    axes[0].set_title(r"Average $\mu(|\dot{\phi}-\omega|)$", fontsize=title_fs)
-    axes[0].set_xticks(np.linspace(freq_offsets[0], freq_offsets[-1], 5))
-    axes[0].set_yticks([-1.0, 0.0, 1.0], ["-1", "0", "1"])
-    axes[0].tick_params(axis="both", labelsize=tick_fs)
-
-    im2 = axes[1].imshow(
-        std_data,
-        aspect="auto",
-        cmap=plot_cmap,
-        origin="lower",
-        extent=[freq_offsets[0], freq_offsets[-1], -1.0, 1.0],
-        vmin=0,
-        vmax=std_color_max,
-    )
-    cbar2 = fig.colorbar(im2, ax=axes[1])
-    cbar2.set_ticks([0, std_color_max])
-    cbar2.ax.set_yticklabels([f'{0:.1f}', f'{std_color_max:.1f}'])
-    cbar2.set_label(r"$\sigma$", fontsize=label_fs)
-    cbar2.ax.tick_params(labelsize=cbar_tick_fs)
-    axes[1].set_xlabel(r"Uniform $\Delta \omega$ (GHz)", fontsize=label_fs)
-    axes[1].set_ylabel(r"Injection Phase / $\pi$", fontsize=label_fs)
-    axes[1].set_title(r"Average $\sigma(|\dot{\phi}-\omega|)$", fontsize=title_fs)
-    axes[1].set_xticks(np.linspace(freq_offsets[0], freq_offsets[-1], 5))
-    axes[1].set_yticks([-1.0, 0.0, 1.0], ["-1", "0", "1"])
-    axes[1].tick_params(axis="both", labelsize=tick_fs)
-
-    fig.suptitle(tag, fontsize=tag_fs)
-    plt.tight_layout()
-    if save_running_plots:
-        plot_dir.mkdir(parents=True, exist_ok=True)
-        if filename is None:
-            filename = f"iter_{step:04d}.png"
-        fig.savefig(plot_dir / filename, dpi=300)
-    # plt.show(block=False)
-    # plt.pause(0.001)
-    plt.close(fig)
 
 for detuning_ghz in detuning_vals_ghz:
     for final_kappa in kappa_vals:
@@ -294,20 +241,6 @@ for detuning_ghz in detuning_vals_ghz:
         running_avg += avg_freq_diff
         running_std += std_freq_diff
         count += 1
-        plot_running(
-            avg_freq_diff,
-            std_freq_diff,
-            rf"($\Delta$={detuning_ghz:.2f} GHz, $\kappa$={final_kappa/1e9:.2f} ns$^{{-1}}$)",
-            count,
-            filename=f"iter_{count:04d}_detuning{detuning_ghz:.2f}_kappa{final_kappa/1e9:.2f}.png",
-        )
-        plot_running(
-            running_avg / count,
-            running_std / count,
-            f"(n={count})",
-            count,
-            filename="../running_avg.png",
-        )
 
 if count == 0:
     raise RuntimeError("No successful sweeps produced results.")
@@ -315,7 +248,6 @@ if count == 0:
 avg_freq_diff = running_avg / count
 std_freq_diff = running_std / count
 
-plot_running(avg_freq_diff, std_freq_diff, "", count, filename="../running_avg.png")
 
 
 
@@ -326,71 +258,43 @@ from mpl_toolkits.mplot3d import Axes3D
 
 fig, axes = plt.subplots(1, 1, figsize=(10, 6), dpi=200)
 
-# Average along the injection phase axis (axis 0)
-avg_freq_diff_phase_avg = np.mean(avg_freq_diff, axis=0)
-std_freq_diff_phase_avg = np.mean(std_freq_diff, axis=0)
+# Average along the noise-iteration axis (axis 0)
+avg_freq_diff_mean = np.mean(avg_freq_diff, axis=0)
+std_freq_diff_mean = np.mean(std_freq_diff, axis=0)
 
 # Create interpolation curve
-spl = make_interp_spline(freq_offsets, avg_freq_diff_phase_avg, k=3)
+spl = make_interp_spline(freq_offsets, avg_freq_diff_mean, k=3)
 freq_offsets_smooth = np.linspace(freq_offsets[0], freq_offsets[-1], 300)
 avg_freq_diff_smooth = spl(freq_offsets_smooth)
 
 
 
-# Plot mean colored by standard deviation
-scatter = axes.scatter(
-    freq_offsets, 
-    avg_freq_diff_phase_avg, 
-    c=std_freq_diff_phase_avg,
-    cmap=plot_cmap,
-    s=100,
-    linewidth=2,
-    edgecolors=None,
-    vmin=0
+# Plot mean +/- std with error bars
+axes.errorbar(
+    freq_offsets,
+    avg_freq_diff_mean,
+    yerr=std_freq_diff_mean,
+    fmt='o',
+    color='tab:blue',
+    ecolor='tab:blue',
+    elinewidth=1,
+    capsize=5,
+    markersize=6,
+    alpha=0.9,
+    label=r'Mean $\pm$ Std'
 )
 
 # Plot interpolated curve
-axes.plot(freq_offsets_smooth, avg_freq_diff_smooth, 'k-', linewidth=5, label='Interpolated curve', zorder=0)
+axes.plot(freq_offsets_smooth, avg_freq_diff_smooth, 'k-', linewidth=2, label='Interpolated curve', zorder=0)
 
-axes.set_xlabel(r'Frequency Offset (GHz)', fontsize=label_fs)
-axes.set_ylabel(r'$\mu(|\dot{\phi}-\omega|)$', fontsize=label_fs)
-# axes.set_title(r'Mean (colored by Std Dev)', fontsize=title_fs)
+axes.set_xlabel(r'Frequency Offset (GHz)', fontsize=label_fs + 4)
+axes.set_ylabel(r'$\mu(|\dot{\phi}-\omega|)$', fontsize=label_fs + 4)
 axes.set_xticks(np.arange(freq_offsets[0], freq_offsets[-1] + 0.05, 0.1))
-axes.tick_params(axis='both', labelsize=tick_fs)
+axes.tick_params(axis='both', labelsize=tick_fs + 4)
 axes.grid(True, alpha=0.3)
-
-cbar = fig.colorbar(scatter, ax=axes)
-cbar.set_label(r'$\sigma$', fontsize=label_fs)
-cbar.ax.tick_params(labelsize=tick_fs)
+axes.legend(loc='lower left', fontsize=tick_fs + 4)
 
 plt.tight_layout()
 plt.show()
 
-
-#%%
-fig = plt.figure(figsize=(12, 8), dpi=200)
-ax = fig.add_subplot(111, projection='3d')
-
-# Create meshgrid for freq_offsets and injection phases
-freq_mesh, phase_mesh = np.meshgrid(freq_offsets, inj_phases / np.pi)
-
-# Plot surface colored by standard deviation
-surf = ax.plot_surface(freq_mesh, phase_mesh, avg_freq_diff, facecolors=plt.cm.get_cmap(plot_cmap)(
-    (std_freq_diff - std_freq_diff.min()) / (std_freq_diff.max() - std_freq_diff.min())
-), shade=False, alpha=0.8)
-
-ax.set_xlabel(r'Frequency Offset (GHz)', fontsize=label_fs)
-ax.set_ylabel(r'Injection Phase / $\pi$', fontsize=label_fs)
-ax.set_zlabel(r'$\mu(|\dot{\phi}-\omega|)$', fontsize=label_fs)
-ax.set_title(r'Average Frequency Difference (3D)', fontsize=title_fs)
-
-ax.view_init(elev=20, azim=290)
-
-# Normalize for colorbar
-norm = plt.Normalize(vmin=std_freq_diff.min(), vmax=std_freq_diff.max())
-cbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=plot_cmap), ax=ax, shrink=0.5)
-cbar.set_label(r'$\sigma$', fontsize=label_fs)
-
-plt.tight_layout()
-plt.show()
 

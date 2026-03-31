@@ -31,7 +31,7 @@ delta = np.sort(np.concatenate([delta/2*np.linspace(-1,1,N_lasers)]))
 # print(delta/(2*np.pi*1e9))
 
 all_data = []
-phi_p_arr = np.linspace(0.0,2,10)
+phi_p_arr = np.linspace(0.0,2,20)
 
 
 
@@ -43,7 +43,7 @@ for phi_p_loop in phi_p_arr:
     all_order_params = []
     sorted_indices_arr = []
     max_num_eqs = 0
-    kappa_vals = np.linspace(0.0e9, 80e9, 200)
+    kappa_vals = np.linspace(0.0e9, 10e9, 10)
 
     
 
@@ -307,7 +307,7 @@ data_dict = {
     'params': phys
 }
 
-np.save(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', data_dict)
+np.save(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz.npy', data_dict)
 
 ##############################################################################################
 ##############################################################################################
@@ -322,7 +322,7 @@ np.save(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy
 N_lasers = 2
 detuning = 4.0
 save = False
-data_dict = np.load(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz_test.npy', allow_pickle=True).item()
+data_dict = np.load(f'../data/all_equilibria_data_{N_lasers}laser_{detuning:.2f}Ghz.npy', allow_pickle=True).item()
 all_data_stacked = data_dict['all_data']
 kappa_vals = data_dict['kappa_vals']
 kappa_plot = np.array(kappa_vals) * 1e-9
@@ -445,13 +445,15 @@ frames = [
 ]
 
 fig.frames = frames
-
+# np.nanmax(E_tot)
+# kappa_vals[-1]*1e-9
+# freq_range[0], freq_range[1]
 # Add slider
 fig.update_layout(
     scene=dict(
-        xaxis=dict(title='κc (ns⁻¹)', range=[0, kappa_vals[-1]*1e-9]),
+        xaxis=dict(title='κc (ns⁻¹)', range=[0, 10]),
         yaxis=dict(title='ω (GHz)', range=[freq_range[0], freq_range[1]]),
-        zaxis=dict(title='E_tot', range=[np.nanmin(E_tot), np.nanmax(E_tot)*1]),
+        zaxis=dict(title='E_tot', range=[np.nanmin(E_tot), 20]),
         aspectmode='cube'
     ),
     margin=dict(l=0, r=0, b=40, t=40),
@@ -509,8 +511,10 @@ if data_dict['params']['sparse']:
 else:
     computation_type = 'dense'
 
+
+save = False
 if save:
-    fig.write_html(f"./HTML_files/branches_{N_lasers}laser_{detuning:.0f}Ghz_{computation_type}.html", auto_play=False)
+    fig.write_html(f"../HTML_files/branches_{N_lasers}laser_{detuning:.0f}Ghz_{computation_type}.html", auto_play=False)
 
 
 
@@ -522,6 +526,10 @@ import numpy as np
 # Subsample parameter (e.g., keep every nth point along kappa axis)
 subsample = 1  # adjust this value to control density
 
+# Plot only a subset of kappa values (in ns^-1)
+kappa_plot_min = 0.0
+kappa_plot_max = 10.0
+
 # Prepare data for all phi_p values
 x_all = []
 y_all = []
@@ -531,10 +539,12 @@ phi_p_colors = []
 
 z_var = E_tot
 
+valid_kappa_idx = np.where((kappa_plot >= kappa_plot_min) & (kappa_plot <= kappa_plot_max))[0]
+valid_kappa_idx = valid_kappa_idx[::subsample]
+
 for desired_phi_p in range(len(phi_p_arr)):
-    for i, kap in enumerate(kappa_plot[::subsample]):  # subsample along kappa
-        # Use original index for data access
-        original_i = i * subsample
+    for original_i in valid_kappa_idx:
+        kap = kappa_plot[original_i]
         valid = (
             np.isfinite(omega[original_i,:]) &
             np.isfinite(phi_p[original_i,:]) &
@@ -583,11 +593,19 @@ fig = go.Figure(
     )]
 )
 
+
+
+# dict(
+#         xaxis=dict(title='κc (ns⁻¹)', range=[0, kappa_vals[-1]*1e-9]),
+#         yaxis=dict(title='ω (GHz)', range=[freq_range[0], freq_range[1]]),
+#         zaxis=dict(title=r'|E_tot|^2', range=[np.nanmin(z_var), np.nanmax(z_var)*1.1]),
+#         aspectmode='cube'
+#     )
 fig.update_layout(
     scene=dict(
-        xaxis=dict(title='κc (ns⁻¹)', range=[0, kappa_vals[-1]*1e-9]),
-        yaxis=dict(title='ω (GHz)', range=[freq_range[0], freq_range[1]]),
-        zaxis=dict(title=r'|E_tot|^2', range=[np.nanmin(z_var), np.nanmax(z_var)*1.1]),
+        xaxis=dict(title='κc (ns⁻¹)', range=[kappa_plot_min, kappa_plot_max]),
+        yaxis=dict(title='ω (GHz)', range=[-2,2]),
+        zaxis=dict(title='|E_tot|^2', range=[np.nanmin(E_tot), 20]),
         aspectmode='cube'
     ),
     margin=dict(l=0, r=0, b=40, t=40),
@@ -601,8 +619,9 @@ if data_dict['params']['sparse']:
 else:
     computation_type = 'dense'
 
+
 if save:
-    fig.write_html(f"./HTML_files/manifold_{N_lasers}laser_{detuning:.2f}Ghz_{computation_type}.html", auto_play=False)
+    fig.write_html(f"../HTML_files/manifold_{N_lasers}laser_{detuning:.2f}Ghz_{computation_type}.html", auto_play=False)
 
 
 #%%
@@ -1024,6 +1043,5 @@ for i in range(len(kappa_plot)):
     plt.show()
     plt.close(fig)
     clear_output(wait=True)
-
 
 

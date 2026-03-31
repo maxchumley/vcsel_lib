@@ -83,9 +83,9 @@ delay_steps = int(tau / dt)
 segment_len = int(steps/2)
 segment_start = int(steps/2)
 
-resolution = 1000
-N_lasers = 3
-coupling_scheme = 'DECAYED'  # 'ATA', 'NN' or 'RANDOM'
+resolution = 100
+N_lasers = 2
+coupling_scheme = 'ATA'  # 'ATA', 'NN' or 'RANDOM'
 dx=0.7
 ramp_start = 2
 
@@ -95,7 +95,7 @@ kappa_c = np.linspace(0e9,20e9,resolution)
 
 
 
-phi_p_vals = np.array([np.pi])#np.linspace(0,2*np.pi,resolution)
+phi_p_vals = np.array([0.0])#np.linspace(0,2*np.pi,resolution)
 
 n_iterations = 100
 
@@ -112,7 +112,7 @@ phys = {
     'I': I,
     'q': q,
     'alpha': alpha,
-    'delta': np.sort(np.concatenate([delta*np.linspace(-1,1,N_lasers)])),
+    'delta': np.sort(np.concatenate([delta/2*np.linspace(-1,1,N_lasers)])),
     'coupling': coupling,     
     'self_feedback': self_feedback, 
     'noise_amplitude': noise_amplitude,
@@ -132,7 +132,7 @@ ramp_start = 1
 ramp_shape = 25
 
 
-kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c[1], N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=True, dx=dx)
+kappa_arr = VCSEL.build_coupling_matrix(time_arr=time_arr, kappa_initial=0, kappa_final=kappa_c[1], N_lasers=N_lasers, ramp_start=ramp_start, ramp_shape=ramp_shape, tau=tau, scheme=coupling_scheme, plot=False, dx=dx)
 
 phys['kappa_c_mat'] = kappa_arr
 
@@ -192,7 +192,7 @@ for k in range(len(kappa_c)-1):
     if k == 0:
         prev_dphi = np.ones((N_lasers, 2*delay_steps))*phys['delta'].reshape((N_lasers,1)) /(2*np.pi*1e9)
         history, _, _, _ = vcsel.generate_history(nd, shape='FR', n_cases=n_cases)
-    t, y_scaled, freqs = vcsel.integrate(history, nd=nd, progress=True)
+    t, y_scaled, freqs = vcsel.integrate(history, nd=nd, progress=True, smooth_freqs=False)
 
     y = y_scaled.copy()
 
@@ -232,7 +232,7 @@ for k in range(len(kappa_c)-1):
         axs[0].legend(loc='upper left', fontsize=18)
     axs[0].set_ylabel(r'$\dot{\phi}$ (GHz)', fontsize=22)
     axs[0].set_ylim(-np.max(np.abs(dphi))*1.2, np.max(np.abs(dphi))*1.2)
-    axs[0].set_ylim(-5,5)
+    axs[0].set_ylim(-2,2)
     axs[0].grid(True, alpha=0.2)
     axs[0].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
     axs[0].tick_params(axis='both', which='major', labelsize=18)

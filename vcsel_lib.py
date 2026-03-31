@@ -102,7 +102,8 @@ class VCSEL:
         -----------------------
         - nondimensional time: t' = t / tau_p  (photon lifetime used as time scale)
         - nondimensional carrier offset:
-             n' = g0 * tau_p * (N - N0)  (so nbar ~ O(1) at steady-state)
+             n' = g0 * tau_p * (N - N0 - 1/(g0*tau_p))
+             (so n + n0 + 1 = g0 * tau_p * N for noise prefactors)
         - nondimensional photon number:
              s' = g0 * tau_n * S
         - gain parameter: Gs = g0 * tau_p
@@ -140,6 +141,8 @@ class VCSEL:
         dt = phys.get('dt', 1e-12)
         Tmax = phys.get('Tmax', 3e-6)
         tau = phys.get('tau', 1e-9)  # feedback delay in seconds
+        save_every = phys.get('save_every', 1)
+        max_output_gb = phys.get('max_output_gb', 10.0)
 
         # Derived discrete parameters
         steps = int(Tmax / dt)
@@ -190,6 +193,8 @@ class VCSEL:
         nd['coupling'] = coupling
         nd['self_feedback'] = self_feedback
         nd['noise_amplitude'] = noise_amplitude
+        nd['save_every'] = save_every
+        nd['max_output_gb'] = max_output_gb
         # nondimensional time step and total time
         nd['dt'] = dt / tau_p
         nd['Tmax'] = Tmax / tau_p
@@ -287,7 +292,13 @@ class VCSEL:
         phi_p_mutual = phi_p - np.diag(phi_p_self[0,:])[None,:,:]
 
         # Time-varying coupling
-        kappa_mat = np.array(nd["kappa"][j])        # shape (N,N)
+        kappa_val = np.asarray(nd["kappa"])
+        if kappa_val.ndim == 3:
+            kappa_mat = np.array(kappa_val[j])        # shape (N,N)
+        elif kappa_val.ndim == 2:
+            kappa_mat = np.array(kappa_val)           # constant (N,N)
+        else:
+            kappa_mat = np.ones((N, N)) * kappa_val   # scalar
         kappa_diag = np.diag(kappa_mat)             # self-feedback (length N)
         kappa_mat = kappa_mat - np.diag(kappa_diag) # zero diagonal for mutual coupling
 
@@ -342,7 +353,11 @@ class VCSEL:
 
             inj_strength = nd["injected_strength"]
             inj_phase    = nd["injected_phase_diff"]
-            omega_inj    = nd["injected_frequency"][j] if isinstance(nd["injected_frequency"], np.ndarray) else nd["injected_frequency"]
+            omega_src = nd["injected_frequency"]
+            if isinstance(omega_src, np.ndarray):
+                omega_inj = omega_src[:, j] if omega_src.ndim == 2 else omega_src[j]
+            else:
+                omega_inj = omega_src
             kappa_inj    = nd["kappa_inj"].T[j]
             t = j*nd["dt"]
 
@@ -445,7 +460,7 @@ class VCSEL:
         return noise[0] if y_c.shape[0] == 1 else noise
     
 
-    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5):
+    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5, smooth_freqs=True):
         """
         Integrate the nondimensional DDE system with a trapezoidal predictor-corrector.
 
@@ -470,6 +485,9 @@ class VCSEL:
             State time series, shape (n_cases, 3*N_lasers, steps).
         freqs : np.ndarray
             Instantaneous phase derivatives, shape (n_cases, N_lasers, steps).
+        smooth_freqs : bool
+            If True (default), apply a moving-average window over one delay to
+            smooth the returned frequency estimates.
         """
 
         if nd is None:
@@ -482,20 +500,59 @@ class VCSEL:
         delay_steps = nd['delay_steps']
         noise_amplitude = nd['noise_amplitude']
         phi_p = nd['phi_p']
-
-        # ----------------- allocate outputs -----------------
-        y = np.zeros((n_cases, 3*N_lasers, steps))
-        freqs = np.zeros((n_cases, N_lasers, steps))
+        save_every = int(max(1, nd.get('save_every', 1)))
+        smooth_window_delays = nd.get("smooth_window_delays", 1.0)
+        delay_interp = nd.get('delay_interp', None)
+        max_output_gb = nd.get('max_output_gb', None)
+        if max_output_gb is not None:
+            bytes_per_step = n_cases * (4 * N_lasers) * 8
+            est_bytes = bytes_per_step * steps
+            max_bytes = max_output_gb * 1e9
+            save_every_req = int(np.ceil(est_bytes / max_bytes)) if est_bytes > max_bytes else 1
+            save_every = max(save_every, save_every_req)
+            nd['save_every'] = save_every
+            if save_every_req > 1:
+                est_gb = est_bytes / 1e9
+                print(
+                    f"Estimated output size ~{est_gb:.2f} GB; "
+                    f"using save_every={save_every} to cap output."
+                )
 
         # Require full delay history
         if history.shape[2] < 2 * delay_steps:
             raise ValueError("history too short for configured delay_steps")
 
-        y[:, :, :2*delay_steps] = history[:, :, :2*delay_steps]
+        use_stream = save_every > 1
+        if use_stream:
+            buffer_len = 2 * delay_steps + 1
+            y_buf = np.zeros((n_cases, 3 * N_lasers, buffer_len))
+            freqs_buf = np.zeros((n_cases, N_lasers, buffer_len))
+            y_buf[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
+            tail_start = max(0, steps - 2 * delay_steps)
+            keep_idx = []
+            y_keep = []
+            f_keep = []
+
+            def should_store(idx):
+                return idx % save_every == 0
+
+            for idx in range(min(2 * delay_steps, steps)):
+                if should_store(idx):
+                    keep_idx.append(idx)
+                    y_keep.append(history[:, :, idx].copy())
+                    f_keep.append(np.zeros((n_cases, N_lasers)))
+            keep_pos = {idx: pos for pos, idx in enumerate(keep_idx)}
+        else:
+            # ----------------- allocate outputs -----------------
+            y = np.zeros((n_cases, 3*N_lasers, steps))
+            freqs = np.zeros((n_cases, N_lasers, steps))
+            y[:, :, :2*delay_steps] = history[:, :, :2*delay_steps]
 
         start_idx = 2 * delay_steps - 1
         if start_idx >= steps:
             t_dim = np.arange(steps) * dt * nd['tau_p']
+            if use_stream:
+                return t_dim, history[:, :, :steps], np.zeros((n_cases, N_lasers, steps))
             return t_dim, y, freqs
 
         # ----------------- precompute indices -----------------
@@ -503,33 +560,173 @@ class VCSEL:
         idx_2tau_arr = np.arange(steps) - 2 * delay_steps
         idx_tau_arr[idx_tau_arr < 0] = 0
         idx_2tau_arr[idx_2tau_arr < 0] = 0
+        if delay_interp in ("linear", "cubic"):
+            tau_steps = nd["tau"] / dt
+            k0 = int(np.floor(tau_steps))
+            frac = tau_steps - k0
+            tau2_steps = 2.0 * nd["tau"] / dt
+            k0_2 = int(np.floor(tau2_steps))
+            frac2 = tau2_steps - k0_2
 
         S_idx = np.arange(N_lasers) * 3 + 1
         phi_idx = np.arange(N_lasers) * 3 + 2
 
+        # ----------------- initialize frequency history -----------------
+        hist_len = min(2 * delay_steps, steps)
+        for n in range(hist_len):
+            if use_stream:
+                y_n = y_buf[:, :, n % buffer_len]
+                y_tau = y_buf[:, :, idx_tau_arr[n] % buffer_len]
+                y_2tau = y_buf[:, :, idx_2tau_arr[n] % buffer_len]
+            else:
+                y_n = y[:, :, n]
+                y_tau = y[:, :, idx_tau_arr[n]]
+                y_2tau = y[:, :, idx_2tau_arr[n]]
+
+            f_n = self.f_nd(
+                y_n, y_tau, y_2tau, n, phi_p, nd
+            )[:, :3*N_lasers]
+
+            deriv_n = f_n
+            if use_stream:
+                freqs_buf[:, :, n % buffer_len] = deriv_n[:, phi_idx]
+                pos = keep_pos.get(n)
+                if pos is not None:
+                    f_keep[pos] = deriv_n[:, phi_idx].copy()
+            else:
+                freqs[:, :, n] = deriv_n[:, phi_idx]
+
         # ----------------- noise normalization -----------------
         if noise_amplitude is None:
             noise_arr = None
+            noise_mode = "none"
+        elif callable(noise_amplitude):
+            noise_arr = noise_amplitude
+            noise_mode = "callable"
         elif np.isscalar(noise_amplitude):
             noise_arr = noise_amplitude
+            noise_mode = "scalar"
         else:
             noise_arr = np.asarray(noise_amplitude)
+            noise_mode = "array"
 
         # ----------------- work buffers -----------------
         y_guess = np.empty((n_cases, 3*N_lasers))
         y_new   = np.empty_like(y_guess)
         tmp_noise = np.empty_like(y_guess)
+        noise_substeps = int(max(1, nd.get("noise_substeps", 1)))
 
         # ----------------- main loop -----------------
+        f_prev = None
         with tqdm(total=steps - 1 - start_idx,
                 desc="Integrating",
                 disable=not progress) as pbar:
 
             for n in range(start_idx, steps - 1):
 
-                y_n = y[:, :, n]
-                y_tau = y[:, :, idx_tau_arr[n + 1]]
-                y_2tau = y[:, :, idx_2tau_arr[n + 1]]
+                if use_stream:
+                    y_n = y_buf[:, :, n % buffer_len]
+                    if delay_interp in ("linear", "cubic"):
+                        idx_hi = max(n - k0, 0)
+                        idx_lo = max(n - k0 - 1, 0)
+                        y_tau_hi = y_buf[:, :, idx_hi % buffer_len]
+                        y_tau_lo = y_buf[:, :, idx_lo % buffer_len]
+                        if delay_interp == "cubic":
+                            idx_p0 = max(idx_lo - 1, 0)
+                            idx_p3 = max(idx_hi + 1, 0)
+                            p0 = y_buf[:, :, idx_p0 % buffer_len]
+                            p1 = y_tau_lo
+                            p2 = y_tau_hi
+                            p3 = y_buf[:, :, idx_p3 % buffer_len]
+                            t = 1.0 - frac
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+
+                        idx_hi2 = max(n - k0_2, 0)
+                        idx_lo2 = max(n - k0_2 - 1, 0)
+                        y_2tau_hi = y_buf[:, :, idx_hi2 % buffer_len]
+                        y_2tau_lo = y_buf[:, :, idx_lo2 % buffer_len]
+                        if delay_interp == "cubic":
+                            idx_p0_2 = max(idx_lo2 - 1, 0)
+                            idx_p3_2 = max(idx_hi2 + 1, 0)
+                            p0 = y_buf[:, :, idx_p0_2 % buffer_len]
+                            p1 = y_2tau_lo
+                            p2 = y_2tau_hi
+                            p3 = y_buf[:, :, idx_p3_2 % buffer_len]
+                            t = 1.0 - frac2
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_2tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                    else:
+                        idx_tau = idx_tau_arr[n + 1]
+                        idx_2tau = idx_2tau_arr[n + 1]
+                        y_tau = y_buf[:, :, max(idx_tau, 0) % buffer_len]
+                        y_2tau = y_buf[:, :, max(idx_2tau, 0) % buffer_len]
+                else:
+                    y_n = y[:, :, n]
+                    if delay_interp in ("linear", "cubic"):
+                        idx_hi = max(n - k0, 0)
+                        idx_lo = max(n - k0 - 1, 0)
+                        y_tau_hi = y[:, :, idx_hi]
+                        y_tau_lo = y[:, :, idx_lo]
+                        if delay_interp == "cubic":
+                            idx_p0 = max(idx_lo - 1, 0)
+                            idx_p3 = max(idx_hi + 1, 0)
+                            p0 = y[:, :, idx_p0]
+                            p1 = y_tau_lo
+                            p2 = y_tau_hi
+                            p3 = y[:, :, idx_p3]
+                            t = 1.0 - frac
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+                        idx_hi2 = max(n - k0_2, 0)
+                        idx_lo2 = max(n - k0_2 - 1, 0)
+                        y_2tau_hi = y[:, :, idx_hi2]
+                        y_2tau_lo = y[:, :, idx_lo2]
+                        if delay_interp == "cubic":
+                            idx_p0_2 = max(idx_lo2 - 1, 0)
+                            idx_p3_2 = max(idx_hi2 + 1, 0)
+                            p0 = y[:, :, idx_p0_2]
+                            p1 = y_2tau_lo
+                            p2 = y_2tau_hi
+                            p3 = y[:, :, idx_p3_2]
+                            t = 1.0 - frac2
+                            t2 = t * t
+                            t3 = t2 * t
+                            y_2tau = 0.5 * (
+                                (2.0 * p1)
+                                + (-p0 + p2) * t
+                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                            )
+                        else:
+                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                    else:
+                        y_tau = y[:, :, idx_tau_arr[n + 1]]
+                        y_2tau = y[:, :, idx_2tau_arr[n + 1]]
 
                 # RHS at current step
                 f_n = self.f_nd(
@@ -557,29 +754,98 @@ class VCSEL:
 
                 # derivative used for frequency
                 deriv_n = (1.0 - theta) * f_n + theta * f_guess
-                freqs[:, :, n + 1] = deriv_n[:, phi_idx]
-
-                # Euler–Maruyama noise
-                if noise_arr is None:
-                    tmp_noise.fill(0.0)
+                if use_stream:
+                    freqs_buf[:, :, (n + 1) % buffer_len] = deriv_n[:, phi_idx]
                 else:
-                    na = noise_arr if np.isscalar(noise_arr) else noise_arr[n]
-                    tmp_noise[:] = self.compute_noise_sample(
-                        y_n, na, dt, nd
-                    )
+                    freqs[:, :, n + 1] = deriv_n[:, phi_idx]
 
-                y_next = y_c + tmp_noise
+                # Euler–Maruyama noise (optionally substepped)
+                if noise_mode == "none":
+                    y_next = y_c
+                else:
+                    if noise_mode == "scalar":
+                        na = noise_arr
+                    elif noise_mode == "callable":
+                        na = noise_arr(n * dt * nd["tau_p"])
+                    else:
+                        na = noise_arr[n]
 
-                # positivity fix
-                y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
+                    if noise_substeps == 1:
+                        tmp_noise[:] = self.compute_noise_sample(
+                            y_c, na, dt, nd
+                        )
+                        y_next = y_c + tmp_noise
+                        y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
+                    else:
+                        y_next = y_c.copy()
+                        dt_sub = dt / noise_substeps
+                        for _ in range(noise_substeps):
+                            tmp_noise[:] = self.compute_noise_sample(
+                                y_next, na, dt_sub, nd
+                            )
+                            y_next += tmp_noise
+                            y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
 
-                y[:, :, n + 1] = y_next
+                if use_stream:
+                    y_buf[:, :, (n + 1) % buffer_len] = y_next
+                    if should_store(n + 1):
+                        keep_idx.append(n + 1)
+                        y_keep.append(y_next.copy())
+                        f_keep.append(freqs_buf[:, :, (n + 1) % buffer_len].copy())
+                else:
+                    y[:, :, n + 1] = y_next
 
                 if progress:
                     pbar.update(1)
 
+        if use_stream:
+            keep_idx = np.array(keep_idx, dtype=int)
+            order = np.argsort(keep_idx)
+            keep_idx = keep_idx[order]
+            y_out = np.stack([y_keep[i] for i in order], axis=2)
+            freqs_out = np.stack([f_keep[i] for i in order], axis=2)
+            t_dim = keep_idx * dt * nd['tau_p']
+
+            window = max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+            window = min(window, freqs_out.shape[2])
+            if smooth_freqs and window > 1:
+                kernel = np.ones(window) / window
+                pad = window // 2
+                freqs_sm = np.empty_like(freqs_out)
+                for i in range(n_cases):
+                    for j in range(N_lasers):
+                        series = freqs_out[i, j, :]
+                        if pad > 0:
+                            series = np.pad(series, (pad, pad), mode="edge")
+                        smoothed = np.convolve(series, kernel, mode="valid")
+                        freqs_sm[i, j, :] = smoothed[:freqs_out.shape[2]]
+                        if pad > 0:
+                            freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+                freqs_out = freqs_sm
+
+            return t_dim, y_out, freqs_out
+
+        if smooth_freqs:
+            window = max(1, int(round(delay_steps * smooth_window_delays)))
+            window = min(window, steps)
+            kernel = np.ones(window) / window
+            freqs_sm = np.empty_like(freqs)
+            pad = window // 2
+            for i in range(n_cases):
+                for j in range(N_lasers):
+                    series = freqs[i, j, :]
+                    if pad > 0:
+                        series = np.pad(series, (pad, pad), mode="edge")
+                    smoothed = np.convolve(series, kernel, mode="valid")
+                    freqs_sm[i, j, :] = smoothed[:steps]
+                    if pad > 0:
+                        freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+            freqs = freqs_sm
+
         t_dim = np.arange(steps) * dt * nd['tau_p']
         return t_dim, y, freqs
+
+
     
     
 
@@ -1690,13 +1956,28 @@ class VCSEL:
 
         stable = None
 
-        A0, A1, A2 = self.compute_jacobians(x_eq, nd, verbose=verbose)
+        nd_local = nd
+        kappa_val = nd.get("kappa")
+        phi_p_val = nd.get("phi_p")
+        if isinstance(kappa_val, (list, tuple, np.ndarray)):
+            kappa_arr = np.array(kappa_val)
+            if kappa_arr.ndim == 3:
+                nd_local = dict(nd_local)
+                nd_local["kappa"] = kappa_arr[-1]
+        if isinstance(phi_p_val, (list, tuple, np.ndarray)):
+            phi_p_arr = np.array(phi_p_val)
+            if phi_p_arr.ndim == 3:
+                if nd_local is nd:
+                    nd_local = dict(nd_local)
+                nd_local["phi_p"] = phi_p_arr[-1]
+
+        A0, A1, A2 = self.compute_jacobians(x_eq, nd_local, verbose=verbose)
         
-        if nd['self_feedback'] > 0.0:
-            tau_list = [0.0, nd['tau'], 2*nd['tau']]
+        if nd_local['self_feedback'] > 0.0:
+            tau_list = [0.0, nd_local['tau'], 2*nd_local['tau']]
             A_list = [A0, A1, A2]
         else:
-            tau_list = [0.0, nd['tau']]
+            tau_list = [0.0, nd_local['tau']]
             A_list = [A0, A1]
 
         eigvals = self.compute_spectrum(

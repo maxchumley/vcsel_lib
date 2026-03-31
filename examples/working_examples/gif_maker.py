@@ -47,14 +47,14 @@ import os
 
 images = []
 
-path = os.path.join(os.getcwd(), 'detuning_sweep_noise')
-save_path = os.getcwd()
-n_frames = 500
-fps = 30
-file_name = 'detuning_sweep_3laser_noise.mp4'
+path = os.path.join(os.getcwd(), '../injection_tests/noisy_branches/')
+save_path = os.path.join(os.getcwd(), '../injection_tests/')
+n_frames = 136
+fps = 5
+file_name = 'noisy_branches_time_series.mp4'
 
 for i in range(n_frames):
-    img_path = os.path.join(path, f'{i}.png')
+    img_path = os.path.join(path, f'noisy_branches_{i}.png')
     if exists(img_path):
         img = imageio.imread(img_path)
 
