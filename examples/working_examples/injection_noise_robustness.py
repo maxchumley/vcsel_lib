@@ -46,8 +46,14 @@ coupling_scheme = "ATA"
 dx = 0.7
 
 # --- Sweep controls ---
-detuning_vals_ghz = np.linspace(0.0, 5.0, 2)
-kappa_vals = np.linspace(0.001e9, 20e9, 2)
+detuning_min_ghz = 0.0
+detuning_max_ghz = 5.0
+kappa_min = 0.001e9
+kappa_max = 20e9
+default_detuning_count = 2
+default_kappa_count = 2
+detuning_vals_ghz = np.linspace(detuning_min_ghz, detuning_max_ghz, default_detuning_count)
+kappa_vals = np.linspace(kappa_min, kappa_max, default_kappa_count)
 n_cases = 100  # number of noise iterations
 n_freq_offsets = 100
 freq_min_ghz = -0.5
@@ -232,19 +238,29 @@ def parse_args():
     parser.add_argument("--detuning-idx", type=int, default=None, help="Index into detuning_vals_ghz")
     parser.add_argument("--kappa-idx", type=int, default=None, help="Index into kappa_vals")
     parser.add_argument("--task-id", type=int, default=None, help="Flattened task index over detuning x kappa")
+    parser.add_argument("--detuning-count", type=int, default=default_detuning_count, help="Number of detuning points")
+    parser.add_argument("--kappa-count", type=int, default=default_kappa_count, help="Number of kappa points")
     parser.add_argument("--output-dir", type=str, default="../injection_tests/injection_noise_robustness_hpc")
     parser.add_argument("--save-name", type=str, default=None, help="Optional output filename for single-task mode")
     parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
     return parser.parse_args()
 
 
-def resolve_task_indices(args):
+def build_sweep_arrays(args):
+    if args.detuning_count < 1 or args.kappa_count < 1:
+        raise ValueError("detuning-count and kappa-count must be >= 1.")
+    detuning_vals = np.linspace(detuning_min_ghz, detuning_max_ghz, args.detuning_count)
+    kappa_vals_local = np.linspace(kappa_min, kappa_max, args.kappa_count)
+    return detuning_vals, kappa_vals_local
+
+
+def resolve_task_indices(args, detuning_vals_local, kappa_vals_local):
     if args.task_id is not None:
-        total = len(detuning_vals_ghz) * len(kappa_vals)
+        total = len(detuning_vals_local) * len(kappa_vals_local)
         if args.task_id < 0 or args.task_id >= total:
             raise ValueError(f"task-id {args.task_id} out of range [0, {total-1}]")
-        det_idx = args.task_id // len(kappa_vals)
-        kap_idx = args.task_id % len(kappa_vals)
+        det_idx = args.task_id // len(kappa_vals_local)
+        kap_idx = args.task_id % len(kappa_vals_local)
         return det_idx, kap_idx
     if args.detuning_idx is not None and args.kappa_idx is not None:
         return args.detuning_idx, args.kappa_idx
@@ -315,11 +331,17 @@ def plot_summary(avg_freq_diff, std_freq_diff):
 
 def main():
     args = parse_args()
-    det_idx, kap_idx = resolve_task_indices(args)
+    detuning_vals_local, kappa_vals_local = build_sweep_arrays(args)
+    det_idx, kap_idx = resolve_task_indices(args, detuning_vals_local, kappa_vals_local)
 
     if det_idx is not None and kap_idx is not None:
-        detuning_ghz = detuning_vals_ghz[det_idx]
-        final_kappa = kappa_vals[kap_idx]
+        if det_idx < 0 or det_idx >= len(detuning_vals_local) or kap_idx < 0 or kap_idx >= len(kappa_vals_local):
+            raise ValueError(
+                f"Index out of range: detuning_idx={det_idx} (max {len(detuning_vals_local)-1}), "
+                f"kappa_idx={kap_idx} (max {len(kappa_vals_local)-1})"
+            )
+        detuning_ghz = detuning_vals_local[det_idx]
+        final_kappa = kappa_vals_local[kap_idx]
         avg_freq_diff, std_freq_diff = run_sweep(detuning_ghz, final_kappa)
         save_single_result(avg_freq_diff, std_freq_diff, detuning_ghz, final_kappa, args)
         if args.no_plot:
@@ -332,8 +354,8 @@ def main():
         running_avg = None
         running_std = None
         count = 0
-        for detuning_ghz in detuning_vals_ghz:
-            for final_kappa in kappa_vals:
+        for detuning_ghz in detuning_vals_local:
+            for final_kappa in kappa_vals_local:
                 avg_freq_diff, std_freq_diff = run_sweep(detuning_ghz, final_kappa)
                 if avg_freq_diff is None:
                     continue

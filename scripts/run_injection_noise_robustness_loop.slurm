@@ -34,6 +34,8 @@ for ((di=0; di<DETUNING_COUNT; di++)); do
       python examples/working_examples/injection_noise_robustness.py \
         --detuning-idx "$di" \
         --kappa-idx "$ki" \
+        --detuning-count "$DETUNING_COUNT" \
+        --kappa-count "$KAPPA_COUNT" \
         --output-dir "$OUTDIR" \
         --save-name "result_d${di}_k${ki}.npz" \
         --no-plot &
