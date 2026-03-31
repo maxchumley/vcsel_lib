@@ -2,6 +2,8 @@
 
 import numpy as np
 import matplotlib.pyplot as plt
+import argparse
+import os
 from joblib import Parallel, delayed
 from tqdm import tqdm
 from contextlib import contextmanager
@@ -225,76 +227,134 @@ def run_sweep(detuning_ghz, final_kappa):
     return avg_freq_diff, std_freq_diff
 
 
-running_avg = None
-running_std = None
-count = 0
+def parse_args():
+    parser = argparse.ArgumentParser(description="Injection noise robustness sweep")
+    parser.add_argument("--detuning-idx", type=int, default=None, help="Index into detuning_vals_ghz")
+    parser.add_argument("--kappa-idx", type=int, default=None, help="Index into kappa_vals")
+    parser.add_argument("--task-id", type=int, default=None, help="Flattened task index over detuning x kappa")
+    parser.add_argument("--output-dir", type=str, default="../injection_tests/injection_noise_robustness_hpc")
+    parser.add_argument("--save-name", type=str, default=None, help="Optional output filename for single-task mode")
+    parser.add_argument("--no-plot", action="store_true", help="Skip plotting")
+    return parser.parse_args()
 
 
-for detuning_ghz in detuning_vals_ghz:
-    for final_kappa in kappa_vals:
+def resolve_task_indices(args):
+    if args.task_id is not None:
+        total = len(detuning_vals_ghz) * len(kappa_vals)
+        if args.task_id < 0 or args.task_id >= total:
+            raise ValueError(f"task-id {args.task_id} out of range [0, {total-1}]")
+        det_idx = args.task_id // len(kappa_vals)
+        kap_idx = args.task_id % len(kappa_vals)
+        return det_idx, kap_idx
+    if args.detuning_idx is not None and args.kappa_idx is not None:
+        return args.detuning_idx, args.kappa_idx
+    return None, None
+
+
+def save_single_result(avg_freq_diff, std_freq_diff, detuning_ghz, final_kappa, args):
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.save_name is not None:
+        out_path = output_dir / args.save_name
+    else:
+        out_path = output_dir / f"result_det{detuning_ghz:.4f}_kappa{final_kappa/1e9:.4f}.npz"
+    if avg_freq_diff is None:
+        np.savez(
+            out_path,
+            success=False,
+            detuning_ghz=detuning_ghz,
+            final_kappa=final_kappa,
+            freq_offsets=freq_offsets,
+        )
+    else:
+        np.savez(
+            out_path,
+            success=True,
+            detuning_ghz=detuning_ghz,
+            final_kappa=final_kappa,
+            freq_offsets=freq_offsets,
+            avg_freq_diff=avg_freq_diff,
+            std_freq_diff=std_freq_diff,
+        )
+    print(f"Saved: {out_path}")
+
+
+def plot_summary(avg_freq_diff, std_freq_diff):
+    fig, axes = plt.subplots(1, 1, figsize=(10, 6), dpi=200)
+
+    avg_freq_diff_mean = np.mean(avg_freq_diff, axis=0)
+    std_freq_diff_mean = np.mean(std_freq_diff, axis=0)
+
+    spl = make_interp_spline(freq_offsets, avg_freq_diff_mean, k=3)
+    freq_offsets_smooth = np.linspace(freq_offsets[0], freq_offsets[-1], 300)
+    avg_freq_diff_smooth = spl(freq_offsets_smooth)
+
+    axes.errorbar(
+        freq_offsets,
+        avg_freq_diff_mean,
+        yerr=std_freq_diff_mean,
+        fmt='o',
+        color='tab:blue',
+        ecolor='tab:blue',
+        elinewidth=1,
+        capsize=5,
+        markersize=6,
+        alpha=0.9,
+        label=r'Mean $\pm$ Std',
+    )
+    axes.plot(freq_offsets_smooth, avg_freq_diff_smooth, 'k-', linewidth=2, label='Interpolated curve', zorder=0)
+    axes.set_xlabel(r'Frequency Offset (GHz)', fontsize=label_fs + 4)
+    axes.set_ylabel(r'$\mu(|\dot{\phi}-\omega|)$', fontsize=label_fs + 4)
+    axes.set_xticks(np.arange(freq_offsets[0], freq_offsets[-1] + 0.05, 0.1))
+    axes.tick_params(axis='both', labelsize=tick_fs + 4)
+    axes.grid(True, alpha=0.3)
+    axes.legend(loc='lower left', fontsize=tick_fs + 4)
+    plt.tight_layout()
+    plt.show()
+
+
+def main():
+    args = parse_args()
+    det_idx, kap_idx = resolve_task_indices(args)
+
+    if det_idx is not None and kap_idx is not None:
+        detuning_ghz = detuning_vals_ghz[det_idx]
+        final_kappa = kappa_vals[kap_idx]
         avg_freq_diff, std_freq_diff = run_sweep(detuning_ghz, final_kappa)
+        save_single_result(avg_freq_diff, std_freq_diff, detuning_ghz, final_kappa, args)
+        if args.no_plot:
+            return
         if avg_freq_diff is None:
-            continue
-        if running_avg is None:
-            running_avg = np.zeros_like(avg_freq_diff)
-            running_std = np.zeros_like(std_freq_diff)
-        running_avg += avg_freq_diff
-        running_std += std_freq_diff
-        count += 1
+            return
+        plot_summary(avg_freq_diff, std_freq_diff)
+        return
+    else:
+        running_avg = None
+        running_std = None
+        count = 0
+        for detuning_ghz in detuning_vals_ghz:
+            for final_kappa in kappa_vals:
+                avg_freq_diff, std_freq_diff = run_sweep(detuning_ghz, final_kappa)
+                if avg_freq_diff is None:
+                    continue
+                if running_avg is None:
+                    running_avg = np.zeros_like(avg_freq_diff)
+                    running_std = np.zeros_like(std_freq_diff)
+                running_avg += avg_freq_diff
+                running_std += std_freq_diff
+                count += 1
 
-if count == 0:
-    raise RuntimeError("No successful sweeps produced results.")
+        if count == 0:
+            raise RuntimeError("No successful sweeps produced results.")
 
-avg_freq_diff = running_avg / count
-std_freq_diff = running_std / count
-
-
-
-
-#%%
-from scipy.interpolate import make_interp_spline
-from mpl_toolkits.mplot3d import Axes3D
-
-
-fig, axes = plt.subplots(1, 1, figsize=(10, 6), dpi=200)
-
-# Average along the noise-iteration axis (axis 0)
-avg_freq_diff_mean = np.mean(avg_freq_diff, axis=0)
-std_freq_diff_mean = np.mean(std_freq_diff, axis=0)
-
-# Create interpolation curve
-spl = make_interp_spline(freq_offsets, avg_freq_diff_mean, k=3)
-freq_offsets_smooth = np.linspace(freq_offsets[0], freq_offsets[-1], 300)
-avg_freq_diff_smooth = spl(freq_offsets_smooth)
+        avg_freq_diff = running_avg / count
+        std_freq_diff = running_std / count
+        if args.no_plot:
+            return
+        plot_summary(avg_freq_diff, std_freq_diff)
+        return
 
 
 
-# Plot mean +/- std with error bars
-axes.errorbar(
-    freq_offsets,
-    avg_freq_diff_mean,
-    yerr=std_freq_diff_mean,
-    fmt='o',
-    color='tab:blue',
-    ecolor='tab:blue',
-    elinewidth=1,
-    capsize=5,
-    markersize=6,
-    alpha=0.9,
-    label=r'Mean $\pm$ Std'
-)
-
-# Plot interpolated curve
-axes.plot(freq_offsets_smooth, avg_freq_diff_smooth, 'k-', linewidth=2, label='Interpolated curve', zorder=0)
-
-axes.set_xlabel(r'Frequency Offset (GHz)', fontsize=label_fs + 4)
-axes.set_ylabel(r'$\mu(|\dot{\phi}-\omega|)$', fontsize=label_fs + 4)
-axes.set_xticks(np.arange(freq_offsets[0], freq_offsets[-1] + 0.05, 0.1))
-axes.tick_params(axis='both', labelsize=tick_fs + 4)
-axes.grid(True, alpha=0.3)
-axes.legend(loc='lower left', fontsize=tick_fs + 4)
-
-plt.tight_layout()
-plt.show()
-
-
+if __name__ == "__main__":
+    main()
