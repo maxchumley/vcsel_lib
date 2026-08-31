@@ -10,6 +10,9 @@ This README is organized as:
 5. Coupling and injection utilities
 6. Examples
 
+For the repository layout, generated-data policy, and cleanup commands, see
+[`docs/repository_maintenance.md`](docs/repository_maintenance.md).
+
 ## 1) Quick start
 
 ```python
@@ -37,6 +40,8 @@ phys = {
     "Tmax": 1e-9,
     "tau": 1e-9,
     "N_lasers": 2,
+    "save_every": 1,
+    "max_output_gb": 10.0,
 }
 
 vcsel = VCSEL(phys)
@@ -60,10 +65,12 @@ t_dim, y, freqs = vcsel.integrate(history, nd=nd, progress=False)
 - State arrays:
   - Single state: shape `(3*N,)`
   - Time series: shape `(n_cases, 3*N, steps)`
+  - With `save_every > 1`, integration outputs are compressed to saved points only.
 
 **History arrays**
 - Delay solver needs `t in [-2*tau, 0]`.
 - History shape: `(n_cases, 3*N, 2*delay_steps)`
+- `freq_hist` returned by `generate_history` is in **GHz**.
 
 **Coupling matrices**
 - `kappa` typically has shape `(steps, N, N)` for time-varying coupling.
@@ -84,6 +91,8 @@ Key outputs in `nd`:
 - `dt`, `Tmax`, `steps`, `delay_steps`
 - `kappa`, `phi_p`, `delta_p`
 - `nbar`, `sbar`, `Gs`, `beta_n`, `beta_const`
+- `save_every`, `max_output_gb`
+- injection controls (`injection`, `injection_topology`, `injected_strength`, `injected_frequency`, `kappa_inj`)
 
 ### `generate_history(nd, shape="FR", n_cases=1, counts=None, guesses=None)`
 Generates history for the delay solver. Always returns four values:
@@ -96,11 +105,26 @@ Supported shapes:
 
 Notes:
 - For `"EQ"`, `counts` and `guesses` are passed to `solve_equilibria`.
+- For `"EQ"`, output case count equals the number of equilibria found.
 - For non-`"EQ"` shapes, `results` is `None`.
+- `freq_hist` is returned in GHz.
 
-### `integrate(history, nd=None, progress=False, theta=0.5, max_iter=5)`
+### `integrate(history, nd=None, progress=False, theta=0.5, max_iter=5, smooth_freqs=True)`
 Integrates the nondimensional DDE with a trapezoidal predictor-corrector plus optional Euler–Maruyama noise. Returns:
 `t_dim, y, freqs`
+
+If `save_every == 1`, output shapes are `(n_cases, 3*N, steps)` and `(n_cases, N, steps)`.
+If `save_every > 1`, both are returned only on the saved time grid.
+
+Important integration controls in `nd`:
+- `save_every` (int): save every k-th sample.
+- `max_output_gb` (float or `None`): auto-increase `save_every` to cap output size.
+- `delay_interp` (`None`, `"linear"`, or `"cubic"`): delayed-state interpolation mode.
+- `noise_substeps` (int): stochastic substeps per deterministic step.
+- `smooth_window_delays` (float): smoothing window length in units of delay for frequency smoothing.
+
+Returned `freqs` are nondimensional phase derivatives (`dphi/dt'`). Convert to GHz with:
+`freq_ghz = freqs * 1e-9 / (2*np.pi*tau_p)`
 
 ### `f_nd(x, x_tau, x_2tau, j, phi_p, nd=None)`
 Vectorized nondimensional VCSEL rate equations used by the integrator.
@@ -156,13 +180,105 @@ Supported schemes:
 - `"RANDOM"`: random adjacency
 - `"DECAYED"`: distance-based decay (uses `dx`)
 
+Injection setup notes:
+- Set `phys["injection"] = True` and `phys["injection_topology"]` (shape `(N,)`, boolean/int mask).
+- Provide `injected_strength`, `kappa_injection`, and `injected_frequency`.
+- Set `nd["injected_phase_diff"]` before calling `integrate()` (scalar or per-case array).
+
 ## 6) Examples
 
-Examples live in `examples/` and `examples/working_examples/`. A few useful entry points:
-- `examples/simple_example.py`
-- `examples/verify_stability.py`
-- `examples/working_examples/verify_stability.py`
-- `examples/working_examples/stability_manifold.py`
+Examples live in `examples/`. A few useful entry points:
+- `examples/basics/simple_example.py`
+- `examples/stability/verify_stability.py`
+- `examples/stability/stability_manifold.py`
+
+### Reinforcement-learning matrix design
+
+`rl/reinforcement_matrix_design.py` is a small, dependency-free REINFORCE example
+that learns static `kappa` and `phi_p` matrices from batched VCSEL rollouts. Each
+training rollout ramps `kappa` from zero using the same schedule as validation:
+
+```bash
+python -m rl.reinforcement_matrix_design
+```
+
+Edit `target_phases` and the reward weights near the top of the file to describe
+the desired phase pattern and frequency-locking behavior. The phase objective
+blends the average phase score with the score of the worst non-reference laser;
+`worst_laser_phase_weight` controls that split. Training uses `n_restarts`
+independently seeded searches, with `n_iterations` iterations in each restart.
+Up to `parallel_restarts` searches run concurrently, and the best design across
+all of them is kept. The inline figure updates after every parallel iteration
+and overlays each restart's mean and best histories with the global-best and
+worst-laser progress. The final matrices and histories are saved in
+`rl/artifacts/data/reinforcement_matrix_design.npz`. Matrix entry `[i, j]` describes delayed
+source `j` coupling into receiver `i`; `kappa_ns` is in ns^-1 and `phi_p` is in
+radians. A final cell reloads that file, ramps the learned coupling matrix on,
+and plots frequency, each laser's wrapped phase relative to laser 1, and
+output-power trajectories in the same format as
+`examples/basics/simple_example.py`.
+
+### Closed-loop neural coupling control
+
+`rl/neural_policy_matrix_design.py` uses replay-buffered TD3 for continuous
+closed-loop control:
+
+```bash
+python -m pip install -e '.[rl]'
+python -m rl.neural_policy_matrix_design
+```
+
+```text
+requested/current phases + explicit error + recent history
+                              |
+                    deterministic TD3 actor
+                              |
+              90 delta-kappa + 90 delta-phi_p actions
+                              |
+               integrate one continuous DDE chunk
+                              |
+                n-step replay, twin critics, repeat
+```
+
+Every episode begins from a newly generated noise-free free-running delay
+history with zero coupling and a random phase target. The observation contains
+the target and current relative phases, their explicit wrapped errors, photon
+powers, current controls, and a five-decision history of phase errors and
+relative frequencies. A `512 -> 512 -> 256` actor independently controls all
+90 directed off-diagonal `kappa` entries and all 90 corresponding `phi_p`
+entries. The diagonal remains zero.
+
+The actor outputs link increments rather than complete matrices. Kappa
+increments are bounded by `maximum_kappa_change_per_step_ns`, and each
+magnitude is clipped to `[0, maximum_kappa_ns]`. Phase increments are bounded
+by `maximum_phi_p_change_per_step_rad` and wrapped to `[-pi, pi]`. The
+integrator linearly ramps both controls from their previous values to their
+new values during the next interval, making them continuous and slew-limited.
+
+After each interval, the integrator returns the final full-resolution `2*tau`
+delay history. That exact history becomes the next step's input, so an episode
+is one continuous DDE trajectory rather than a sequence of restarted
+simulations. The reward contains no explicit frequency-locking term. It combines the
+time-averaged requested-phase score, improvement from the preceding control
+step, and additional terminal phase reward. Frequency remains a plotted
+diagnostic. Success requires both the mean phase score and the weakest laser's
+phase score to remain high for several consecutive steps; sustained drifting
+phases therefore cannot count as success.
+
+Each transition is stored in a replay buffer. Five-step returns preserve the
+discounted reward from a short action sequence, and twin critics bootstrap
+from stored outcomes while the delayed actor is updated less frequently.
+Target networks and clipped target-action noise stabilize off-policy learning.
+
+The default training run contains 10 parallel free-running episodes, 50
+control decisions spanning 100 ns per episode, and two TD3 gradient updates
+per simulation step after `learning_starts` transitions are stored.
+Deterministic evaluation uses the same fixed targets. The
+prominent evaluation curves and matrix panels always show the result for
+`requested_phases`; held-out means remain available in the saved histories.
+The checkpoint is saved to `dynamic_coupling_td3.pt`. Final validation plots
+frequency, relative phase, power, the time-varying kappa range, and
+representative time-varying `phi_p` links.
 
 ## Notes and tips
 

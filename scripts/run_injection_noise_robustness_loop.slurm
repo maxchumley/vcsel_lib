@@ -21,7 +21,7 @@ conda activate vcsel
 DETUNING_COUNT=2
 KAPPA_COUNT=2
 
-OUTDIR="examples/injection_tests/injection_noise_robustness_hpc"
+OUTDIR="examples/injection/results/injection_tests/injection_noise_robustness_hpc"
 mkdir -p "$OUTDIR"
 
 # Run up to one task per allocated CPU core in parallel.
@@ -31,7 +31,7 @@ active=0
 for ((di=0; di<DETUNING_COUNT; di++)); do
   for ((ki=0; ki<KAPPA_COUNT; ki++)); do
     srun --exclusive -N1 -n1 -c1 \
-      python examples/working_examples/injection_noise_robustness.py \
+      python -m examples.injection.injection_noise_robustness \
         --detuning-idx "$di" \
         --kappa-idx "$ki" \
         --detuning-count "$DETUNING_COUNT" \

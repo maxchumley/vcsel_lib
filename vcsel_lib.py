@@ -13,7 +13,7 @@ This module is intended for research/teaching use and keeps a clear separation
 between physical parameters (SI units) and nondimensional parameters used by
 the integrator.
 
-Author: Max Chumley with documentation assistance from GitHub Copilot and OpenAI CODEX
+Author: Max Chumley with assistance from GitHub Copilot and OpenAI CODEX
 """
 
 import numpy as np
@@ -76,8 +76,8 @@ class VCSEL:
               - dt: timestep for integration (s)
               - Tmax: total integration time (s)
               - tau: feedback/coupling delay (s)
-            Additional keys such as 'steps', 'delay_steps' can be supplied but
-            are computed if absent.
+            Discrete controls such as `steps` and `delay_steps` are computed
+            internally from `dt`, `Tmax`, and `tau`.
 
         After initialization, call scale_params() to compute nd (nondimensional
         parameters) required by the integrator.
@@ -137,6 +137,10 @@ class VCSEL:
         q = phys['q']
         coupling = phys.get('coupling', 1.0)
         self_feedback = phys.get('self_feedback', 0.0)
+        # TODO(model): currently this maps to the 2*tau self-feedback path in
+        # f_nd/residuals/compute_jacobians. If you later add single-round-trip
+        # (tau) self-feedback, introduce a separate parameter (e.g.
+        # self_feedback_tau) and keep backward compatibility for this key.
         noise_amplitude = phys.get('noise_amplitude', 0.0)
         dt = phys.get('dt', 1e-12)
         Tmax = phys.get('Tmax', 3e-6)
@@ -195,6 +199,7 @@ class VCSEL:
         nd['noise_amplitude'] = noise_amplitude
         nd['save_every'] = save_every
         nd['max_output_gb'] = max_output_gb
+        nd['output_dtype'] = phys.get('output_dtype', None)
         # nondimensional time step and total time
         nd['dt'] = dt / tau_p
         nd['Tmax'] = Tmax / tau_p
@@ -271,10 +276,36 @@ class VCSEL:
         beta_c = nd["beta_const"]
         alpha  = nd["alpha"]
 
-        delta = np.array(nd["delta_p"]).reshape(1, N)  # shape (1,N) broadcasts across cases
+        delta_p = np.asarray(nd["delta_p"], dtype=float)
+        if delta_p.ndim == 0:
+            delta = np.full((1, N), float(delta_p))
+        elif delta_p.shape == (N,):
+            delta = delta_p.reshape(1, N)  # broadcast one detuning vector across cases
+        elif delta_p.shape == (1, N):
+            delta = delta_p
+        elif delta_p.shape == (n_cases, N):
+            delta = delta_p
+        else:
+            raise ValueError(
+                "nd['delta_p'] must be scalar, shape "
+                f"({N},), shape (1,{N}), or shape ({n_cases},{N}); "
+                f"got shape {delta_p.shape}"
+            )
 
-        # φ_p must be (N, N)
-        if np.ndim(phi_p) == 0:
+        # phi_p may be static, case-dependent, or time-and-case-dependent.
+        if np.ndim(phi_p) == 4:
+            phi_p = np.asarray(phi_p)
+            if phi_p.shape[1:] != (n_cases, N, N):
+                raise ValueError(
+                    "phi_p with 4 dimensions must have shape "
+                    f"(steps,{n_cases},{N},{N}); got {phi_p.shape}"
+                )
+            if j >= phi_p.shape[0]:
+                raise ValueError(
+                    "time-dependent phi_p has fewer entries than nd['steps']"
+                )
+            phi_p = np.array(phi_p[j])
+        elif np.ndim(phi_p) == 0:
             # Account for scalar phi_p
             phi_p = phi_p * np.ones((N, N))[None,:,:]
         elif np.ndim(phi_p) == 2:
@@ -289,18 +320,61 @@ class VCSEL:
                 raise ValueError(f"phi_p must be scalar or shape (N,N) or (n_cases,N,N), got shape {phi_p.shape}")
             
         phi_p_self = phi_p[:, np.arange(N), np.arange(N)]
-        phi_p_mutual = phi_p - np.diag(phi_p_self[0,:])[None,:,:]
 
-        # Time-varying coupling
+        # Time-varying and/or case-dependent coupling.
         kappa_val = np.asarray(nd["kappa"])
-        if kappa_val.ndim == 3:
-            kappa_mat = np.array(kappa_val[j])        # shape (N,N)
+        if kappa_val.ndim == 4:
+            if kappa_val.shape[1:] != (n_cases, N, N):
+                raise ValueError(
+                    "nd['kappa'] with 4 dimensions must have shape "
+                    f"(steps,{n_cases},{N},{N}); got {kappa_val.shape}"
+                )
+            kappa_mat = np.array(kappa_val[j])        # shape (n_cases,N,N)
+        elif kappa_val.ndim == 3:
+            if nd.get("kappa_case_dependent", False) and kappa_val.shape == (n_cases, N, N):
+                kappa_mat = np.array(kappa_val)       # case-dependent constant
+            elif kappa_val.shape[0] == int(nd.get("steps", kappa_val.shape[0])) and kappa_val.shape[1:] == (N, N):
+                kappa_mat = np.array(kappa_val[j])    # time-dependent shared, shape (N,N)
+            elif kappa_val.shape == (n_cases, N, N):
+                kappa_mat = np.array(kappa_val)       # case-dependent constant
+            elif kappa_val.shape[1:] == (N, N):
+                kappa_mat = np.array(kappa_val[j])    # time-dependent shared, shape (N,N)
+            else:
+                raise ValueError(
+                    "nd['kappa'] with 3 dimensions must have shape "
+                    f"(steps,{N},{N}) or ({n_cases},{N},{N}); got {kappa_val.shape}"
+                )
         elif kappa_val.ndim == 2:
             kappa_mat = np.array(kappa_val)           # constant (N,N)
         else:
             kappa_mat = np.ones((N, N)) * kappa_val   # scalar
-        kappa_diag = np.diag(kappa_mat)             # self-feedback (length N)
-        kappa_mat = kappa_mat - np.diag(kappa_diag) # zero diagonal for mutual coupling
+        if kappa_mat.ndim == 2:
+            kappa_cases = kappa_mat[None, :, :]
+            kappa_diag = np.diag(kappa_mat)[None, :]
+        else:
+            kappa_cases = kappa_mat
+            kappa_diag = np.diagonal(kappa_mat, axis1=1, axis2=2)
+
+        # Optional scalar schedule shared by every link and case.  Keeping the
+        # ramp separate from kappa avoids materializing a potentially huge
+        # (steps, n_cases, N, N) array during batched parameter searches.
+        kappa_ramp = nd.get("kappa_ramp", None)
+        if kappa_ramp is not None:
+            kappa_ramp = np.asarray(kappa_ramp, dtype=float)
+            if kappa_ramp.ndim == 0:
+                kappa_scale = float(kappa_ramp)
+            elif kappa_ramp.ndim == 1 and j < kappa_ramp.size:
+                kappa_scale = float(kappa_ramp[j])
+            else:
+                raise ValueError(
+                    "nd['kappa_ramp'] must be a scalar or a 1D array with "
+                    "at least nd['steps'] entries"
+                )
+            kappa_cases = kappa_cases * kappa_scale
+            kappa_diag = kappa_diag * kappa_scale
+        # The one-delay coupling path uses the full matrix, including any
+        # diagonal entries supplied by the topology. Set the diagonal of aMAT
+        # to zero for CUSTOM coupling when one-delay self-feedback is unwanted.
 
 
         # Keep photon numbers positive
@@ -323,27 +397,29 @@ class VCSEL:
         # shape: (n_cases, N, N)
         if nd['coupling'] > 0.0:
             mutual_amp = sqrtS[:, :, None] * sqrtS_t[:, None, :]
-            phi_diff_mutual = phi_t[:, None, :] - phi[:, :, None] - phi_p_mutual
+            phi_diff_mutual = phi_t[:, None, :] - phi[:, :, None] - phi_p
             cos_mutual = np.cos(phi_diff_mutual)
             sin_mutual = np.sin(phi_diff_mutual)
 
             # intensity dynamics
-            dS += nd['coupling'] * 2 * np.sum(kappa_mat[None, :, :] * mutual_amp * cos_mutual, axis=2)
+            dS += nd['coupling'] * 2 * np.sum(kappa_cases * mutual_amp * cos_mutual, axis=2)
 
             # phase dynamics
             ratio = sqrtS_t[:, None, :] / sqrtS[:, :, None]
             ratio = np.clip(ratio, 0, 10)
-            dphi +=nd['coupling'] *  np.sum(kappa_mat[None, :, :] * (ratio) * sin_mutual, axis=2)
+            dphi +=nd['coupling'] *  np.sum(kappa_cases * (ratio) * sin_mutual, axis=2)
 
         # ----------------- SELF-FEEDBACK -----------------
+        # TODO(model): this is currently only the 2*tau self-feedback term.
+        # Add a separate tau self-feedback contribution if/when needed.
 
         if nd["self_feedback"] > 0.0:
             self_amp = sqrtS[:, :] * sqrtS_2t[:, :]
             phi_diff_self = phi_2t - phi - 2*phi_p_self
             cos_self = np.cos(phi_diff_self)
             sin_self = np.sin(phi_diff_self)
-            dS += nd["self_feedback"] * 2 * kappa_diag[None, :] * self_amp * cos_self
-            dphi += nd["self_feedback"] * kappa_diag[None, :] * ((sqrtS_2t / sqrtS) * sin_self)
+            dS += nd["self_feedback"] * 2 * kappa_diag * self_amp * cos_self
+            dphi += nd["self_feedback"] * kappa_diag * ((sqrtS_2t / sqrtS) * sin_self)
 
         # ----------------- INJECTION (optional) -----------------
         injection_topology = nd.get("injection_topology", None)
@@ -401,6 +477,9 @@ class VCSEL:
         y_c : np.ndarray, shape (n_cases, 3*N) or (3*N,)
         noise_amplitude : float
         dt : float
+            Nondimensional step, ``dt_physical / tau_p``.  This function
+            returns a state increment, rather than a Langevin force, so the
+            noise amplitudes are multiplied by ``sqrt(dt)``.
         nd : dict
             Must contain keys: n0, T, beta_n, Gs
 
@@ -438,6 +517,11 @@ class VCSEL:
         Z_fphi = Z[:, 2::3]
 
         # --- Prefactors ---
+        # With X = n+n0+1 = g0*tau_p*N_phys,
+        # S = g0*tau_n*S_phys, T = tau_n/tau_p, and Gs = g0*tau_p,
+        # these are exactly the nondimensional form of Ma et al. (2019),
+        # Eq. (2).  Z_fs is intentionally shared by the carrier and photon
+        # increments, with opposite signs, to preserve their covariance.
         scale = noise_amplitude * np.sqrt(dt)
 
         pref_Fn  = np.sqrt(2.0 * Gs * (n + n0 + 1.0) / T)            # Fn
@@ -460,7 +544,19 @@ class VCSEL:
         return noise[0] if y_c.shape[0] == 1 else noise
     
 
-    def integrate(self, history, nd=None, progress=False, theta=0.5, max_iter=5, smooth_freqs=True):
+    def integrate(
+        self,
+        history,
+        nd=None,
+        progress=False,
+        theta=0.5,
+        max_iter=5,
+        smooth_freqs=True,
+        message=None,
+        integration_scheme=None,
+        return_final_history=False,
+        progress_callback=None,
+    ):
         """
         Integrate the nondimensional DDE system with a trapezoidal predictor-corrector.
 
@@ -476,18 +572,56 @@ class VCSEL:
             Trapezoidal blend parameter (0.5 is Crank-Nicolson).
         max_iter : int
             Maximum fixed-point iterations per step.
+        smooth_freqs : bool
+            If True (default), apply moving-average smoothing to returned
+            frequency estimates.
+        integration_scheme : str or None
+            Deterministic integration scheme. Supported values are
+            "trapezoid" / "trapezoidal" for the existing predictor-corrector
+            path, and "ABM4" for a fourth-order Adams-Bashforth predictor plus
+            Adams-Moulton corrector. If None, reads nd["integration_scheme"]
+            and falls back to "trapezoid".
+        return_final_history : bool
+            If True, return a fourth value containing the final full-resolution
+            `2*tau` history, even when `save_every > 1`.
+        progress_callback : callable or None
+            Optional callback called with the number of completed integration
+            steps since the previous callback update. This is useful for
+            routing subprocess progress to a parent process without printing
+            from inside the worker.
+
+        Notes
+        -----
+        Optional controls are read from `nd`:
+          - `save_every` (int): store every k-th output sample.
+          - `max_output_gb` (float or None): auto-increase `save_every` to
+            keep estimated output size below this cap.
+          - `show_output_size_message` (bool): print the estimated-output
+            message when `max_output_gb` increases `save_every` (default True).
+          - `delay_interp` (None, "linear", or "cubic"): delayed-state
+            interpolation mode.
+          - `noise_substeps` (int): number of Euler-Maruyama substeps per
+            coarse deterministic step.
+          - `smooth_window_delays` (float): smoothing window length measured
+            in delay units when `smooth_freqs=True`.
+          - `output_state_indices` (array-like or None): optional state indices
+            to keep in the returned `y` time series. The full state is still
+            integrated internally and returned final histories remain full
+            state histories.
+          - `kappa_ramp` (scalar or 1D array): optional multiplicative coupling
+            schedule shared by every link and case.
 
         Returns
         -------
         t_dim : np.ndarray
             Dimensional time array (seconds).
         y : np.ndarray
-            State time series, shape (n_cases, 3*N_lasers, steps).
+            State time series. Shape is
+            `(n_cases, 3*N_lasers, steps)` when `save_every == 1`, otherwise
+            `(n_cases, 3*N_lasers, n_saved_steps)`.
         freqs : np.ndarray
-            Instantaneous phase derivatives, shape (n_cases, N_lasers, steps).
-        smooth_freqs : bool
-            If True (default), apply a moving-average window over one delay to
-            smooth the returned frequency estimates.
+            Instantaneous phase derivatives in nondimensional units. Shape
+            matches the time axis returned by `t_dim`.
         """
 
         if nd is None:
@@ -503,15 +637,80 @@ class VCSEL:
         save_every = int(max(1, nd.get('save_every', 1)))
         smooth_window_delays = nd.get("smooth_window_delays", 1.0)
         delay_interp = nd.get('delay_interp', None)
+        if integration_scheme is None:
+            integration_scheme = nd.get("integration_scheme", "trapezoid")
+        integration_scheme_key = (
+            str(integration_scheme).lower().replace("_", "").replace("-", "")
+        )
+        if integration_scheme_key in ("trapezoid", "trapezoidal", "heun", "pc"):
+            integration_scheme_key = "trapezoid"
+        elif integration_scheme_key in (
+            "abm4",
+            "ab4am4",
+            "adamsbashforthmoulton4",
+            "adamsbashforthadamsmoulton4",
+        ):
+            integration_scheme_key = "abm4"
+        else:
+            raise ValueError(
+                "integration_scheme must be 'trapezoid' or 'ABM4', "
+                f"got {integration_scheme!r}"
+            )
         max_output_gb = nd.get('max_output_gb', None)
+        output_dtype = nd.get("output_dtype", None)
+        if output_dtype is not None:
+            output_dtype = np.dtype(output_dtype)
+        store_freqs = bool(nd.get("store_freqs", True))
+        output_state_indices = nd.get("output_state_indices", None)
+        if output_state_indices is not None:
+            output_state_indices = np.asarray(output_state_indices, dtype=int)
+            if output_state_indices.ndim != 1:
+                raise ValueError("output_state_indices must be a 1D array of state indices.")
+            if np.any(output_state_indices < 0) or np.any(output_state_indices >= 3 * N_lasers):
+                raise ValueError(
+                    f"output_state_indices must be between 0 and {3 * N_lasers - 1}."
+                )
+        output_n_states = (
+            len(output_state_indices)
+            if output_state_indices is not None
+            else 3 * N_lasers
+        )
+
+        def output_state_copy(arr):
+            if output_state_indices is not None:
+                out = arr[:, output_state_indices].copy()
+            else:
+                out = arr.copy()
+            if output_dtype is not None:
+                out = out.astype(output_dtype, copy=False)
+            return out
+
+        def output_freq_copy(arr):
+            out = arr.copy()
+            if output_dtype is not None:
+                out = out.astype(output_dtype, copy=False)
+            return out
+
+        def output_state_series(arr):
+            if output_state_indices is not None:
+                out = arr[:, output_state_indices, :].copy()
+            else:
+                out = arr
+            if output_dtype is not None and out.dtype != output_dtype:
+                out = out.astype(output_dtype, copy=False)
+            return out
+
         if max_output_gb is not None:
-            bytes_per_step = n_cases * (4 * N_lasers) * 8
+            freq_states = N_lasers if store_freqs else 0
+            bytes_per_step = n_cases * (output_n_states + freq_states) * 8
             est_bytes = bytes_per_step * steps
             max_bytes = max_output_gb * 1e9
             save_every_req = int(np.ceil(est_bytes / max_bytes)) if est_bytes > max_bytes else 1
             save_every = max(save_every, save_every_req)
             nd['save_every'] = save_every
-            if save_every_req > 1:
+            if save_every_req > 1 and bool(
+                nd.get("show_output_size_message", True)
+            ):
                 est_gb = est_bytes / 1e9
                 print(
                     f"Estimated output size ~{est_gb:.2f} GB; "
@@ -523,14 +722,23 @@ class VCSEL:
             raise ValueError("history too short for configured delay_steps")
 
         use_stream = save_every > 1
+        if use_stream and integration_scheme_key == "abm4":
+            # ABM4 can run in streaming mode because the ring buffer stores the
+            # full-resolution delayed state history. Only the returned output is
+            # downsampled by save_every.
+            pass
         if use_stream:
             buffer_len = 2 * delay_steps + 1
             y_buf = np.zeros((n_cases, 3 * N_lasers, buffer_len))
-            freqs_buf = np.zeros((n_cases, N_lasers, buffer_len))
+            freqs_buf = (
+                np.zeros((n_cases, N_lasers, buffer_len))
+                if store_freqs
+                else None
+            )
             y_buf[:, :, :2 * delay_steps] = history[:, :, :2 * delay_steps]
             keep_idx = []
             y_keep = []
-            f_keep = []
+            f_keep = [] if store_freqs else None
 
             def should_store(idx):
                 return idx % save_every == 0
@@ -538,21 +746,54 @@ class VCSEL:
             for idx in range(min(2 * delay_steps, steps)):
                 if should_store(idx):
                     keep_idx.append(idx)
-                    y_keep.append(history[:, :, idx].copy())
-                    f_keep.append(np.zeros((n_cases, N_lasers)))
+                    y_keep.append(output_state_copy(history[:, :, idx]))
+                    if store_freqs:
+                        f_keep.append(np.zeros((n_cases, N_lasers), dtype=output_dtype or float))
             keep_pos = {idx: pos for pos, idx in enumerate(keep_idx)}
         else:
             # ----------------- allocate outputs -----------------
             y = np.zeros((n_cases, 3*N_lasers, steps))
-            freqs = np.zeros((n_cases, N_lasers, steps))
+            freqs = np.zeros((n_cases, N_lasers, steps)) if store_freqs else None
             y[:, :, :2*delay_steps] = history[:, :, :2*delay_steps]
+
+        def final_history_from_buffer():
+            history_len_local = min(2 * delay_steps, steps)
+            start_local = steps - history_len_local
+            return np.stack(
+                [
+                    y_buf[:, :, idx % buffer_len].copy()
+                    for idx in range(start_local, steps)
+                ],
+                axis=2,
+            )
+
+        def maybe_return(t_dim, y_out, freqs_out, final_history=None):
+            if return_final_history:
+                if final_history is None:
+                    history_len_local = min(2 * delay_steps, y_out.shape[2])
+                    final_history = y_out[:, :, -history_len_local:].copy()
+                return t_dim, y_out, freqs_out, final_history
+            return t_dim, y_out, freqs_out
 
         start_idx = 2 * delay_steps - 1
         if start_idx >= steps:
             t_dim = np.arange(steps) * dt * nd['tau_p']
             if use_stream:
-                return t_dim, history[:, :, :steps], np.zeros((n_cases, N_lasers, steps))
-            return t_dim, y, freqs
+                y_out_full = history[:, :, :steps]
+                y_out = output_state_series(y_out_full)
+                freqs_out = (
+                    np.zeros((n_cases, N_lasers, steps))
+                    if store_freqs
+                    else None
+                )
+                final_history = y_out_full[:, :, -min(2 * delay_steps, steps):].copy()
+                return maybe_return(t_dim, y_out, freqs_out, final_history)
+            final_history = (
+                y[:, :, -min(2 * delay_steps, steps):].copy()
+                if return_final_history
+                else None
+            )
+            return maybe_return(t_dim, output_state_series(y), freqs, final_history)
 
         # ----------------- precompute indices -----------------
         idx_tau_arr = np.arange(steps) - delay_steps
@@ -587,12 +828,12 @@ class VCSEL:
             )[:, :3*N_lasers]
 
             deriv_n = f_n
-            if use_stream:
+            if use_stream and store_freqs:
                 freqs_buf[:, :, n % buffer_len] = deriv_n[:, phi_idx]
                 pos = keep_pos.get(n)
                 if pos is not None:
-                    f_keep[pos] = deriv_n[:, phi_idx].copy()
-            else:
+                    f_keep[pos] = output_freq_copy(deriv_n[:, phi_idx])
+            elif store_freqs:
                 freqs[:, :, n] = deriv_n[:, phi_idx]
 
         # ----------------- noise normalization -----------------
@@ -615,9 +856,254 @@ class VCSEL:
         tmp_noise = np.empty_like(y_guess)
         noise_substeps = int(max(1, nd.get("noise_substeps", 1)))
 
+        if integration_scheme_key == "abm4":
+            if start_idx < 3:
+                raise ValueError(
+                    "ABM4 needs at least four RHS history samples. "
+                    "Use a smaller dt so 2*tau contains at least four steps."
+                )
+
+            def state_at(state_idx):
+                if use_stream:
+                    return y_buf[:, :, state_idx % buffer_len]
+                return y[:, :, state_idx]
+
+            def delay_states_at(stage_idx):
+                if delay_interp in ("linear", "cubic"):
+                    idx_hi = max(stage_idx - k0, 0)
+                    idx_lo = max(stage_idx - k0 - 1, 0)
+                    y_tau_hi = state_at(idx_hi)
+                    y_tau_lo = state_at(idx_lo)
+                    if delay_interp == "cubic":
+                        idx_p0 = max(idx_lo - 1, 0)
+                        idx_p3 = max(idx_hi + 1, 0)
+                        p0 = state_at(idx_p0)
+                        p1 = y_tau_lo
+                        p2 = y_tau_hi
+                        p3 = state_at(idx_p3)
+                        t = 1.0 - frac
+                        t2 = t * t
+                        t3 = t2 * t
+                        y_tau_stage = 0.5 * (
+                            (2.0 * p1)
+                            + (-p0 + p2) * t
+                            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                        )
+                    else:
+                        y_tau_stage = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+
+                    idx_hi2 = max(stage_idx - k0_2, 0)
+                    idx_lo2 = max(stage_idx - k0_2 - 1, 0)
+                    y_2tau_hi = state_at(idx_hi2)
+                    y_2tau_lo = state_at(idx_lo2)
+                    if delay_interp == "cubic":
+                        idx_p0_2 = max(idx_lo2 - 1, 0)
+                        idx_p3_2 = max(idx_hi2 + 1, 0)
+                        p0 = state_at(idx_p0_2)
+                        p1 = y_2tau_lo
+                        p2 = y_2tau_hi
+                        p3 = state_at(idx_p3_2)
+                        t = 1.0 - frac2
+                        t2 = t * t
+                        t3 = t2 * t
+                        y_2tau_stage = 0.5 * (
+                            (2.0 * p1)
+                            + (-p0 + p2) * t
+                            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                        )
+                    else:
+                        y_2tau_stage = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                    return y_tau_stage, y_2tau_stage
+
+                return state_at(idx_tau_arr[stage_idx]), state_at(idx_2tau_arr[stage_idx])
+
+            def rhs_at(stage_idx, state):
+                y_tau_stage, y_2tau_stage = delay_states_at(stage_idx)
+                return self.f_nd(
+                    state,
+                    y_tau_stage,
+                    y_2tau_stage,
+                    stage_idx,
+                    phi_p,
+                    nd,
+                )[:, :3*N_lasers]
+
+            f_nm3, f_nm2, f_nm1, f_n = [
+                rhs_at(idx, state_at(idx))
+                for idx in range(start_idx - 3, start_idx + 1)
+            ]
+
+            with tqdm(
+                total=steps - 1 - start_idx,
+                desc="Integrating" if message is None else f"Integrating {message}",
+                disable=not progress,
+            ) as pbar:
+                for n in range(start_idx, steps - 1):
+                    y_n = state_at(n)
+                    y_guess[:] = y_n
+                    y_guess += (dt / 24.0) * (
+                        55.0 * f_n
+                        - 59.0 * f_nm1
+                        + 37.0 * f_nm2
+                        - 9.0 * f_nm3
+                    )
+
+                    y_tau_next, y_2tau_next = delay_states_at(n + 1)
+                    f_guess = self.f_nd(
+                        y_guess,
+                        y_tau_next,
+                        y_2tau_next,
+                        n + 1,
+                        phi_p,
+                        nd,
+                    )[:, :3*N_lasers]
+
+                    for _ in range(max_iter):
+                        y_new[:] = y_n
+                        y_new += (dt / 24.0) * (
+                            9.0 * f_guess
+                            + 19.0 * f_n
+                            - 5.0 * f_nm1
+                            + f_nm2
+                        )
+                        delta_iter = np.max(np.abs(y_new - y_guess))
+                        y_guess[:] = y_new
+                        if delta_iter < 1e-10:
+                            break
+                        f_guess = self.f_nd(
+                            y_guess,
+                            y_tau_next,
+                            y_2tau_next,
+                            n + 1,
+                            phi_p,
+                            nd,
+                        )[:, :3*N_lasers]
+
+                    y_c = y_guess
+                    f_endpoint = self.f_nd(
+                        y_c,
+                        y_tau_next,
+                        y_2tau_next,
+                        n + 1,
+                        phi_p,
+                        nd,
+                    )[:, :3*N_lasers]
+                    if use_stream and store_freqs:
+                        freqs_buf[:, :, (n + 1) % buffer_len] = f_endpoint[:, phi_idx]
+                    elif store_freqs:
+                        freqs[:, :, n + 1] = f_endpoint[:, phi_idx]
+
+                    # Euler-Maruyama noise (optionally substepped)
+                    if noise_mode == "none":
+                        y_next = y_c
+                    else:
+                        if noise_mode == "scalar":
+                            na = noise_arr
+                        elif noise_mode == "callable":
+                            na = noise_arr(n * dt * nd["tau_p"])
+                        else:
+                            na = noise_arr[n]
+
+                        if noise_substeps == 1:
+                            tmp_noise[:] = self.compute_noise_sample(
+                                y_c, na, dt, nd
+                            )
+                            y_next = y_c + tmp_noise
+                            y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
+                        else:
+                            y_next = y_c.copy()
+                            dt_sub = dt / noise_substeps
+                            for _ in range(noise_substeps):
+                                tmp_noise[:] = self.compute_noise_sample(
+                                    y_next, na, dt_sub, nd
+                                )
+                                y_next += tmp_noise
+                                y_next[:, S_idx] = np.maximum(y_next[:, S_idx], 1e-11)
+
+                    if use_stream:
+                        y_buf[:, :, (n + 1) % buffer_len] = y_next
+                        if should_store(n + 1):
+                            keep_idx.append(n + 1)
+                            y_keep.append(output_state_copy(y_next))
+                            if store_freqs:
+                                f_keep.append(output_freq_copy(f_endpoint[:, phi_idx]))
+                    else:
+                        y[:, :, n + 1] = y_next
+                    f_next = rhs_at(n + 1, y_next)
+                    f_nm3, f_nm2, f_nm1, f_n = f_nm2, f_nm1, f_n, f_next
+
+                    if progress:
+                        pbar.update(1)
+                    if progress_callback is not None:
+                        progress_callback(1)
+
+            if use_stream:
+                keep_idx = np.array(keep_idx, dtype=int)
+                order = np.argsort(keep_idx)
+                keep_idx = keep_idx[order]
+                y_out = np.stack([y_keep[i] for i in order], axis=2)
+                freqs_out = (
+                    np.stack([f_keep[i] for i in order], axis=2)
+                    if store_freqs
+                    else None
+                )
+                t_dim = keep_idx * dt * nd['tau_p']
+                final_history = final_history_from_buffer()
+
+                window = (
+                    max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+                    if store_freqs
+                    else 1
+                )
+                if store_freqs:
+                    window = min(window, freqs_out.shape[2])
+                if store_freqs and smooth_freqs and window > 1:
+                    kernel = np.ones(window) / window
+                    pad = window // 2
+                    freqs_sm = np.empty_like(freqs_out)
+                    for i in range(n_cases):
+                        for j in range(N_lasers):
+                            series = freqs_out[i, j, :]
+                            if pad > 0:
+                                series = np.pad(series, (pad, pad), mode="edge")
+                            smoothed = np.convolve(series, kernel, mode="valid")
+                            freqs_sm[i, j, :] = smoothed[:freqs_out.shape[2]]
+                            if pad > 0:
+                                freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+                    freqs_out = freqs_sm
+
+                return maybe_return(t_dim, y_out, freqs_out, final_history)
+
+            if store_freqs and smooth_freqs:
+                window = max(1, int(round(delay_steps * smooth_window_delays)))
+                window = min(window, steps)
+                kernel = np.ones(window) / window
+                freqs_sm = np.empty_like(freqs)
+                pad = window // 2
+                for i in range(n_cases):
+                    for j in range(N_lasers):
+                        series = freqs[i, j, :]
+                        if pad > 0:
+                            series = np.pad(series, (pad, pad), mode="edge")
+                        smoothed = np.convolve(series, kernel, mode="valid")
+                        freqs_sm[i, j, :] = smoothed[:steps]
+                        if pad > 0:
+                            freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
+                freqs = freqs_sm
+
+            t_dim = np.arange(steps) * dt * nd['tau_p']
+            final_history = (
+                y[:, :, -min(2 * delay_steps, steps):].copy()
+                if return_final_history
+                else None
+            )
+            return maybe_return(t_dim, output_state_series(y), freqs, final_history)
+
         # ----------------- main loop -----------------
         with tqdm(total=steps - 1 - start_idx,
-                desc="Integrating",
+                desc="Integrating" if message is None else f"Integrating {message}",
                 disable=not progress) as pbar:
 
             for n in range(start_idx, steps - 1):
@@ -753,8 +1239,9 @@ class VCSEL:
                 # derivative used for frequency
                 deriv_n = (1.0 - theta) * f_n + theta * f_guess
                 if use_stream:
-                    freqs_buf[:, :, (n + 1) % buffer_len] = deriv_n[:, phi_idx]
-                else:
+                    if store_freqs:
+                        freqs_buf[:, :, (n + 1) % buffer_len] = deriv_n[:, phi_idx]
+                elif store_freqs:
                     freqs[:, :, n + 1] = deriv_n[:, phi_idx]
 
                 # Euler–Maruyama noise (optionally substepped)
@@ -788,25 +1275,38 @@ class VCSEL:
                     y_buf[:, :, (n + 1) % buffer_len] = y_next
                     if should_store(n + 1):
                         keep_idx.append(n + 1)
-                        y_keep.append(y_next.copy())
-                        f_keep.append(freqs_buf[:, :, (n + 1) % buffer_len].copy())
+                        y_keep.append(output_state_copy(y_next))
+                        if store_freqs:
+                            f_keep.append(output_freq_copy(freqs_buf[:, :, (n + 1) % buffer_len]))
                 else:
                     y[:, :, n + 1] = y_next
 
                 if progress:
                     pbar.update(1)
+                if progress_callback is not None:
+                    progress_callback(1)
 
         if use_stream:
             keep_idx = np.array(keep_idx, dtype=int)
             order = np.argsort(keep_idx)
             keep_idx = keep_idx[order]
             y_out = np.stack([y_keep[i] for i in order], axis=2)
-            freqs_out = np.stack([f_keep[i] for i in order], axis=2)
+            freqs_out = (
+                np.stack([f_keep[i] for i in order], axis=2)
+                if store_freqs
+                else None
+            )
             t_dim = keep_idx * dt * nd['tau_p']
+            final_history = final_history_from_buffer()
 
-            window = max(1, int(round(delay_steps * smooth_window_delays / save_every)))
-            window = min(window, freqs_out.shape[2])
-            if smooth_freqs and window > 1:
+            window = (
+                max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+                if store_freqs
+                else 1
+            )
+            if store_freqs:
+                window = min(window, freqs_out.shape[2])
+            if store_freqs and smooth_freqs and window > 1:
                 kernel = np.ones(window) / window
                 pad = window // 2
                 freqs_sm = np.empty_like(freqs_out)
@@ -821,9 +1321,9 @@ class VCSEL:
                             freqs_sm[i, j, -pad:] = freqs_sm[i, j, -pad - 1]
                 freqs_out = freqs_sm
 
-            return t_dim, y_out, freqs_out
+            return maybe_return(t_dim, y_out, freqs_out, final_history)
 
-        if smooth_freqs:
+        if store_freqs and smooth_freqs:
             window = max(1, int(round(delay_steps * smooth_window_delays)))
             window = min(window, steps)
             kernel = np.ones(window) / window
@@ -841,14 +1341,12 @@ class VCSEL:
             freqs = freqs_sm
 
         t_dim = np.arange(steps) * dt * nd['tau_p']
-        return t_dim, y, freqs
-
-
-    
-    
-
-
-    
+        final_history = (
+            y[:, :, -min(2 * delay_steps, steps):].copy()
+            if return_final_history
+            else None
+        )
+        return maybe_return(t_dim, output_state_series(y), freqs, final_history)
 
     # -------------------------------------------------------------------------
     # Static Utility: Cosine Ramp
@@ -916,7 +1414,8 @@ class VCSEL:
               - 'ZF' : zero-field history (all fields zero except phase ramp)
               - 'EQ' : equilibrium histories for all steady-state solutions
         n_cases : int
-            Number of independent cases to tile the history for.
+            Number of independent cases to tile the history for (ignored when
+            shape='EQ', where one case is returned per equilibrium).
         counts : dict or None
             Optional override for phase and frequency seed counts when
             shape='EQ'.
@@ -929,7 +1428,7 @@ class VCSEL:
         history : np.ndarray, shape (n_cases, 3*N_lasers, 2*delay_steps)
             History suitable as input to integrate().
         freq_hist : np.ndarray, shape (n_cases, N_lasers, 2*delay_steps)
-            Frequency history (rad/s) inferred from the detuning or equilibrium.
+            Frequency history in GHz inferred from detuning/equilibrium.
         eq : np.ndarray or None
             Final equilibrium when shape='EQ', otherwise None.
         results : np.ndarray or None
@@ -949,39 +1448,59 @@ class VCSEL:
 
         N_lasers = nd.get('N_lasers', 2)
 
+        def _delta_cases_for_history():
+            delta_p = np.asarray(nd['delta_p'], dtype=float)
+            if delta_p.ndim == 0:
+                return np.full((n_cases, N_lasers), float(delta_p))
+            if delta_p.shape == (N_lasers,):
+                return np.tile(delta_p[None, :], (n_cases, 1))
+            if delta_p.shape == (1, N_lasers):
+                return np.tile(delta_p, (n_cases, 1))
+            if delta_p.shape == (n_cases, N_lasers):
+                return delta_p
+            raise ValueError(
+                "nd['delta_p'] must be scalar, shape "
+                f"({N_lasers},), shape (1,{N_lasers}), or shape "
+                f"({n_cases},{N_lasers}) for {n_cases} cases; got shape {delta_p.shape}"
+            )
+
         if shape == 'FR':
             # Free-running steady-state: steady carriers and photons; phi2 may
             # accumulate according to detuning.
-            hist = np.zeros((3*N_lasers, length))
-            hist[0::3, :] = nd['nbar']         # n1
-            hist[1::3, :] = nd['sbar']         # S1 (nondimensional)
-            freq_hist = np.zeros((N_lasers, 2*nd['delay_steps']))
+            history = np.zeros((n_cases, 3 * N_lasers, length))
+            history[:, 0::3, :] = nd['nbar']         # n1
+            history[:, 1::3, :] = nd['sbar']         # S1 (nondimensional)
+            freq_hist = np.zeros((n_cases, N_lasers, length))
+            delta_cases = _delta_cases_for_history()
+            t_hist = np.arange(length) * nd['dt']
 
-            if np.shape(nd['delta_p']) == ():
-                raise ValueError("nd['delta_p'] must be array-like for multiple lasers")
-            elif np.shape(nd['delta_p']) != (N_lasers,):
-                raise ValueError(f"nd['delta_p'] must have shape ({N_lasers},) for {N_lasers} lasers")
-            else:
-                for p, delta_p in enumerate(np.array(nd['delta_p'])):
-                    hist[3*p+2, :] = delta_p * np.arange(length) * nd['dt']  
-                    freq_hist[p, :] = delta_p * np.ones(length) / (2*np.pi*1e9*nd['tau_p'])  # convert back to rad/s
+            for p in range(N_lasers):
+                history[:, 3 * p + 2, :] = delta_cases[:, p, None] * t_hist[None, :]
+                freq_hist[:, p, :] = (
+                    delta_cases[:, p, None]
+                    / (2 * np.pi * 1e9 * nd['tau_p'])
+                )
+
+            return history, freq_hist, eq, results
 
 
         elif shape == 'ZF':
             # Zero-field initial condition: zero photons and zero carriers
-            hist = np.zeros((3*N_lasers, length))
-            hist[0::3, :] = 0.0         # n1
-            hist[1::3, :] = 0.0         # S1 (nondimensional)
-            freq_hist = np.zeros((N_lasers, 2*nd['delay_steps']))
+            history = np.zeros((n_cases, 3 * N_lasers, length))
+            history[:, 0::3, :] = 0.0         # n1
+            history[:, 1::3, :] = 0.0         # S1 (nondimensional)
+            freq_hist = np.zeros((n_cases, N_lasers, length))
+            delta_cases = _delta_cases_for_history()
+            t_hist = np.arange(length) * nd['dt']
 
-            if np.shape(nd['delta_p']) == ():
-                raise ValueError("nd['delta_p'] must be array-like for multiple lasers")
-            elif np.shape(nd['delta_p']) != (N_lasers,):
-                raise ValueError(f"nd['delta_p'] must have shape ({N_lasers},) for {N_lasers} lasers")
-            else:
-                for p, delta_p in enumerate(np.array(nd['delta_p'])):
-                    hist[3*p+2, :] = delta_p * np.arange(length) * nd['dt']  
-                    freq_hist[p, :] = delta_p * np.ones(length) / (2*np.pi*1e9*nd['tau_p'])  # convert back to rad/s
+            for p in range(N_lasers):
+                history[:, 3 * p + 2, :] = delta_cases[:, p, None] * t_hist[None, :]
+                freq_hist[:, p, :] = (
+                    delta_cases[:, p, None]
+                    / (2 * np.pi * 1e9 * nd['tau_p'])
+                )
+
+            return history, freq_hist, eq, results
         elif shape == 'EQ':
             # Steady-state equilibrium histories for all solutions.
             N_lasers = nd.get('N_lasers', 2)
@@ -1323,6 +1842,9 @@ class VCSEL:
             # -----------------------------
             # Photon equation: self-feedback
             # -----------------------------
+            # TODO(model): this residual currently encodes only 2*tau
+            # self-feedback. Add tau self-feedback here when that path is
+            # enabled in the forward model.
             
             phi_fb = -2.0 * (w_tau + phi_p[i,i])
         
@@ -1492,45 +2014,74 @@ class VCSEL:
         ramp = VCSEL.cosine_ramp(time_arr, ramp_start*tau, ramp_shape*tau, kappa_initial=0, kappa_final=1)
         kappa_arr = kappa_initial + (ramp[:, None, None] * (kappa_final[None, :, :]-kappa_initial[None, :, :]))
 
-        if scheme == 'ATA':
-            # All-to-all coupling: both lasers have the same coupling strength
-            kappa_mat = np.copy(kappa_arr)
-        elif scheme == 'NN':
-            kappa_mat = np.zeros_like(kappa_arr)
+        def _normalize_adjacency(adj):
+            adj = np.array(adj, dtype=float, copy=True)
+            total = float(np.sum(adj))
+            if total <= 0.0:
+                raise ValueError("Adjacency matrix must have a positive sum for normalization.")
+            return adj / total
 
-            # --- Keep diagonals ---
+        if scheme == 'ATA':
+            # All-to-all topology, normalized so sum(aMAT)=1
+            aMAT = np.ones((N_lasers, N_lasers), dtype=float)
+            aMAT = _normalize_adjacency(aMAT)
+            kappa_mat = kappa_arr * aMAT[None, :, :]
+        elif scheme == 'NN':
+            # Nearest-neighbor topology + diagonal, normalized so sum(aMAT)=1
+            aMAT = np.zeros((N_lasers, N_lasers), dtype=float)
             diag_idx = np.arange(N_lasers)
-            kappa_mat[:, diag_idx, diag_idx] = kappa_arr[:, diag_idx, diag_idx]
+            aMAT[diag_idx, diag_idx] = 1.0
 
             # --- Nearest neighbors: i → i+1 (upper diagonal) ---
             up_i = np.arange(N_lasers - 1)
             up_j = np.arange(1, N_lasers)
-            kappa_mat[:, up_i, up_j] = kappa_arr[:, up_i, up_j]
+            aMAT[up_i, up_j] = 1.0
 
             # --- Nearest neighbors: i → i−1 (lower diagonal) ---
             down_i = np.arange(1, N_lasers)
             down_j = np.arange(N_lasers - 1)
-            kappa_mat[:, down_i, down_j] = kappa_arr[:, down_i, down_j]
+            aMAT[down_i, down_j] = 1.0
+            aMAT = _normalize_adjacency(aMAT)
+            kappa_mat = kappa_arr * aMAT[None, :, :]
         elif scheme =='CUSTOM':
             if aMAT is None:
                 raise ValueError("Custom scheme requires aMAT (adjacency matrix).")
-            kappa_mat = np.copy(kappa_arr)
-            # Custom scheme can be implemented here
+            aMAT = np.array(aMAT, dtype=float)
+            if aMAT.shape != (N_lasers, N_lasers):
+                raise ValueError(f"Custom adjacency must have shape ({N_lasers}, {N_lasers}).")
+            aMAT = _normalize_adjacency(aMAT)
             kappa_mat = kappa_arr * aMAT[None, :, :]
         elif scheme == 'RANDOM':
             # Global coupling: each laser couples to the mean field of all others
             aMAT = np.random.randint(0, 2, size=(N_lasers, N_lasers))
+            aMAT = np.triu(aMAT, 1)
+            aMAT = aMAT + aMAT.T
+
+            for j in range(N_lasers):
+                if not np.any(aMAT[:, j]):
+                    i = np.random.choice([k for k in range(N_lasers) if k != j])
+                    aMAT[i, j] = aMAT[j, i] = 1
+
+            # Normalize random adjacency so its elements sum to 1.
+            aMAT = aMAT.astype(float)
+            aMAT_sum = np.sum(aMAT)
+            if aMAT_sum <= 0.0:
+                # Safe fallback for degenerate draws.
+                aMAT = np.ones((N_lasers, N_lasers), dtype=float)
+                np.fill_diagonal(aMAT, 0.0)
+            aMAT = _normalize_adjacency(aMAT)
+
             kappa_mat = kappa_arr * aMAT[None, :, :]
         elif scheme =='DECAYED':
             if dx is None:
                 raise ValueError("Decayed scheme requires dx (distance array).")
-            kappa_mat = np.copy(kappa_arr)
             aMAT = np.zeros((N_lasers, N_lasers))
             # Exponential decay based on distance
             for i in range(N_lasers):
                 for j in range(N_lasers):
                     aMAT[i, j] = dx**np.abs(i - j)
 
+            aMAT = _normalize_adjacency(aMAT)
             kappa_mat = kappa_arr * aMAT[None, :, :]            
 
             
@@ -1541,13 +2092,13 @@ class VCSEL:
         if plot:
             import matplotlib.pyplot as plt
             plt.figure(figsize=(5, 4), dpi=300)
-            plt.imshow(kappa_mat[-1,:,:]/np.max(kappa_mat[-1,:,:]), cmap='viridis', aspect='auto')
-            cbar = plt.colorbar(label='Normalized Coupling Strength')
+            plt.imshow(aMAT, cmap='viridis', aspect='auto')
+            cbar = plt.colorbar(label='Adjacency Matrix')
             cbar.ax.tick_params(labelsize=14)
-            cbar.set_label('Normalized Coupling Strength', fontsize=14)
+            cbar.set_label('Adjacency Matrix', fontsize=14)
             plt.xlabel('Laser Index', fontsize=14)
             plt.ylabel('Laser Index', fontsize=14)
-            plt.title('Normalized Coupling Matrix', fontsize=16)
+            plt.title('Adjacency Matrix', fontsize=16)
             plt.clim(0,1)
             # Set tick labels at 0 and N_lasers-1 with custom labels
             plt.xticks([0, N_lasers - 1], ['1', str(N_lasers)], fontsize=14)
@@ -1689,6 +2240,9 @@ class VCSEL:
         # A2 : self-feedback (INCOMPLETE)
         # =========================================================
         if self_fb > 0.0:
+            # TODO(model): only 2*tau self-feedback is included here. If tau
+            # self-feedback is added, its delayed derivatives belong in A1 and
+            # matching instantaneous terms must be added to A0.
             for i in range(N):
                 kap = kappa_diag[i]
                 dphi =  - 2*phi_p_self[i] - 2*omega * nd["tau"]
@@ -1972,6 +2526,9 @@ class VCSEL:
         A0, A1, A2 = self.compute_jacobians(x_eq, nd_local, verbose=verbose)
         
         if nd_local['self_feedback'] > 0.0:
+            # TODO(model): tau_list assumes mutual coupling at tau and
+            # self-feedback at 2*tau only. Revisit if tau self-feedback is
+            # added to f_nd/residuals/compute_jacobians.
             tau_list = [0.0, nd_local['tau'], 2*nd_local['tau']]
             A_list = [A0, A1, A2]
         else:
@@ -2005,3 +2562,5 @@ class VCSEL:
             stable = 1.0
         
         return stable, eigvals
+
+__all__ = ["VCSEL"]
