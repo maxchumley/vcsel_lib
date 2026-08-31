@@ -16,14 +16,15 @@ the integrator.
 Author: Max Chumley with assistance from GitHub Copilot and OpenAI CODEX
 """
 
-import numpy as np
 import warnings
-from sympy import symbols, Eq, solve
-from tqdm import tqdm
-from scipy.optimize import root
-from joblib import Parallel, delayed
+
+import numpy as np
 import scipy.sparse as sp
 import scipy.sparse.linalg as spla
+from joblib import Parallel, delayed
+from scipy.optimize import root
+from sympy import Eq, solve, symbols
+from tqdm import tqdm
 
 
 class VCSEL:
@@ -281,9 +282,7 @@ class VCSEL:
             delta = np.full((1, N), float(delta_p))
         elif delta_p.shape == (N,):
             delta = delta_p.reshape(1, N)  # broadcast one detuning vector across cases
-        elif delta_p.shape == (1, N):
-            delta = delta_p
-        elif delta_p.shape == (n_cases, N):
+        elif delta_p.shape == (1, N) or delta_p.shape == (n_cases, N):
             delta = delta_p
         else:
             raise ValueError(
@@ -1053,7 +1052,7 @@ class VCSEL:
                 final_history = final_history_from_buffer()
 
                 window = (
-                    max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+                    max(1, round(delay_steps * smooth_window_delays / save_every))
                     if store_freqs
                     else 1
                 )
@@ -1077,7 +1076,7 @@ class VCSEL:
                 return maybe_return(t_dim, y_out, freqs_out, final_history)
 
             if store_freqs and smooth_freqs:
-                window = max(1, int(round(delay_steps * smooth_window_delays)))
+                window = max(1, round(delay_steps * smooth_window_delays))
                 window = min(window, steps)
                 kernel = np.ones(window) / window
                 freqs_sm = np.empty_like(freqs)
@@ -1300,7 +1299,7 @@ class VCSEL:
             final_history = final_history_from_buffer()
 
             window = (
-                max(1, int(round(delay_steps * smooth_window_delays / save_every)))
+                max(1, round(delay_steps * smooth_window_delays / save_every))
                 if store_freqs
                 else 1
             )
@@ -1324,7 +1323,7 @@ class VCSEL:
             return maybe_return(t_dim, y_out, freqs_out, final_history)
 
         if store_freqs and smooth_freqs:
-            window = max(1, int(round(delay_steps * smooth_window_delays)))
+            window = max(1, round(delay_steps * smooth_window_delays))
             window = min(window, steps)
             kernel = np.ones(window) / window
             freqs_sm = np.empty_like(freqs)
@@ -1907,7 +1906,7 @@ class VCSEL:
         """
 
         eps = 1e-12
-        n_cases, total_states, T = y_segment.shape
+        _, total_states, _ = y_segment.shape
         N = total_states // 3
 
         # Extract S_i and phi_i for all lasers
@@ -2086,7 +2085,7 @@ class VCSEL:
 
             
         else:
-            raise ValueError("Unsupported coupling scheme: {}".format(scheme))
+            raise ValueError(f"Unsupported coupling scheme: {scheme}")
             
 
         if plot:
