@@ -211,9 +211,30 @@ __marimo__/
 results/
 
 examples/archive/
-examples/data/
-examples/HTML_files/
-examples/injection_tests/
+/examples/*/data/
+/examples/*/results/
+bayesian_steering_output*/
 
+# Generated simulation artifacts
+/rl/artifacts/
+/continuous_adjoint_frames/
+/logs/
+/output/
+/tmp/
 
-.png
+# Local recovery snapshots. Promote intentionally preserved files into a
+# documented archive before committing them.
+/working_model_backup/
+/archive/
+
+# Scheduler output
+slurm-*.out
+*.slurm.out
+*.slurm.err
+
+*.npy
+*.npz
+*.png
+*.mp4
+*.mkv
+*.gif

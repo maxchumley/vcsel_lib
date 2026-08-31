@@ -2,6 +2,7 @@ import os
 import sys
 
 import numpy as np
+import pytest
 
 # Ensure local vcsel_lib.py is used instead of any installed package.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -33,7 +34,7 @@ def make_phys(N_lasers=2, steps=20):
     delta = detuning * 2 * np.pi * 1e9
     delta_dist = delta / 2 * np.linspace(-1, 1, N_lasers)
 
-    kappa_c = 0.5e9
+    kappa_c = 2e9
     ramp_start = 0
     ramp_shape = 0.001
     kappa_arr = VCSEL.build_coupling_matrix(
@@ -135,6 +136,30 @@ def test_generate_history_shapes():
     assert results is None or results.shape[1] == 3 * nd["N_lasers"]
 
 
+def test_generate_history_case_dependent_delta():
+    phys = make_phys(N_lasers=2, steps=12)
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    n_cases = 4
+    nd["delta_p"] = np.array([
+        [-0.01, 0.01],
+        [-0.02, 0.02],
+        [-0.03, 0.03],
+        [-0.04, 0.04],
+    ])
+
+    history, freq_hist, eq, results = vcsel.generate_history(nd, shape="FR", n_cases=n_cases)
+
+    assert history.shape == (n_cases, 3 * nd["N_lasers"], 2 * nd["delay_steps"])
+    assert freq_hist.shape == (n_cases, nd["N_lasers"], 2 * nd["delay_steps"])
+    assert eq is None
+    assert results is None
+    assert np.allclose(
+        freq_hist[:, :, 0],
+        nd["delta_p"] / (2 * np.pi * 1e9 * nd["tau_p"]),
+    )
+
+
 def test_invert_scaling_vectorized():
     phys = make_phys(N_lasers=3, steps=8)
     vcsel = VCSEL(phys)
@@ -173,6 +198,84 @@ def test_compute_noise_sample_zero():
     assert np.allclose(noise, 0.0)
 
 
+def test_nondimensional_noise_matches_dimensional_ma_equation(monkeypatch):
+    """The scaled noise increment must equal Ma et al. Eq. (2)."""
+    phys = make_phys(N_lasers=2, steps=6)
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+
+    # Two cases also verify that each laser/case uses its corresponding state.
+    carrier_number = np.array(
+        [[4.2e5, 5.1e5], [3.8e5, 6.0e5]], dtype=float
+    )
+    photon_number = np.array(
+        [[8.0e4, 1.2e5], [9.5e4, 7.0e4]], dtype=float
+    )
+    y_nd = np.zeros((2, 6), dtype=float)
+    y_nd[:, 0::3] = (
+        phys["g0"] * phys["tau_p"] * (carrier_number - phys["N0"])
+        - 1.0
+    )
+    y_nd[:, 1::3] = phys["g0"] * phys["tau_n"] * photon_number
+
+    standard_normals = np.array(
+        [
+            [0.3, -0.7, 1.1, -1.2, 0.8, -0.4],
+            [-0.2, 0.6, 0.9, 1.3, -0.5, -1.0],
+        ],
+        dtype=float,
+    )
+    monkeypatch.setattr(
+        np.random,
+        "randn",
+        lambda *shape: standard_normals.copy(),
+    )
+    actual = vcsel.compute_noise_sample(
+        y_nd,
+        noise_amplitude=1.0,
+        dt=nd["dt"],
+        nd=nd,
+    )
+
+    # Ma et al. write forces proportional to 1/sqrt(dt_physical).  After the
+    # Euler--Maruyama step, their dimensional state increments are therefore
+    # the coefficients below multiplied by sqrt(dt_physical).
+    z_n = standard_normals[:, 0::3]
+    z_s = standard_normals[:, 1::3]
+    z_phi = standard_normals[:, 2::3]
+    dt_physical = nd["dt"] * phys["tau_p"]
+    sqrt_dt_physical = np.sqrt(dt_physical)
+    beta = phys["beta"]
+    tau_n = phys["tau_n"]
+
+    delta_carrier = (
+        np.sqrt(2.0 * carrier_number / tau_n) * z_n
+        - np.sqrt(
+            2.0 * beta * carrier_number * photon_number / tau_n
+        )
+        * z_s
+    ) * sqrt_dt_physical
+    delta_photon = (
+        np.sqrt(2.0 * beta * carrier_number * photon_number / tau_n)
+        * z_s
+        * sqrt_dt_physical
+    )
+    delta_phase = (
+        np.sqrt(
+            beta * carrier_number / (2.0 * tau_n * photon_number)
+        )
+        * z_phi
+        * sqrt_dt_physical
+    )
+
+    expected = np.zeros_like(y_nd)
+    expected[:, 0::3] = phys["g0"] * phys["tau_p"] * delta_carrier
+    expected[:, 1::3] = phys["g0"] * phys["tau_n"] * delta_photon
+    expected[:, 2::3] = delta_phase
+
+    np.testing.assert_allclose(actual, expected, rtol=2e-15, atol=1e-18)
+
+
 def test_f_nd_shapes_and_finite():
     phys = make_phys(N_lasers=2, steps=6)
     vcsel = VCSEL(phys)
@@ -188,6 +291,58 @@ def test_f_nd_shapes_and_finite():
     assert np.isfinite(out).all()
 
 
+def test_f_nd_case_dependent_delta():
+    phys = make_phys(N_lasers=2, steps=6)
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+
+    n_cases = 3
+    N_lasers = phys["N_lasers"]
+    nd["delta_p"] = np.array([
+        [-0.01, 0.01],
+        [-0.02, 0.02],
+        [-0.03, 0.03],
+    ])
+    x = np.random.randn(n_cases, 3 * N_lasers)
+    x_tau = np.random.randn(n_cases, 3 * N_lasers)
+    x_2tau = np.random.randn(n_cases, 3 * N_lasers)
+
+    out = vcsel.f_nd(x, x_tau, x_2tau, j=0, phi_p=0.0, nd=nd)
+
+    assert out.shape == (n_cases, 3 * N_lasers)
+    assert np.isfinite(out).all()
+
+
+def test_f_nd_kappa_ramp_matches_zero_and_full_coupling():
+    phys = make_phys(N_lasers=2, steps=6)
+    phys["noise_amplitude"] = 0.0
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    nd["kappa"] = np.array([[0.0, 0.02], [0.03, 0.0]])
+    nd["phi_p"] = np.zeros((2, 2))
+
+    x = np.array([[nd["nbar"], nd["sbar"], 0.1,
+                   nd["nbar"], nd["sbar"], -0.2]])
+    x_tau = np.array([[nd["nbar"], nd["sbar"], 0.4,
+                       nd["nbar"], nd["sbar"], 0.7]])
+    x_2tau = x.copy()
+
+    nd_ramped = dict(nd)
+    nd_ramped["kappa_ramp"] = np.r_[0.0, np.ones(nd["steps"] - 1)]
+    out_zero = vcsel.f_nd(x, x_tau, x_2tau, 0, nd["phi_p"], nd_ramped)
+    out_full = vcsel.f_nd(x, x_tau, x_2tau, 1, nd["phi_p"], nd_ramped)
+
+    nd_uncoupled = dict(nd)
+    nd_uncoupled["coupling"] = 0.0
+    expected_zero = vcsel.f_nd(
+        x, x_tau, x_2tau, 0, nd["phi_p"], nd_uncoupled
+    )
+    expected_full = vcsel.f_nd(x, x_tau, x_2tau, 1, nd["phi_p"], nd)
+
+    np.testing.assert_allclose(out_zero, expected_zero)
+    np.testing.assert_allclose(out_full, expected_full)
+
+
 def test_integrate_short_run():
     phys = make_phys(N_lasers=2, steps=20)
     vcsel = VCSEL(phys)
@@ -200,6 +355,125 @@ def test_integrate_short_run():
     assert t_dim.shape[0] == nd["steps"]
     assert y.shape == (1, 3 * nd["N_lasers"], nd["steps"])
     assert freqs.shape == (1, nd["N_lasers"], nd["steps"])
+
+
+def test_integrate_case_dependent_delta_short_run():
+    phys = make_phys(N_lasers=2, steps=20)
+    phys["noise_amplitude"] = 0.0
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    nd["tau"] = nd["dt"]
+    nd["delay_steps"] = 1
+    n_cases = 4
+    nd["delta_p"] = np.array([
+        [-0.01, 0.01],
+        [-0.02, 0.02],
+        [-0.03, 0.03],
+        [-0.04, 0.04],
+    ])
+    nd["phi_p"] = np.zeros((n_cases, nd["N_lasers"], nd["N_lasers"]))
+    history, _, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=n_cases)
+
+    t_dim, y, freqs = vcsel.integrate(history, nd=nd, progress=False, max_iter=1)
+
+    assert t_dim.shape[0] == nd["steps"]
+    assert y.shape == (n_cases, 3 * nd["N_lasers"], nd["steps"])
+    assert freqs.shape == (n_cases, nd["N_lasers"], nd["steps"])
+    assert np.isfinite(y).all()
+    assert np.isfinite(freqs).all()
+
+
+def test_integrate_kappa_ramp_matches_explicit_four_dimensional_kappa():
+    phys = make_phys(N_lasers=2, steps=24)
+    phys["tau"] = phys["dt"]
+    phys["noise_amplitude"] = 0.0
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    n_cases = 2
+    history, _, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=n_cases)
+
+    kappa_cases = np.array(
+        [
+            [[0.0, 0.01], [0.02, 0.0]],
+            [[0.0, 0.03], [0.04, 0.0]],
+        ]
+    )
+    ramp = np.linspace(0.0, 1.0, nd["steps"])
+    phi_p = np.zeros((n_cases, 2, 2))
+
+    nd_low_memory = dict(nd)
+    nd_low_memory["kappa"] = kappa_cases
+    nd_low_memory["kappa_case_dependent"] = True
+    nd_low_memory["kappa_ramp"] = ramp
+    nd_low_memory["phi_p"] = phi_p
+
+    nd_explicit = dict(nd)
+    nd_explicit["kappa"] = ramp[:, None, None, None] * kappa_cases[None, :, :, :]
+    nd_explicit["phi_p"] = phi_p
+
+    t_ramp, y_ramp, f_ramp = vcsel.integrate(
+        history.copy(), nd=nd_low_memory, progress=False, max_iter=1,
+        smooth_freqs=False,
+    )
+    t_full, y_full, f_full = vcsel.integrate(
+        history.copy(), nd=nd_explicit, progress=False, max_iter=1,
+        smooth_freqs=False,
+    )
+
+    np.testing.assert_array_equal(t_ramp, t_full)
+    np.testing.assert_allclose(y_ramp, y_full, rtol=0.0, atol=0.0)
+    np.testing.assert_allclose(f_ramp, f_full, rtol=0.0, atol=0.0)
+
+
+def test_integrate_abm4_short_run():
+    phys = make_phys(N_lasers=2, steps=80)
+    phys["tau"] = 5 * phys["dt"]
+    phys["noise_amplitude"] = 0.0
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    nd["integration_scheme"] = "ABM4"
+    nd["delay_interp"] = "linear"
+    history, _, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=1)
+    t_dim, y, freqs = vcsel.integrate(
+        history,
+        nd=nd,
+        progress=False,
+        max_iter=2,
+        smooth_freqs=False,
+    )
+    assert t_dim.shape[0] == nd["steps"]
+    assert y.shape == (1, 3 * nd["N_lasers"], nd["steps"])
+    assert freqs.shape == (1, nd["N_lasers"], nd["steps"])
+    assert np.isfinite(y).all()
+    assert np.isfinite(freqs).all()
+
+
+def test_integrate_abm4_streaming_final_history():
+    phys = make_phys(N_lasers=2, steps=80)
+    phys["tau"] = 5 * phys["dt"]
+    phys["noise_amplitude"] = 0.0
+    phys["save_every"] = 4
+    phys["output_dtype"] = np.float32
+    vcsel = VCSEL(phys)
+    nd = vcsel.scale_params()
+    nd["integration_scheme"] = "ABM4"
+    nd["delay_interp"] = "linear"
+    history, _, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=1)
+    t_dim, y, freqs, final_history = vcsel.integrate(
+        history,
+        nd=nd,
+        progress=False,
+        max_iter=2,
+        smooth_freqs=False,
+        return_final_history=True,
+    )
+    assert t_dim.shape[0] < nd["steps"]
+    assert y.shape[2] == t_dim.shape[0]
+    assert freqs.shape == (1, nd["N_lasers"], t_dim.shape[0])
+    assert y.dtype == np.float32
+    assert final_history.shape == (1, 3 * nd["N_lasers"], 2 * nd["delay_steps"])
+    assert np.isfinite(y).all()
+    assert np.isfinite(final_history).all()
 
 
 def test_solve_equilibria_runs():
