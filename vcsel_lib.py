@@ -50,7 +50,7 @@ class VCSEL:
         operating regimes. See scale_params() for exact transforms used.
     """
 
-    _PHASE_MODELS = {"ma_2019", "standard_lk", "chumley_2026"}
+    _PHASE_MODELS = frozenset({"ma_2019", "standard_lk", "chumley_2026"})
 
     def __init__(self, phys_params):
         """
