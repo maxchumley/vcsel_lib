@@ -11,7 +11,7 @@ python -m rl.conditional_coupling_run
 python -m rl.conditional_coupling_run_variable_m
 python -m rl.inspect_saved_coupling_model
 python -m rl.inspect_saved_coupling_model_variable_m
-python -m rl.inspect_power_vs_lasers
+python -m rl.inspect_sparse_coupling_budget_vs_lasers
 ```
 
 Generated files are kept beneath `rl/artifacts/`:

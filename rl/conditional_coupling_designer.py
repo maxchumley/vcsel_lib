@@ -1913,7 +1913,7 @@ def train_reinforce(
     figure_and_axes = make_training_figure(config) if live_plot else None
     progress_figure_directory = None
     if live_plot:
-        progress_figure_directory = RESULTS_DIR
+        progress_figure_directory = RESULTS_DIR / "training" / "progress"
         progress_figure_directory.mkdir(parents=True, exist_ok=True)
     simulation_pool = None
     if config.n_jobs == 1:

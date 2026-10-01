@@ -16,6 +16,26 @@ from IPython.display import clear_output
 import gc
 import os
 from pathlib import Path
+# Make the repositorys ``examples`` package available to scripts and notebooks.
+import sys
+
+_path_search_starts = [Path.cwd().resolve()]
+if "__file__" in globals():
+    _path_search_starts.append(Path(__file__).resolve().parent)
+_repo_root = next(
+    (candidate for start in _path_search_starts for candidate in (start, *start.parents)
+     if (candidate / "examples" / "_paths.py").is_file()),
+    None,
+)
+if _repo_root is None:
+    raise ModuleNotFoundError(
+        "Could not locate the vcsel_lib repository root containing examples/_paths.py."
+    )
+sys.path.insert(0, str(_repo_root))
+for _module_name in tuple(sys.modules):
+    if _module_name == "examples" or _module_name.startswith("examples."):
+        del sys.modules[_module_name]
+
 import queue as queue_module
 import time
 import inspect

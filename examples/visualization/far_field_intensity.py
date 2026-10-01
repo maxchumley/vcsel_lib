@@ -3,6 +3,29 @@
 
 from itertools import combinations
 from pathlib import Path
+# Make the repository's ``examples`` package available to scripts and notebooks.
+import sys
+
+_path_search_starts = [Path.cwd().resolve()]
+if "__file__" in globals():
+    _path_search_starts.append(Path(__file__).resolve().parent)
+_repo_root = next(
+    (candidate for start in _path_search_starts for candidate in (start, *start.parents)
+     if (candidate / "examples" / "_paths.py").is_file()),
+    None,
+)
+if _repo_root is None:
+    raise ModuleNotFoundError(
+        "Could not locate the vcsel_lib repository root containing examples/_paths.py."
+    )
+if str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+
+# Do not evict ``examples`` modules here.  During a normal import, this file is
+# registered as ``examples.visualization.far_field_intensity`` before its body
+# executes.  Removing that in-progress entry causes importlib to fail at the
+# end of the import with ``KeyError: 'examples.visualization.far_field_intensity'``.
+
 
 import matplotlib.pyplot as plt
 import numpy as np

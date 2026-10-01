@@ -208,6 +208,9 @@ __marimo__/
 
 .DS_Store
 
+# Local Codex working files and previews
+/.codex_tmp/
+
 results/
 
 examples/archive/

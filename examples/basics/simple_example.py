@@ -9,6 +9,26 @@ from itertools import combinations
 from IPython.display import clear_output
 from scipy.constants import hbar, c
 from pathlib import Path
+# Make the repositorys ``examples`` package available to scripts and notebooks.
+import sys
+
+_path_search_starts = [Path.cwd().resolve()]
+if "__file__" in globals():
+    _path_search_starts.append(Path(__file__).resolve().parent)
+_repo_root = next(
+    (candidate for start in _path_search_starts for candidate in (start, *start.parents)
+     if (candidate / "examples" / "_paths.py").is_file()),
+    None,
+)
+if _repo_root is None:
+    raise ModuleNotFoundError(
+        "Could not locate the vcsel_lib repository root containing examples/_paths.py."
+    )
+sys.path.insert(0, str(_repo_root))
+for _module_name in tuple(sys.modules):
+    if _module_name == "examples" or _module_name.startswith("examples."):
+        del sys.modules[_module_name]
+
 
 try:
     from examples._paths import BASICS_RESULTS_DIR
@@ -41,7 +61,7 @@ lam = 910e-9
 self_feedback = 0.0
 coupling = 1.0
 
-N_lasers = 100
+N_lasers = 3
 coupling_scheme = 'CUSTOM'
 detuning = 1.0 # detuning (GHz)
 delta = detuning * 2 * np.pi * 1e9
@@ -49,7 +69,7 @@ delta_dist = delta / 2 * np.linspace(-1, 1, N_lasers)
 
 dt = 1 * tau_p
 Tmax = 2.0e-7
-kappa_c_final = 1000e9
+kappa_c_final = 10e9
 noise_amplitude = 0.0
 n_iterations = 1
 aMAT = np.ones((N_lasers, N_lasers)) - np.eye(N_lasers)

@@ -49,6 +49,49 @@ from rl.paths import MODEL_DIR, RESULTS_DIR
 DEFAULT_N_LASERS = 5
 CHECKPOINT_FORMAT = "conditional_coupling_variable_m_pooled_v1"
 BIGRU_CHECKPOINT_FORMAT = "conditional_coupling_variable_m_bigru_v1"
+BIGRU_M_CONDITIONED_CHECKPOINT_FORMAT = (
+    "conditional_coupling_variable_m_bigru_m_conditioned_v2"
+)
+BIGRU_EDGE_STD_CHECKPOINT_FORMAT = (
+    "conditional_coupling_variable_m_bigru_edge_std_v3"
+)
+BIGRU_SPARSE_CHECKPOINT_FORMAT = (
+    "conditional_coupling_variable_m_bigru_sparse_v4"
+)
+BIGRU_MODULATED_CHECKPOINT_FORMAT = (
+    "conditional_coupling_variable_m_bigru_modulated_v5"
+)
+GNN_CHECKPOINT_FORMAT = "conditional_coupling_variable_m_gnn_v1"
+
+
+def smoothly_bound_log_std(
+    raw_log_std: torch.Tensor,
+    minimum_log_std: float,
+    maximum_log_std: float,
+) -> torch.Tensor:
+    """Smoothly constrain log standard deviations to the configured range.
+
+    Unlike ``torch.clamp``, this transformation retains a nonzero gradient
+    when a decoder prediction passes a bound, so exploration can recover.
+    """
+    return (
+        minimum_log_std
+        + torch.nn.functional.softplus(raw_log_std - minimum_log_std)
+        - torch.nn.functional.softplus(raw_log_std - maximum_log_std)
+    )
+
+
+def raw_log_std_for_smooth_bound(
+    bounded_log_std: float,
+    minimum_log_std: float,
+    maximum_log_std: float,
+) -> float:
+    """Invert :func:`smoothly_bound_log_std` for decoder initialization."""
+    if not minimum_log_std < bounded_log_std < maximum_log_std:
+        raise ValueError("bounded_log_std must lie strictly inside the bounds")
+    log_numerator = np.log(np.expm1(bounded_log_std - minimum_log_std))
+    log_denominator = np.log1p(-np.exp(bounded_log_std - maximum_log_std))
+    return float(minimum_log_std + log_numerator - log_denominator)
 
 
 def _load_vcsel_class() -> type:
@@ -137,34 +180,147 @@ class DesignerConfig:
     """
 
     # ``n_lasers`` is the size used by direct evaluation/design calls.
-    # Training selects one size per iteration from ``training_n_lasers``.
+    # Training randomly selects one of these array sizes for each update.
     n_lasers: int = 5
     training_n_lasers: tuple[int, ...] = (3, 4, 5, 6, 7)
+    # Optional sampling weights for the variable-size training loop.  When
+    # omitted, all configured sizes are sampled uniformly.
+    training_n_laser_weights: tuple[float, ...] | None = None
+    # Optionally begin with a prefix of ``training_n_lasers`` and append one
+    # additional size at a fixed iteration interval.
+    enable_array_size_curriculum: bool = False
+    array_size_curriculum_initial_count: int = 1
+    array_size_curriculum_start_iteration: int = 500
+    array_size_curriculum_add_interval: int = 100
 
     # Neural network and REINFORCE training
     training_iterations: int = 700
+    # Number of same-size targets in one optimizer update.
     targets_per_batch: int = 16
     candidates_per_target: int = 128
+    # Training-only worker granularity. Candidate rewards are reassembled
+    # before the REINFORCE loss is evaluated.
+    candidates_per_worker_task: int = 16
     node_hidden_sizes: tuple[int, ...] = (64,)
     node_embedding_dim: int = 64
-    # ``pooled`` is the current default. ``bigru`` is retained as an
-    # optional legacy architecture for reproducing older runs.
+    # Select the pooled, recurrent, or graph message-passing encoder without
+    # changing either of the other implementations.
     encoder_architecture: str = "pooled"
     # Retained so older configuration cells can still be loaded. The pooled
     # policy below no longer uses a recurrent GRU hidden state.
     gru_hidden_size: int = 64
+    gnn_message_passing_steps: int = 3
+    gnn_message_hidden_size: int = 64
     edge_hidden_sizes: tuple[int, ...] = (128, 128)
+    # Give the shared edge decoder the normalized array size and inverse
+    # neighbor count, and let exploration depend on those same two features.
+    condition_on_n_lasers: bool = True
+    condition_log_std_on_n_lasers: bool = True
+    # Give the GNN message and edge networks only bounded degree features:
+    # [1 / (M - 1), 1 / (M - 1)^2].  Unlike normalized M, these features
+    # remain in [0, 1] and approach zero for unseen larger arrays.
+    condition_on_bounded_degree: bool = False
+    # Apply an M-conditioned scale and shift after every hidden edge-decoder
+    # activation. This gives array size direct control over the coordinated
+    # kappa/phase solution while preserving the shared decoder weights.
+    modulate_edge_decoder_by_n_lasers: bool = False
+    # Variable-M analogue of the fixed-M policy's per-action exploration:
+    # predict separate kappa/phi log standard deviations for every edge.
+    edge_conditioned_log_std: bool = False
+    # Replace the edge log-standard-deviation hard clamp with a differentiable
+    # soft bound. This lets an edge recover after its raw decoder output falls
+    # below the configured minimum instead of receiving exactly zero gradient.
+    smooth_edge_log_std_bounds: bool = False
+    # Sparse refinement adds one Bernoulli gate per independently decoded
+    # coupling magnitude. Dense policies leave this disabled.
+    enable_sparse_gates: bool = False
+    initial_gate_logit: float = 5.0
+    gate_probability_threshold: float = 0.5
+    # Exact-budget sparse training keeps the existing gate head but treats
+    # its outputs as link-selection scores.  Every sampled mask contains a
+    # directed spanning tree plus enough additional links to meet the sampled
+    # budget, so disconnected laser arrays are impossible by construction.
+    enable_connected_edge_budgets: bool = False
+    condition_on_edge_budget: bool = False
+    edge_budget_warmup_iterations: int = 200
+    edge_budget_curriculum_iterations: int = 1000
+    # Let the gate head choose both the connected topology and its link count.
+    # A spanning tree is always sampled first; every remaining directed link
+    # is then a Bernoulli policy action.  Successful sparse candidates receive
+    # an additional reward, so REINFORCE learns how many links to retain.
+    enable_learned_connected_sparsity: bool = False
+    sparsity_phase_reward_threshold: float = 0.98
+    # Replace the absolute phase threshold with a per-target reference formed
+    # from the best current training candidate.  Sparsity is eligible only
+    # within ``phase_retention_tolerance`` of that reference.
+    use_relative_phase_retention: bool = False
+    phase_retention_tolerance: float = 0.005
+    # Use ordinal candidate ranks instead of weighted scalar resource bonuses.
+    # Eligible candidates outrank ineligible candidates; eligible candidates
+    # are then ordered by link count, coupling cost, and phase reward.
+    use_lexicographic_rank_advantages: bool = False
+    # Reserve the first training candidate as an all-links-active reference.
+    # Its continuous actions remain on-policy, while its gates are not used
+    # for a Bernoulli gate update because they are intentionally forced on.
+    include_dense_reference_candidate: bool = False
+    successful_sparsity_reward_weight: float = 0.05
+    # Successful candidates are ranked first by active-link fraction and
+    # then, among otherwise equally sparse solutions, by normalized squared
+    # coupling cost.  This fraction is the largest possible coupling-cost
+    # bonus expressed as a fraction of the reward for removing one link.
+    # Keeping it below one makes the ordering strictly lexicographic:
+    # phase success -> fewer links -> lower coupling cost.
+    coupling_cost_tiebreak_fraction: float = 0.0
+    # Learn one global retained-link density per target/candidate.  The
+    # sampled density is converted into a deterministic, weakly connected
+    # relative-coupling backbone before simulation.
+    enable_learned_backbone_density: bool = False
+    # Treat the connected link budget as an input condition instead of a
+    # policy action. The GNN predicts only kappa/phi under that hard budget.
+    enable_conditional_backbone_budget: bool = False
+    # Learn phase-error-versus-budget and direct allowable-error-to-budget
+    # mappings from the simulations already used by REINFORCE.
+    enable_budget_error_selector: bool = False
+    selector_budget_levels_per_target: int = 8
+    selector_labels_per_target: int = 8
+    monotonic_budget_selector: bool = False
+    # Reserve one policy-mean candidate at every sampled budget. These
+    # deterministic candidates supervise the direct selector with maximum
+    # per-laser phase error, matching one-candidate deterministic inference.
+    # All remaining candidates continue to train the coupling policy through
+    # the unchanged phase-only REINFORCE objective.
+    selector_use_deterministic_max_error: bool = False
+    selector_training_minimum_error_deg: float = 1.0
+    selector_training_maximum_error_deg: float = 30.0
+    selector_validation_error_deg: float = 5.0
+    initial_backbone_density: float = 1.0
+    backbone_density_log_std: float = 0.75
     learning_rate: float = 1.0e-3
     learning_rate_switch_iteration: int = 1500
     learning_rate_after_switch: float = 1.0e-4
+    # The default preserves the existing one-array-size-per-update behavior.
+    # The optional balanced mode spreads one fixed-size target budget across
+    # every configured M and combines their gradients in one optimizer step.
+    train_all_sizes_each_iteration: bool = False
+    gradient_combination_mode: str = "mean"
+    per_size_gradient_clip: float = 1.0
     force_symmetric_kappa: bool = False
     force_symmetric_phi_p: bool = False
     # Keep individual links asymmetric while balancing total upper/lower
     # triangular coupling strength after action decoding.
     balanced_coupling: bool = False
+    # Scale every decoded edge by 1/(M-1), bounding the total possible
+    # incoming coupling at each receiver independently of array size.
+    normalize_incoming_coupling_by_degree: bool = False
     initial_log_std: float = -0.25
     minimum_log_std: float = -3.0
     maximum_log_std: float = 0.75
+    # Optionally hold a higher exploration floor while the detuning
+    # curriculum expands, then lower it linearly to ``minimum_log_std``.
+    enable_minimum_log_std_annealing: bool = False
+    initial_minimum_log_std: float = -1.5
+    minimum_log_std_anneal_start_iteration: int = 1000
+    minimum_log_std_anneal_iterations: int = 500
     enable_exploration_annealing: bool = False
     exploration_anneal_start_iteration: int = 200
     exploration_anneal_iterations: int = 250
@@ -205,16 +361,26 @@ class DesignerConfig:
     detuning_curriculum_initial_half_span_ghz: float = 0.05
     detuning_curriculum_warmup_iterations: int = 200
     detuning_curriculum_iterations: int = 1500
+    # ``independent`` preserves the original per-laser uniform sampler.
+    # ``stratified_span`` first assigns each row a peak-to-peak width from a
+    # randomized stratification of the current curriculum interval, then
+    # places the lasers within that width. This makes span coverage
+    # independent of M.
+    detuning_span_sampling_mode: str = "independent"
     time_step_seconds: float = 5.4e-12
     simulation_time_seconds: float = 500.0e-9
     save_every: int = 10
     coupling_ramp_start_delays: float = 2.0
-    coupling_ramp_rise_delays: float = 5.0
+    coupling_ramp_rise_delays: float = 100.0
     reward_tail_fraction: float = 0.35
 
     # Validation, plotting, and saving
     held_out_target_count: int = 64
     validation_interval: int = 10
+    # When enabled, keep the held-out phase targets and normalized detuning
+    # patterns fixed while scaling their physical detunings to the maximum
+    # span currently allowed by the training curriculum.
+    validation_follows_detuning_curriculum: bool = False
     plot_update_interval: int = 1
     best_checkpoint_file: str | None = None
     current_checkpoint_file: str | None = None
@@ -249,22 +415,302 @@ class DesignerConfig:
             raise ValueError("every training_n_lasers value must be at least 2")
         if len(set(self.training_n_lasers)) != len(self.training_n_lasers):
             raise ValueError("training_n_lasers must not contain duplicates")
+        if self.training_n_laser_weights is not None:
+            if len(self.training_n_laser_weights) != len(self.training_n_lasers):
+                raise ValueError(
+                    "training_n_laser_weights must have one value per "
+                    "training_n_lasers entry"
+                )
+            if any(
+                not np.isfinite(weight) or weight <= 0.0
+                for weight in self.training_n_laser_weights
+            ):
+                raise ValueError(
+                    "training_n_laser_weights must contain finite positive "
+                    "values"
+                )
+        if not (
+            1
+            <= self.array_size_curriculum_initial_count
+            <= len(self.training_n_lasers)
+        ):
+            raise ValueError(
+                "array_size_curriculum_initial_count must be between one "
+                "and the number of training sizes"
+            )
+        if self.array_size_curriculum_start_iteration < 0:
+            raise ValueError(
+                "array_size_curriculum_start_iteration must be nonnegative"
+            )
+        if self.array_size_curriculum_add_interval < 1:
+            raise ValueError(
+                "array_size_curriculum_add_interval must be positive"
+            )
         if self.targets_per_batch < 1:
             raise ValueError("targets_per_batch must be positive")
         if self.candidates_per_target < 2:
             raise ValueError("candidates_per_target must be at least 2")
+        if self.candidates_per_worker_task < 1:
+            raise ValueError("candidates_per_worker_task must be positive")
         if self.n_jobs < 1:
             raise ValueError("n_jobs must be at least 1")
         if len(self.node_hidden_sizes) < 1:
             raise ValueError("node_hidden_sizes must contain at least one layer")
         if self.node_embedding_dim < 1:
             raise ValueError("node_embedding_dim must be positive")
-        if self.encoder_architecture not in {"pooled", "bigru"}:
+        if self.encoder_architecture not in {"pooled", "bigru", "gnn"}:
             raise ValueError(
-                "encoder_architecture must be 'pooled' or 'bigru'"
+                "encoder_architecture must be 'pooled', 'bigru', or 'gnn'"
+            )
+        if (
+            self.edge_conditioned_log_std
+            and self.encoder_architecture not in {"bigru", "gnn"}
+        ):
+            raise ValueError(
+                "edge_conditioned_log_std is supported only by the bigru "
+                "and gnn architectures"
+            )
+        if (
+            self.modulate_edge_decoder_by_n_lasers
+            and self.encoder_architecture != "bigru"
+        ):
+            raise ValueError(
+                "modulate_edge_decoder_by_n_lasers is currently supported "
+                "only by the bigru architecture"
+            )
+        if (
+            self.condition_on_bounded_degree
+            and self.encoder_architecture != "gnn"
+        ):
+            raise ValueError(
+                "condition_on_bounded_degree is supported only by the gnn "
+                "architecture"
+            )
+        if self.condition_on_bounded_degree and self.condition_on_n_lasers:
+            raise ValueError(
+                "condition_on_bounded_degree and condition_on_n_lasers "
+                "cannot both be enabled"
+            )
+        if (
+            self.edge_conditioned_log_std
+            and self.condition_log_std_on_n_lasers
+        ):
+            raise ValueError(
+                "edge_conditioned_log_std and "
+                "condition_log_std_on_n_lasers cannot both be enabled"
+            )
+        if (
+            self.smooth_edge_log_std_bounds
+            and not self.edge_conditioned_log_std
+        ):
+            raise ValueError(
+                "smooth_edge_log_std_bounds requires "
+                "edge_conditioned_log_std=True"
+            )
+        if (
+            self.enable_sparse_gates
+            and self.encoder_architecture not in {"bigru", "gnn"}
+        ):
+            raise ValueError(
+                "enable_sparse_gates is supported only by the bigru and "
+                "gnn architectures"
+            )
+        if not np.isfinite(self.initial_gate_logit):
+            raise ValueError("initial_gate_logit must be finite")
+        if not 0.0 < self.gate_probability_threshold < 1.0:
+            raise ValueError(
+                "gate_probability_threshold must lie strictly between 0 and 1"
+            )
+        if self.enable_connected_edge_budgets:
+            if not self.enable_sparse_gates:
+                raise ValueError(
+                    "connected edge budgets require enable_sparse_gates=True"
+                )
+            if self.encoder_architecture != "gnn":
+                raise ValueError(
+                    "connected edge budgets are currently supported only "
+                    "by the GNN architecture"
+                )
+            if self.force_symmetric_kappa:
+                raise ValueError(
+                    "connected edge budgets currently require directed "
+                    "coupling magnitudes"
+                )
+            if self.force_symmetric_phi_p:
+                raise ValueError(
+                    "connected edge budgets currently require directed "
+                    "coupling phases"
+                )
+            if not self.condition_on_edge_budget:
+                raise ValueError(
+                    "connected edge budgets require "
+                    "condition_on_edge_budget=True"
+                )
+        if self.enable_learned_connected_sparsity:
+            if self.enable_connected_edge_budgets:
+                raise ValueError(
+                    "learned connected sparsity and exact edge budgets are "
+                    "mutually exclusive"
+                )
+            if not self.enable_sparse_gates:
+                raise ValueError(
+                    "learned connected sparsity requires "
+                    "enable_sparse_gates=True"
+                )
+            if self.encoder_architecture != "gnn":
+                raise ValueError(
+                    "learned connected sparsity is currently supported only "
+                    "by the GNN architecture"
+                )
+            if self.force_symmetric_kappa or self.force_symmetric_phi_p:
+                raise ValueError(
+                    "learned connected sparsity currently requires directed "
+                    "coupling magnitudes and phases"
+                )
+            if self.condition_on_edge_budget:
+                raise ValueError(
+                    "learned connected sparsity chooses its own link count, "
+                    "so condition_on_edge_budget must be False"
+                )
+        if not 0.0 <= self.sparsity_phase_reward_threshold <= 1.0:
+            raise ValueError(
+                "sparsity_phase_reward_threshold must lie in [0, 1]"
+            )
+        if self.phase_retention_tolerance < 0.0:
+            raise ValueError(
+                "phase_retention_tolerance must be nonnegative"
+            )
+        if (
+            self.use_relative_phase_retention
+            and not self.enable_learned_connected_sparsity
+        ):
+            raise ValueError(
+                "relative phase retention requires "
+                "enable_learned_connected_sparsity=True"
+            )
+        if (
+            self.include_dense_reference_candidate
+            and not self.use_relative_phase_retention
+        ):
+            raise ValueError(
+                "a dense reference candidate requires relative phase "
+                "retention"
+            )
+        if (
+            self.use_lexicographic_rank_advantages
+            and not self.use_relative_phase_retention
+        ):
+            raise ValueError(
+                "lexicographic rank advantages require relative phase "
+                "retention"
+            )
+        if self.successful_sparsity_reward_weight < 0.0:
+            raise ValueError(
+                "successful_sparsity_reward_weight must be nonnegative"
+            )
+        if not 0.0 <= self.coupling_cost_tiebreak_fraction < 1.0:
+            raise ValueError(
+                "coupling_cost_tiebreak_fraction must lie in [0, 1)"
+            )
+        if not 0.0 < self.initial_backbone_density <= 1.0:
+            raise ValueError("initial_backbone_density must lie in (0, 1]")
+        if not np.isfinite(self.backbone_density_log_std):
+            raise ValueError("backbone_density_log_std must be finite")
+        if self.enable_learned_backbone_density:
+            if self.encoder_architecture != "gnn":
+                raise ValueError(
+                    "learned backbone density is currently supported only "
+                    "by the GNN architecture"
+                )
+            if self.enable_sparse_gates or self.enable_connected_edge_budgets:
+                raise ValueError(
+                    "learned backbone density cannot be combined with edge "
+                    "gates or exact edge budgets"
+                )
+        if self.enable_conditional_backbone_budget:
+            if self.encoder_architecture != "gnn":
+                raise ValueError(
+                    "conditional backbone budgets require the GNN architecture"
+                )
+            if not self.condition_on_edge_budget:
+                raise ValueError(
+                    "conditional backbone budgets require "
+                    "condition_on_edge_budget=True"
+                )
+            if (
+                self.enable_sparse_gates
+                or self.enable_connected_edge_budgets
+                or self.enable_learned_backbone_density
+            ):
+                raise ValueError(
+                    "conditional backbone budgets cannot be combined with "
+                    "edge gates or learned rho"
+                )
+        if self.enable_budget_error_selector:
+            if not self.enable_conditional_backbone_budget:
+                raise ValueError(
+                    "the budget error selector requires conditional budgets"
+                )
+            if not (
+                0.0 < self.selector_training_minimum_error_deg
+                < self.selector_training_maximum_error_deg
+                <= 180.0
+            ):
+                raise ValueError(
+                    "selector training errors must satisfy "
+                    "0 < minimum < maximum <= 180 degrees"
+                )
+            if not 0.0 < self.selector_validation_error_deg <= 180.0:
+                raise ValueError(
+                    "selector_validation_error_deg must lie in (0, 180]"
+                )
+            if self.selector_budget_levels_per_target < 2:
+                raise ValueError(
+                    "selector_budget_levels_per_target must be at least 2"
+                )
+            if self.selector_labels_per_target < 1:
+                raise ValueError(
+                    "selector_labels_per_target must be positive"
+                )
+        if self.monotonic_budget_selector and not self.enable_budget_error_selector:
+            raise ValueError(
+                "monotonic_budget_selector requires the budget error selector"
+            )
+        if (
+            self.selector_use_deterministic_max_error
+            and not self.enable_budget_error_selector
+        ):
+            raise ValueError(
+                "deterministic maximum-error selector labels require the "
+                "budget error selector"
+            )
+        if (
+            self.coupling_cost_tiebreak_fraction > 0.0
+            and not self.enable_learned_connected_sparsity
+        ):
+            raise ValueError(
+                "coupling-cost tie-breaking requires "
+                "enable_learned_connected_sparsity=True"
+            )
+        if self.condition_on_edge_budget and self.encoder_architecture != "gnn":
+            raise ValueError(
+                "edge-budget conditioning is currently supported only by "
+                "the GNN architecture"
+            )
+        if self.edge_budget_warmup_iterations < 0:
+            raise ValueError(
+                "edge_budget_warmup_iterations must be nonnegative"
+            )
+        if self.edge_budget_curriculum_iterations < 0:
+            raise ValueError(
+                "edge_budget_curriculum_iterations must be nonnegative"
             )
         if self.gru_hidden_size < 1:
             raise ValueError("gru_hidden_size must be positive")
+        if self.gnn_message_passing_steps < 1:
+            raise ValueError("gnn_message_passing_steps must be positive")
+        if self.gnn_message_hidden_size < 1:
+            raise ValueError("gnn_message_hidden_size must be positive")
         if len(self.edge_hidden_sizes) < 1:
             raise ValueError("edge_hidden_sizes must contain at least one layer")
         if self.learning_rate <= 0.0:
@@ -275,6 +721,23 @@ class DesignerConfig:
             )
         if self.learning_rate_after_switch <= 0.0:
             raise ValueError("learning_rate_after_switch must be positive")
+        if self.gradient_combination_mode not in {"mean", "pcgrad"}:
+            raise ValueError(
+                "gradient_combination_mode must be 'mean' or 'pcgrad'"
+            )
+        if self.per_size_gradient_clip <= 0.0:
+            raise ValueError("per_size_gradient_clip must be positive")
+        if self.train_all_sizes_each_iteration:
+            if self.targets_per_batch < len(self.training_n_lasers):
+                raise ValueError(
+                    "all-size updates require at least one target per "
+                    "training_n_lasers entry"
+                )
+            if self.enable_array_size_curriculum:
+                raise ValueError(
+                    "all-size updates and the array-size curriculum cannot "
+                    "be enabled together"
+                )
         if not (
             self.minimum_log_std
             <= self.initial_log_std
@@ -282,6 +745,29 @@ class DesignerConfig:
         ):
             raise ValueError(
                 "initial_log_std must be within the log-std bounds"
+            )
+        if self.enable_minimum_log_std_annealing:
+            if not (
+                self.minimum_log_std
+                <= self.initial_minimum_log_std
+                <= self.maximum_log_std
+            ):
+                raise ValueError(
+                    "initial_minimum_log_std must be within the log-std "
+                    "bounds"
+                )
+            if self.initial_log_std < self.initial_minimum_log_std:
+                raise ValueError(
+                    "initial_log_std must not be below "
+                    "initial_minimum_log_std"
+                )
+        if self.minimum_log_std_anneal_start_iteration < 0:
+            raise ValueError(
+                "minimum_log_std_anneal_start_iteration must be nonnegative"
+            )
+        if self.minimum_log_std_anneal_iterations < 0:
+            raise ValueError(
+                "minimum_log_std_anneal_iterations must be nonnegative"
             )
         if not (
             self.minimum_log_std
@@ -313,6 +799,14 @@ class DesignerConfig:
             raise ValueError("simulation_time_seconds must be positive")
         if self.detuning_span_ghz <= 0.0:
             raise ValueError("detuning_span_ghz must be positive")
+        if self.detuning_span_sampling_mode not in {
+            "independent",
+            "stratified_span",
+        }:
+            raise ValueError(
+                "detuning_span_sampling_mode must be 'independent' or "
+                "'stratified_span'"
+            )
         if not (
             0.0
             <= self.detuning_curriculum_initial_half_span_ghz
@@ -436,26 +930,15 @@ def sample_target_phases(
     return make_relative_to_laser_1(targets)
 
 
-def sample_detuning_distributions(
-    count: int,
-    rng: np.random.Generator,
+def detuning_curriculum_half_span_at(
+    iteration: int | None,
     config: DesignerConfig,
-    iteration: int | None = None,
-) -> np.ndarray:
-    """Sample one ordered detuning vector per target, in GHz.
-
-    The returned values are detunings relative to the mean optical
-    frequency, whose reference is 0 GHz. Training holds a narrow random span
-    for the configured warm-up, then grows that span to the full configured
-    range. Rows are centered and sorted so matrix indices always run from the
-    lowest to the highest detuning.
-    """
-    if count < 1:
-        raise ValueError("count must be positive")
-    half_span = 0.5 * config.detuning_span_ghz
+) -> float:
+    """Return the maximum absolute detuning allowed by the curriculum."""
+    final_half_span = 0.5 * config.detuning_span_ghz
     if iteration is None or config.detuning_curriculum_iterations == 0:
-        span_fraction = 1.0
-    elif iteration < config.detuning_curriculum_warmup_iterations:
+        return final_half_span
+    if iteration < config.detuning_curriculum_warmup_iterations:
         span_fraction = 0.0
     else:
         ramp_iterations = max(
@@ -469,13 +952,62 @@ def sample_detuning_distributions(
             0.0,
             1.0,
         )
-    initial_half_span = (
+    return float(
         config.detuning_curriculum_initial_half_span_ghz
+        + span_fraction
+        * (
+            final_half_span
+            - config.detuning_curriculum_initial_half_span_ghz
+        )
     )
-    current_half_span = (
-        initial_half_span
-        + span_fraction * (half_span - initial_half_span)
-    )
+
+
+def sample_detuning_distributions(
+    count: int,
+    rng: np.random.Generator,
+    config: DesignerConfig,
+    iteration: int | None = None,
+) -> np.ndarray:
+    """Sample one ordered detuning vector per target, in GHz.
+
+    The returned values are detunings relative to the mean optical frequency,
+    whose reference is 0 GHz. Training holds a narrow random span for the
+    configured warm-up, then grows that span to the full configured range.
+    With ``stratified_span`` sampling, each row is assigned one randomized
+    stratum of peak-to-peak width so every batch covers the current curriculum
+    interval consistently for every M. Rows are centered and sorted so matrix
+    indices always run from the lowest to the highest detuning.
+    """
+    if count < 1:
+        raise ValueError("count must be positive")
+    half_span = 0.5 * config.detuning_span_ghz
+    current_half_span = detuning_curriculum_half_span_at(iteration, config)
+
+    if config.detuning_span_sampling_mode == "stratified_span":
+        # Draw exactly one randomized width from each equal-width stratum,
+        # then shuffle their association with target phase patterns. For a
+        # one-row design/evaluation call this reduces to an ordinary uniform
+        # draw over the current peak-to-peak interval.
+        current_total_span = 2.0 * current_half_span
+        desired_spans = current_total_span * (
+            np.arange(count, dtype=float) + rng.random(count)
+        ) / float(count)
+        rng.shuffle(desired_spans)
+
+        # Random order statistics give an irregular array while explicitly
+        # retaining both ends of the requested interval. After subtracting
+        # the row mean, the optical reference is zero and the peak-to-peak
+        # width remains exactly desired_spans.
+        unit_positions = rng.uniform(
+            0.0, 1.0, size=(count, config.n_lasers)
+        )
+        unit_positions[:, 0] = 0.0
+        unit_positions[:, -1] = 1.0
+        unit_positions.sort(axis=1)
+        detunings = unit_positions * desired_spans[:, None]
+        detunings -= detunings.mean(axis=1, keepdims=True)
+        return detunings.astype(np.float64)
+
     random_detunings = rng.uniform(
         -half_span, half_span, size=(count, config.n_lasers)
     )
@@ -800,6 +1332,21 @@ class BiGRUPolicyNetwork(nn.Module):
         self.force_symmetric_phi_p = config.force_symmetric_phi_p
         self.node_embedding_dim = config.node_embedding_dim
         self.gru_hidden_size = config.gru_hidden_size
+        self.minimum_training_n_lasers = min(config.training_n_lasers)
+        self.maximum_training_n_lasers = max(config.training_n_lasers)
+        self.condition_on_n_lasers = config.condition_on_n_lasers
+        self.condition_log_std_on_n_lasers = (
+            config.condition_log_std_on_n_lasers
+        )
+        self.modulate_edge_decoder_by_n_lasers = (
+            config.modulate_edge_decoder_by_n_lasers
+        )
+        self.edge_conditioned_log_std = config.edge_conditioned_log_std
+        self.smooth_edge_log_std_bounds = (
+            config.smooth_edge_log_std_bounds
+        )
+        self.enable_sparse_gates = config.enable_sparse_gates
+        self.gate_probability_threshold = config.gate_probability_threshold
 
         node_layers: list[nn.Module] = []
         input_width = 3
@@ -822,17 +1369,21 @@ class BiGRUPolicyNetwork(nn.Module):
             bidirectional=True,
         )
 
-        # The archived decoder used the source and receiver BiGRU states
-        # (2*hidden each) plus the four local phase/detuning features.
+        # Each edge uses source/receiver BiGRU states, four local physical
+        # features, and (for new models) two explicit array-size features.
         edge_input_width = 4 * self.gru_hidden_size + 4
+        if self.condition_on_n_lasers:
+            edge_input_width += 2
         edge_layers: list[nn.Module] = []
+        self.edge_hidden_sizes = tuple(config.edge_hidden_sizes)
         for output_width in config.edge_hidden_sizes:
             linear = nn.Linear(edge_input_width, output_width)
             nn.init.orthogonal_(linear.weight, gain=np.sqrt(2.0))
             nn.init.zeros_(linear.bias)
             edge_layers.extend((linear, nn.SiLU()))
             edge_input_width = output_width
-        edge_output = nn.Linear(edge_input_width, 2)
+        edge_output_width = 4 if self.edge_conditioned_log_std else 2
+        edge_output = nn.Linear(edge_input_width, edge_output_width)
         nn.init.orthogonal_(edge_output.weight, gain=0.01)
         nn.init.zeros_(edge_output.bias)
         initial_fraction = config.initial_kappa_fraction
@@ -840,23 +1391,85 @@ class BiGRUPolicyNetwork(nn.Module):
             initial_fraction / (1.0 - initial_fraction)
         )
         with torch.no_grad():
-            edge_output.bias.copy_(
+            edge_output.bias[:2].copy_(
                 torch.tensor(
                     [initial_kappa_logit, 0.0],
                     dtype=edge_output.bias.dtype,
                 )
             )
+            if self.edge_conditioned_log_std:
+                # Begin with exactly the same shared exploration used before;
+                # the two extra rows then learn edge-specific deviations.
+                edge_output.weight[2:].zero_()
+                initial_raw_log_std = float(config.initial_log_std)
+                if self.smooth_edge_log_std_bounds:
+                    initial_raw_log_std = raw_log_std_for_smooth_bound(
+                        config.initial_log_std,
+                        config.minimum_log_std,
+                        config.maximum_log_std,
+                    )
+                edge_output.bias[2:].fill_(initial_raw_log_std)
         edge_layers.append(edge_output)
         self.edge_decoder = nn.Sequential(*edge_layers)
-
+        if self.modulate_edge_decoder_by_n_lasers:
+            # One small conditioning layer produces a scale correction and a
+            # shift for every hidden decoder channel. Zero initialization
+            # makes scale=1 and shift=0, exactly recovering the unmodulated
+            # decoder at initialization.
+            modulation_width = 2 * sum(self.edge_hidden_sizes)
+            self.edge_size_modulation = nn.Linear(2, modulation_width)
+            nn.init.zeros_(self.edge_size_modulation.weight)
+            nn.init.zeros_(self.edge_size_modulation.bias)
+        if self.enable_sparse_gates:
+            # A separate head preserves every dense decoder parameter exactly
+            # when upgrading an existing checkpoint. Its zero weights and
+            # positive bias initially leave almost every connection active.
+            self.edge_gate_head = nn.Linear(edge_input_width, 1)
+            nn.init.zeros_(self.edge_gate_head.weight)
+            nn.init.constant_(
+                self.edge_gate_head.bias, float(config.initial_gate_logit)
+            )
         self.log_std_kappa = nn.Parameter(
             torch.tensor(float(config.initial_log_std))
         )
         self.log_std_phi = nn.Parameter(
             torch.tensor(float(config.initial_log_std))
         )
+        if self.condition_log_std_on_n_lasers:
+            # The two outputs are learned corrections to log(sigma_kappa)
+            # and log(sigma_phi). Zero initialization exactly reproduces the
+            # original shared exploration scale at the start of training.
+            self.size_log_std_head = nn.Linear(2, 2)
+            nn.init.zeros_(self.size_log_std_head.weight)
+            nn.init.zeros_(self.size_log_std_head.bias)
         self.minimum_log_std = config.minimum_log_std
         self.maximum_log_std = config.maximum_log_std
+
+    def array_size_features(
+        self,
+        n_lasers: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return normalized M and inverse neighbor count for one array."""
+        size_range = (
+            self.maximum_training_n_lasers
+            - self.minimum_training_n_lasers
+        )
+        normalized_size = (
+            0.0
+            if size_range == 0
+            else 2.0
+            * (n_lasers - self.minimum_training_n_lasers)
+            / size_range
+            - 1.0
+        )
+        return torch.tensor(
+            [normalized_size, 1.0 / (n_lasers - 1)],
+            device=device,
+            dtype=dtype,
+        )
 
     def link_counts(self, n_lasers: int) -> tuple[int, int, int]:
         directed = n_lasers * (n_lasers - 1)
@@ -868,7 +1481,9 @@ class BiGRUPolicyNetwork(nn.Module):
         _, magnitude, phase = self.link_counts(n_lasers)
         return magnitude + phase
 
-    def action_mean(self, node_features: torch.Tensor) -> torch.Tensor:
+    def _action_parameters(
+        self, node_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         if node_features.ndim != 3 or node_features.shape[2] != 3:
             raise ValueError("node_features must have shape (batch, M, 3)")
         batch_size, n_lasers, _ = node_features.shape
@@ -914,12 +1529,51 @@ class BiGRUPolicyNetwork(nn.Module):
             ),
             dim=2,
         )
+        size_feature_vector = None
+        if (
+            self.condition_on_n_lasers
+            or self.modulate_edge_decoder_by_n_lasers
+        ):
+            size_feature_vector = self.array_size_features(
+                n_lasers,
+                device=node_features.device,
+                dtype=node_features.dtype,
+            )
+        if self.condition_on_n_lasers:
+            size_features = size_feature_vector.view(1, 1, 2).expand(
+                batch_size, n_directed_links, 2
+            )
+            edge_features = torch.cat((edge_features, size_features), dim=2)
         edge_inputs = torch.cat(
             (source_embeddings, receiver_embeddings, edge_features), dim=2
         )
-        edge_outputs = self.edge_decoder(
-            edge_inputs.reshape(batch_size * n_directed_links, -1)
-        ).reshape(batch_size, n_directed_links, 2)
+        flat_edge_inputs = edge_inputs.reshape(
+            batch_size * n_directed_links, -1
+        )
+        if self.modulate_edge_decoder_by_n_lasers:
+            modulation = self.edge_size_modulation(size_feature_vector)
+            modulation_width = sum(self.edge_hidden_sizes)
+            scale_corrections = modulation[:modulation_width]
+            shifts = modulation[modulation_width:]
+            edge_latent = flat_edge_inputs
+            channel_start = 0
+            for hidden_index, hidden_width in enumerate(
+                self.edge_hidden_sizes
+            ):
+                linear = self.edge_decoder[2 * hidden_index]
+                activation = self.edge_decoder[2 * hidden_index + 1]
+                edge_latent = activation(linear(edge_latent))
+                channel_stop = channel_start + hidden_width
+                edge_latent = (
+                    1.0
+                    + scale_corrections[channel_start:channel_stop]
+                ) * edge_latent + shifts[channel_start:channel_stop]
+                channel_start = channel_stop
+        else:
+            edge_latent = self.edge_decoder[:-1](flat_edge_inputs)
+        edge_outputs = self.edge_decoder[-1](edge_latent).reshape(
+            batch_size, n_directed_links, -1
+        )
         directed_magnitude_means = 6.0 * torch.tanh(
             edge_outputs[:, :, 0] / 6.0
         )
@@ -939,7 +1593,56 @@ class BiGRUPolicyNetwork(nn.Module):
             if self.force_symmetric_phi_p
             else directed_phase_means
         )
-        return torch.cat((magnitude_means, phase_means), dim=1)
+        means = torch.cat((magnitude_means, phase_means), dim=1)
+        gate_logits = None
+        if self.enable_sparse_gates:
+            directed_gate_logits = self.edge_gate_head(edge_latent).reshape(
+                batch_size, n_directed_links
+            )
+            gate_logits = (
+                directed_gate_logits.index_select(1, upper_triangle)
+                if self.force_symmetric_kappa
+                else directed_gate_logits
+            )
+        if not self.edge_conditioned_log_std:
+            return means, None, gate_logits
+
+        directed_kappa_log_std = edge_outputs[:, :, 2]
+        directed_phi_log_std = edge_outputs[:, :, 3]
+        kappa_log_std = (
+            directed_kappa_log_std.index_select(1, upper_triangle)
+            if self.force_symmetric_kappa
+            else directed_kappa_log_std
+        )
+        phi_log_std = (
+            directed_phi_log_std.index_select(1, upper_triangle)
+            if self.force_symmetric_phi_p
+            else directed_phi_log_std
+        )
+        return (
+            means,
+            torch.cat((kappa_log_std, phi_log_std), dim=1),
+            gate_logits,
+        )
+
+    def action_mean(self, node_features: torch.Tensor) -> torch.Tensor:
+        return self._action_parameters(node_features)[0]
+
+    def gate_distribution(
+        self, node_features: torch.Tensor
+    ) -> torch.distributions.Bernoulli:
+        """Return one learned on/off distribution per magnitude link."""
+        gate_logits = self._action_parameters(node_features)[2]
+        if gate_logits is None:
+            raise RuntimeError("this policy does not have sparse gates enabled")
+        return torch.distributions.Bernoulli(logits=gate_logits)
+
+    def deterministic_gates(self, node_features: torch.Tensor) -> torch.Tensor:
+        """Threshold gate probabilities for deterministic evaluation."""
+        probabilities = self.gate_distribution(node_features).probs
+        return (probabilities >= self.gate_probability_threshold).to(
+            probabilities.dtype
+        )
 
     def forward(self, node_features: torch.Tensor) -> torch.Tensor:
         return self.action_mean(node_features)
@@ -947,30 +1650,644 @@ class BiGRUPolicyNetwork(nn.Module):
     def distribution(
         self, node_features: torch.Tensor
     ) -> torch.distributions.Normal:
-        mean = self(node_features)
+        mean, edge_log_std, _ = self._action_parameters(node_features)
+        if edge_log_std is not None:
+            if self.smooth_edge_log_std_bounds:
+                log_std = smoothly_bound_log_std(
+                    edge_log_std,
+                    self.minimum_log_std,
+                    self.maximum_log_std,
+                )
+            else:
+                log_std = torch.clamp(
+                    edge_log_std,
+                    self.minimum_log_std,
+                    self.maximum_log_std,
+                )
+            return torch.distributions.Normal(mean, torch.exp(log_std))
+
         n_lasers = node_features.shape[1]
         _, n_magnitude_links, n_phase_links = self.link_counts(n_lasers)
+        size_log_std_adjustment = torch.zeros(
+            2, device=mean.device, dtype=mean.dtype
+        )
+        if self.condition_log_std_on_n_lasers:
+            size_features = self.array_size_features(
+                n_lasers,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
+            size_log_std_adjustment = self.size_log_std_head(size_features)
+        kappa_log_std = torch.clamp(
+            self.log_std_kappa + size_log_std_adjustment[0],
+            self.minimum_log_std,
+            self.maximum_log_std,
+        )
+        phi_log_std = torch.clamp(
+            self.log_std_phi + size_log_std_adjustment[1],
+            self.minimum_log_std,
+            self.maximum_log_std,
+        )
         log_std = torch.cat(
             (
-                torch.clamp(
-                    self.log_std_kappa,
-                    self.minimum_log_std,
-                    self.maximum_log_std,
-                ).expand(n_magnitude_links),
-                torch.clamp(
-                    self.log_std_phi,
-                    self.minimum_log_std,
-                    self.maximum_log_std,
-                ).expand(n_phase_links),
+                kappa_log_std.expand(n_magnitude_links),
+                phi_log_std.expand(n_phase_links),
             )
         )
         return torch.distributions.Normal(mean, torch.exp(log_std))
+
+class GraphMessagePassingLayer(nn.Module):
+    """One degree-normalized residual update on a complete directed graph."""
+
+    def __init__(
+        self,
+        node_width: int,
+        hidden_width: int,
+        edge_feature_width: int = 4,
+    ):
+        super().__init__()
+        # A message depends on both endpoints and the four physical pair
+        # features. The same MLP is applied to every directed edge.
+        self.message_mlp = nn.Sequential(
+            nn.Linear(2 * node_width + edge_feature_width, hidden_width),
+            nn.SiLU(),
+            nn.Linear(hidden_width, node_width),
+        )
+        self.update_mlp = nn.Sequential(
+            nn.Linear(2 * node_width, hidden_width),
+            nn.SiLU(),
+            nn.Linear(hidden_width, node_width),
+        )
+        self.normalization = nn.LayerNorm(node_width)
+        for module in (self.message_mlp, self.update_mlp):
+            for layer in module:
+                if isinstance(layer, nn.Linear):
+                    nn.init.orthogonal_(layer.weight, gain=np.sqrt(2.0))
+                    nn.init.zeros_(layer.bias)
+
+    def forward(
+        self,
+        node_states: torch.Tensor,
+        edge_features: torch.Tensor,
+        link_receivers: torch.Tensor,
+        link_sources: torch.Tensor,
+    ) -> torch.Tensor:
+        """Update ``(batch, M, width)`` node states equivariantly."""
+        batch_size, n_lasers, node_width = node_states.shape
+        source_states = node_states.index_select(1, link_sources)
+        receiver_states = node_states.index_select(1, link_receivers)
+        messages = self.message_mlp(
+            torch.cat(
+                (source_states, receiver_states, edge_features), dim=2
+            )
+        )
+        receiver_indices = link_receivers.view(1, -1, 1).expand(
+            batch_size, -1, node_width
+        )
+        aggregated_messages = torch.zeros_like(node_states)
+        aggregated_messages.scatter_add_(
+            1, receiver_indices, messages
+        )
+        # Every receiver has M-1 incoming neighbors. Taking their mean keeps
+        # the message scale comparable for both trained and unseen M.
+        aggregated_messages = aggregated_messages / float(n_lasers - 1)
+        update = self.update_mlp(
+            torch.cat((node_states, aggregated_messages), dim=2)
+        )
+        return self.normalization(node_states + update)
+
+
+class GNNPolicyNetwork(nn.Module):
+    """Permutation-equivariant, variable-size message-passing policy."""
+
+    def __init__(self, config: DesignerConfig):
+        super().__init__()
+        if config.modulate_edge_decoder_by_n_lasers:
+            raise ValueError(
+                "the GNN comparison requires M modulation to be disabled"
+            )
+        self.force_symmetric_kappa = config.force_symmetric_kappa
+        self.force_symmetric_phi_p = config.force_symmetric_phi_p
+        self.node_embedding_dim = config.node_embedding_dim
+        self.minimum_training_n_lasers = min(config.training_n_lasers)
+        self.maximum_training_n_lasers = max(config.training_n_lasers)
+        self.condition_on_n_lasers = config.condition_on_n_lasers
+        self.condition_on_bounded_degree = (
+            config.condition_on_bounded_degree
+        )
+        self.condition_log_std_on_n_lasers = (
+            config.condition_log_std_on_n_lasers
+        )
+        self.modulate_edge_decoder_by_n_lasers = False
+        self.edge_conditioned_log_std = config.edge_conditioned_log_std
+        self.smooth_edge_log_std_bounds = (
+            config.smooth_edge_log_std_bounds
+        )
+        self.enable_sparse_gates = config.enable_sparse_gates
+        self.enable_learned_backbone_density = (
+            config.enable_learned_backbone_density
+        )
+        self.enable_budget_error_selector = config.enable_budget_error_selector
+        self.monotonic_budget_selector = config.monotonic_budget_selector
+        self.condition_on_edge_budget = config.condition_on_edge_budget
+        self.gate_probability_threshold = config.gate_probability_threshold
+
+        node_layers: list[nn.Module] = []
+        input_width = 4 if self.condition_on_edge_budget else 3
+        for output_width in config.node_hidden_sizes:
+            linear = nn.Linear(input_width, output_width)
+            nn.init.orthogonal_(linear.weight, gain=np.sqrt(2.0))
+            nn.init.zeros_(linear.bias)
+            node_layers.extend((linear, nn.SiLU()))
+            input_width = output_width
+        node_output = nn.Linear(input_width, self.node_embedding_dim)
+        nn.init.orthogonal_(node_output.weight, gain=np.sqrt(2.0))
+        nn.init.zeros_(node_output.bias)
+        node_layers.extend((node_output, nn.SiLU()))
+        self.node_encoder = nn.Sequential(*node_layers)
+
+        message_edge_feature_width = (
+            6 if self.condition_on_bounded_degree else 4
+        )
+        self.message_layers = nn.ModuleList(
+            GraphMessagePassingLayer(
+                self.node_embedding_dim,
+                config.gnn_message_hidden_size,
+                edge_feature_width=message_edge_feature_width,
+            )
+            for _ in range(config.gnn_message_passing_steps)
+        )
+
+        edge_input_width = 2 * self.node_embedding_dim + 4
+        if self.condition_on_bounded_degree:
+            edge_input_width += 2
+        if self.condition_on_n_lasers:
+            edge_input_width += 2
+        edge_layers: list[nn.Module] = []
+        for output_width in config.edge_hidden_sizes:
+            linear = nn.Linear(edge_input_width, output_width)
+            nn.init.orthogonal_(linear.weight, gain=np.sqrt(2.0))
+            nn.init.zeros_(linear.bias)
+            edge_layers.extend((linear, nn.SiLU()))
+            edge_input_width = output_width
+        edge_output_width = 4 if self.edge_conditioned_log_std else 2
+        edge_output = nn.Linear(edge_input_width, edge_output_width)
+        nn.init.orthogonal_(edge_output.weight, gain=0.01)
+        nn.init.zeros_(edge_output.bias)
+        initial_fraction = config.initial_kappa_fraction
+        initial_kappa_logit = np.log(
+            initial_fraction / (1.0 - initial_fraction)
+        )
+        with torch.no_grad():
+            edge_output.bias[:2].copy_(
+                torch.tensor(
+                    [initial_kappa_logit, 0.0],
+                    dtype=edge_output.bias.dtype,
+                )
+            )
+            if self.edge_conditioned_log_std:
+                edge_output.weight[2:].zero_()
+                initial_raw_log_std = float(config.initial_log_std)
+                if self.smooth_edge_log_std_bounds:
+                    initial_raw_log_std = raw_log_std_for_smooth_bound(
+                        config.initial_log_std,
+                        config.minimum_log_std,
+                        config.maximum_log_std,
+                    )
+                edge_output.bias[2:].fill_(initial_raw_log_std)
+        edge_layers.append(edge_output)
+        self.edge_decoder = nn.Sequential(*edge_layers)
+        if self.enable_sparse_gates:
+            # This head reads the existing edge latent state, so adding it to
+            # a dense checkpoint leaves every GNN encoder/decoder parameter
+            # unchanged.  A positive bias initially keeps all links open.
+            self.edge_gate_head = nn.Linear(edge_input_width, 1)
+            nn.init.zeros_(self.edge_gate_head.weight)
+            nn.init.constant_(
+                self.edge_gate_head.bias, float(config.initial_gate_logit)
+            )
+        if self.enable_learned_backbone_density:
+            self.backbone_density_head = nn.Sequential(
+                nn.Linear(5, config.node_embedding_dim), nn.SiLU(),
+                nn.Linear(config.node_embedding_dim, 1),
+            )
+            nn.init.orthogonal_(self.backbone_density_head[0].weight, gain=np.sqrt(2.0))
+            nn.init.zeros_(self.backbone_density_head[0].bias)
+            nn.init.zeros_(self.backbone_density_head[2].weight)
+            initial_rho = min(config.initial_backbone_density, 1.0 - 1.0e-4)
+            nn.init.constant_(
+                self.backbone_density_head[2].bias,
+                float(np.log(initial_rho / (1.0 - initial_rho))),
+            )
+            self.backbone_density_log_std = nn.Parameter(
+                torch.tensor(float(config.backbone_density_log_std))
+            )
+        if self.enable_budget_error_selector:
+            context_width = 2 * config.node_embedding_dim + 2
+            self.budget_error_context_encoder = nn.Sequential(
+                nn.Linear(3, config.node_embedding_dim),
+                nn.SiLU(),
+                nn.Linear(config.node_embedding_dim, config.node_embedding_dim),
+                nn.SiLU(),
+            )
+            self.budget_error_head = nn.Sequential(
+                nn.Linear(context_width + 1, config.node_embedding_dim),
+                nn.SiLU(),
+                nn.Linear(config.node_embedding_dim, 1),
+            )
+            selector_input_width = (
+                context_width
+                if self.monotonic_budget_selector
+                else context_width + 1
+            )
+            selector_output_width = (
+                4 if self.monotonic_budget_selector else 1
+            )
+            self.budget_selector_head = nn.Sequential(
+                nn.Linear(selector_input_width, config.node_embedding_dim),
+                nn.SiLU(),
+                nn.Linear(config.node_embedding_dim, selector_output_width),
+            )
+            for module in (
+                self.budget_error_context_encoder,
+                self.budget_error_head,
+                self.budget_selector_head,
+            ):
+                for layer in module:
+                    if isinstance(layer, nn.Linear):
+                        nn.init.orthogonal_(layer.weight, gain=np.sqrt(2.0))
+                        nn.init.zeros_(layer.bias)
+            nn.init.zeros_(self.budget_selector_head[-1].weight)
+            if self.monotonic_budget_selector:
+                # An unbiased q=0.5 starting point avoids carrying the old
+                # near-dense selector collapse into a fresh run. The three
+                # negative raw coefficients become positive through softplus
+                # and guarantee dq/d(epsilon) <= 0.
+                with torch.no_grad():
+                    self.budget_selector_head[-1].bias[0].zero_()
+                    self.budget_selector_head[-1].bias[1:].fill_(-2.0)
+            else:
+                # Preserve compatibility with the first selector experiment.
+                nn.init.constant_(
+                    self.budget_selector_head[-1].bias,
+                    float(np.log(0.95 / 0.05)),
+                )
+
+        self.log_std_kappa = nn.Parameter(
+            torch.tensor(float(config.initial_log_std))
+        )
+        self.log_std_phi = nn.Parameter(
+            torch.tensor(float(config.initial_log_std))
+        )
+        if self.condition_log_std_on_n_lasers:
+            self.size_log_std_head = nn.Linear(2, 2)
+            nn.init.zeros_(self.size_log_std_head.weight)
+            nn.init.zeros_(self.size_log_std_head.bias)
+        self.minimum_log_std = config.minimum_log_std
+        self.maximum_log_std = config.maximum_log_std
+
+    def array_size_features(
+        self,
+        n_lasers: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        size_range = (
+            self.maximum_training_n_lasers
+            - self.minimum_training_n_lasers
+        )
+        normalized_size = (
+            0.0
+            if size_range == 0
+            else 2.0
+            * (n_lasers - self.minimum_training_n_lasers)
+            / size_range
+            - 1.0
+        )
+        return torch.tensor(
+            [normalized_size, 1.0 / (n_lasers - 1)],
+            device=device,
+            dtype=dtype,
+        )
+
+    @staticmethod
+    def bounded_degree_features(
+        n_lasers: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return smooth degree features that remain bounded for every M."""
+        inverse_degree = 1.0 / float(n_lasers - 1)
+        return torch.tensor(
+            [inverse_degree, inverse_degree**2],
+            device=device,
+            dtype=dtype,
+        )
+
+    def link_counts(self, n_lasers: int) -> tuple[int, int, int]:
+        directed = n_lasers * (n_lasers - 1)
+        magnitude = directed // 2 if self.force_symmetric_kappa else directed
+        phase = directed // 2 if self.force_symmetric_phi_p else directed
+        return directed, magnitude, phase
+
+    def action_size_for(self, n_lasers: int) -> int:
+        _, magnitude, phase = self.link_counts(n_lasers)
+        return magnitude + phase
+
+    def _action_parameters(
+        self, node_features: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        expected_feature_count = 4 if self.condition_on_edge_budget else 3
+        if (
+            node_features.ndim != 3
+            or node_features.shape[2] != expected_feature_count
+        ):
+            raise ValueError(
+                "node_features must have shape "
+                f"(batch, M, {expected_feature_count})"
+            )
+        batch_size, n_lasers, _ = node_features.shape
+        if n_lasers < 2:
+            raise ValueError("node_features must contain at least two lasers")
+
+        receiver_numpy, source_numpy = directed_link_indices(n_lasers)
+        link_receivers = torch.as_tensor(
+            receiver_numpy, dtype=torch.long, device=node_features.device
+        )
+        link_sources = torch.as_tensor(
+            source_numpy, dtype=torch.long, device=node_features.device
+        )
+        n_directed_links, _, _ = self.link_counts(n_lasers)
+
+        cosine = node_features[:, :, 0]
+        sine = node_features[:, :, 1]
+        normalized_detuning = node_features[:, :, 2]
+        local_cosine = (
+            cosine[:, link_sources] * cosine[:, link_receivers]
+            + sine[:, link_sources] * sine[:, link_receivers]
+        )
+        local_sine = (
+            sine[:, link_sources] * cosine[:, link_receivers]
+            - cosine[:, link_sources] * sine[:, link_receivers]
+        )
+        local_detuning_difference = 0.5 * (
+            normalized_detuning[:, link_sources]
+            - normalized_detuning[:, link_receivers]
+        )
+        edge_features = torch.stack(
+            (
+                local_cosine,
+                local_sine,
+                local_detuning_difference,
+                torch.abs(local_detuning_difference),
+            ),
+            dim=2,
+        )
+        if self.condition_on_bounded_degree:
+            degree_features = self.bounded_degree_features(
+                n_lasers,
+                device=node_features.device,
+                dtype=node_features.dtype,
+            ).view(1, 1, 2).expand(
+                batch_size, n_directed_links, 2
+            )
+            edge_features = torch.cat(
+                (edge_features, degree_features), dim=2
+            )
+
+        node_states = self.node_encoder(node_features)
+        for message_layer in self.message_layers:
+            node_states = message_layer(
+                node_states,
+                edge_features,
+                link_receivers,
+                link_sources,
+            )
+
+        source_states = node_states.index_select(1, link_sources)
+        receiver_states = node_states.index_select(1, link_receivers)
+        decoder_features = edge_features
+        if self.condition_on_n_lasers:
+            size_features = self.array_size_features(
+                n_lasers,
+                device=node_features.device,
+                dtype=node_features.dtype,
+            ).view(1, 1, 2).expand(
+                batch_size, n_directed_links, 2
+            )
+            decoder_features = torch.cat(
+                (decoder_features, size_features), dim=2
+            )
+        edge_inputs = torch.cat(
+            (source_states, receiver_states, decoder_features), dim=2
+        )
+        flat_edge_inputs = edge_inputs.reshape(
+            batch_size * n_directed_links, -1
+        )
+        edge_latent = self.edge_decoder[:-1](flat_edge_inputs)
+        edge_outputs = self.edge_decoder[-1](edge_latent).reshape(
+            batch_size, n_directed_links, -1
+        )
+
+        directed_magnitude_means = 6.0 * torch.tanh(
+            edge_outputs[:, :, 0] / 6.0
+        )
+        directed_phase_means = edge_outputs[:, :, 1]
+        upper_triangle = torch.as_tensor(
+            np.flatnonzero(receiver_numpy < source_numpy),
+            dtype=torch.long,
+            device=node_features.device,
+        )
+        magnitude_means = (
+            directed_magnitude_means.index_select(1, upper_triangle)
+            if self.force_symmetric_kappa
+            else directed_magnitude_means
+        )
+        phase_means = (
+            directed_phase_means.index_select(1, upper_triangle)
+            if self.force_symmetric_phi_p
+            else directed_phase_means
+        )
+        means = torch.cat((magnitude_means, phase_means), dim=1)
+        gate_logits = None
+        if self.enable_sparse_gates:
+            directed_gate_logits = self.edge_gate_head(edge_latent).reshape(
+                batch_size, n_directed_links
+            )
+            gate_logits = (
+                directed_gate_logits.index_select(1, upper_triangle)
+                if self.force_symmetric_kappa
+                else directed_gate_logits
+            )
+        if not self.edge_conditioned_log_std:
+            return means, None, gate_logits
+
+        directed_kappa_log_std = edge_outputs[:, :, 2]
+        directed_phi_log_std = edge_outputs[:, :, 3]
+        kappa_log_std = (
+            directed_kappa_log_std.index_select(1, upper_triangle)
+            if self.force_symmetric_kappa
+            else directed_kappa_log_std
+        )
+        phi_log_std = (
+            directed_phi_log_std.index_select(1, upper_triangle)
+            if self.force_symmetric_phi_p
+            else directed_phi_log_std
+        )
+        return (
+            means,
+            torch.cat((kappa_log_std, phi_log_std), dim=1),
+            gate_logits,
+        )
+
+    def action_mean(self, node_features: torch.Tensor) -> torch.Tensor:
+        return self._action_parameters(node_features)[0]
+
+    def gate_distribution(
+        self, node_features: torch.Tensor
+    ) -> torch.distributions.Bernoulli:
+        """Return one learned on/off distribution per magnitude link."""
+        gate_logits = self._action_parameters(node_features)[2]
+        if gate_logits is None:
+            raise RuntimeError("this policy does not have sparse gates enabled")
+        return torch.distributions.Bernoulli(logits=gate_logits)
+
+    def deterministic_gates(self, node_features: torch.Tensor) -> torch.Tensor:
+        """Threshold gate probabilities for deterministic evaluation."""
+        probabilities = self.gate_distribution(node_features).probs
+        return (probabilities >= self.gate_probability_threshold).to(
+            probabilities.dtype
+        )
+
+    def forward(self, node_features: torch.Tensor) -> torch.Tensor:
+        return self.action_mean(node_features)
+
+    def distribution(
+        self, node_features: torch.Tensor
+    ) -> torch.distributions.Normal:
+        mean, edge_log_std, _ = self._action_parameters(node_features)
+        if edge_log_std is not None:
+            if self.smooth_edge_log_std_bounds:
+                log_std = smoothly_bound_log_std(
+                    edge_log_std,
+                    self.minimum_log_std,
+                    self.maximum_log_std,
+                )
+            else:
+                log_std = torch.clamp(
+                    edge_log_std,
+                    self.minimum_log_std,
+                    self.maximum_log_std,
+                )
+            return torch.distributions.Normal(mean, torch.exp(log_std))
+
+        n_lasers = node_features.shape[1]
+        _, n_magnitude_links, n_phase_links = self.link_counts(n_lasers)
+        size_log_std_adjustment = torch.zeros(
+            2, device=mean.device, dtype=mean.dtype
+        )
+        if self.condition_log_std_on_n_lasers:
+            size_features = self.array_size_features(
+                n_lasers,
+                device=mean.device,
+                dtype=mean.dtype,
+            )
+            size_log_std_adjustment = self.size_log_std_head(size_features)
+        kappa_log_std = torch.clamp(
+            self.log_std_kappa + size_log_std_adjustment[0],
+            self.minimum_log_std,
+            self.maximum_log_std,
+        )
+        phi_log_std = torch.clamp(
+            self.log_std_phi + size_log_std_adjustment[1],
+            self.minimum_log_std,
+            self.maximum_log_std,
+        )
+        log_std = torch.cat(
+            (
+                kappa_log_std.expand(n_magnitude_links),
+                phi_log_std.expand(n_phase_links),
+            )
+        )
+        return torch.distributions.Normal(mean, torch.exp(log_std))
+
+    def backbone_density_distribution(
+        self, node_features: torch.Tensor
+    ) -> torch.distributions.Normal:
+        """Distribution over a logit mapped to retained density by sigmoid."""
+        if not self.enable_learned_backbone_density:
+            raise RuntimeError("learned backbone density is not enabled")
+        n_lasers = node_features.shape[1]
+        pooled = node_features[:, :, :3].mean(dim=1)
+        degree = self.bounded_degree_features(
+            n_lasers, device=pooled.device, dtype=pooled.dtype
+        ).view(1, 2).expand(pooled.shape[0], 2)
+        mean = self.backbone_density_head(torch.cat((pooled, degree), dim=1))
+        log_std = torch.clamp(
+            self.backbone_density_log_std,
+            self.minimum_log_std,
+            self.maximum_log_std,
+        )
+        return torch.distributions.Normal(mean, torch.exp(log_std))
+
+    def budget_error_context(self, node_features: torch.Tensor) -> torch.Tensor:
+        """Permutation-invariant context for budget prediction heads."""
+        if not self.enable_budget_error_selector:
+            raise RuntimeError("budget error selector is not enabled")
+        encoded = self.budget_error_context_encoder(node_features[:, :, :3])
+        pooled = torch.cat((encoded.mean(dim=1), encoded.amax(dim=1)), dim=1)
+        degree = self.bounded_degree_features(
+            node_features.shape[1], device=pooled.device, dtype=pooled.dtype
+        ).view(1, 2).expand(pooled.shape[0], 2)
+        return torch.cat((pooled, degree), dim=1)
+
+    def predict_normalized_phase_error(
+        self, node_features: torch.Tensor, retained_density: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict circular RMS phase error divided by pi."""
+        context = self.budget_error_context(node_features)
+        density = retained_density.to(context).reshape(-1, 1)
+        if density.shape[0] != context.shape[0]:
+            raise ValueError("retained_density must have one value per target")
+        return torch.sigmoid(
+            self.budget_error_head(torch.cat((context, density), dim=1))
+        ).squeeze(1)
+
+    def predict_normalized_budget(
+        self, node_features: torch.Tensor, allowable_error_fraction: torch.Tensor
+    ) -> torch.Tensor:
+        """Predict q=0 spanning-tree through q=1 all-to-all budget."""
+        context = self.budget_error_context(node_features)
+        tolerance = allowable_error_fraction.to(context).reshape(-1, 1)
+        if tolerance.shape[0] != context.shape[0]:
+            raise ValueError(
+                "allowable_error_fraction must have one value per target"
+            )
+        if self.monotonic_budget_selector:
+            parameters = self.budget_selector_head(context)
+            intercept = parameters[:, 0]
+            positive_coefficients = torch.nn.functional.softplus(
+                parameters[:, 1:]
+            )
+            powers = torch.cat(
+                (tolerance, tolerance.square(), tolerance.pow(3)), dim=1
+            )
+            return torch.sigmoid(
+                intercept - torch.sum(positive_coefficients * powers, dim=1)
+            )
+        return torch.sigmoid(
+            self.budget_selector_head(torch.cat((context, tolerance), dim=1))
+        ).squeeze(1)
 
 
 def make_policy(config: DesignerConfig) -> nn.Module:
     """Construct the architecture selected by ``config.encoder_architecture``."""
     if config.encoder_architecture == "bigru":
         return BiGRUPolicyNetwork(config)
+    if config.encoder_architecture == "gnn":
+        return GNNPolicyNetwork(config)
     return PolicyNetwork(config)
 
 
@@ -979,6 +2296,7 @@ def encode_for_policy(
     policy: PolicyNetwork,
     config: DesignerConfig,
     detuning_distribution_ghz: np.ndarray | None = None,
+    active_link_counts: np.ndarray | int | None = None,
 ) -> torch.Tensor:
     """Prepare per-laser phase/detuning features on the policy's device.
 
@@ -1013,16 +2331,43 @@ def encode_for_policy(
                 "targets and detuning distributions must have the same "
                 "batch size"
             )
-    # One feature row per laser: target angle on the unit circle plus its
-    # normalized detuning. Shape: (batch, M, 3).
-    node_features = np.stack(
-        (
-            np.cos(relative_phases),
-            np.sin(relative_phases),
-            detuning_features,
-        ),
-        axis=2,
-    ).astype(np.float32)
+    feature_columns = [
+        np.cos(relative_phases),
+        np.sin(relative_phases),
+        detuning_features,
+    ]
+    if getattr(policy, "condition_on_edge_budget", False):
+        maximum_links = config.n_lasers * (config.n_lasers - 1)
+        if active_link_counts is None:
+            active_counts = np.full(
+                relative_phases.shape[0], maximum_links, dtype=float
+            )
+        else:
+            active_counts = np.asarray(active_link_counts, dtype=float)
+            if active_counts.ndim == 0:
+                active_counts = np.full(
+                    relative_phases.shape[0], float(active_counts)
+                )
+            if active_counts.shape != (relative_phases.shape[0],):
+                raise ValueError(
+                    "active_link_counts must be scalar or have one value "
+                    "per target"
+                )
+            if np.any(active_counts < config.n_lasers - 1) or np.any(
+                active_counts > maximum_links
+            ):
+                raise ValueError(
+                    "active_link_counts must lie between M-1 and M*(M-1)"
+                )
+        normalized_budget = (
+            active_counts / float(maximum_links)
+        )[:, None]
+        feature_columns.append(
+            np.broadcast_to(normalized_budget, relative_phases.shape)
+        )
+    # One feature row per laser: target angle on the unit circle, normalized
+    # detuning, and (for the connected-sparse policy) active-link budget.
+    node_features = np.stack(feature_columns, axis=2).astype(np.float32)
     return torch.as_tensor(
         node_features,
         dtype=torch.float32,
@@ -1048,8 +2393,1144 @@ def sample_coupling_designs(
     # log pi(action | target), treating the sampled action as observed data.
     actions = sampled.detach().permute(1, 0, 2)
     log_probabilities = distribution.log_prob(sampled.detach())
-    log_probabilities = log_probabilities.sum(dim=2).permute(1, 0)
+    # Average over action dimensions so variable-size arrays have comparable
+    # policy-gradient scale while every sampled action still contributes.
+    log_probabilities = log_probabilities.mean(dim=2).permute(1, 0)
     return actions, log_probabilities
+
+
+def sample_coupling_designs_with_backbone_density(
+    policy: GNNPolicyNetwork,
+    encoded_targets: torch.Tensor,
+    candidates_per_target: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample continuous matrices plus one retained-link density ``rho``."""
+    actions, action_log_probability = sample_coupling_designs(
+        policy, encoded_targets, candidates_per_target
+    )
+    distribution = policy.backbone_density_distribution(encoded_targets)
+    sampled_logits = distribution.sample((candidates_per_target,))
+    rho_log_probability = distribution.log_prob(sampled_logits.detach())
+    rho = torch.sigmoid(sampled_logits.detach()).permute(1, 0, 2).squeeze(2)
+    # The continuous score is already averaged over its action dimensions.
+    # Add the scalar rho score so both parts of the joint action can learn.
+    joint_log_probability = (
+        action_log_probability
+        + rho_log_probability.squeeze(2).permute(1, 0)
+    )
+    return actions, rho, joint_log_probability
+
+
+def relative_coupling_backbone_mask(
+    kappa_per_ns: np.ndarray,
+    retained_density: float,
+) -> np.ndarray:
+    """Select a deterministic weakly connected directed backbone.
+
+    Links are ranked by receiver-normalized coupling.  A maximum spanning
+    tree is selected first, followed by each node's strongest local links and
+    then the globally strongest remaining directions.
+    """
+    kappa = np.asarray(kappa_per_ns, dtype=float)
+    if kappa.ndim != 2 or kappa.shape[0] != kappa.shape[1]:
+        raise ValueError("kappa_per_ns must be a square matrix")
+    m = kappa.shape[0]
+    maximum_links = m * (m - 1)
+    link_limit = max(m - 1, int(np.ceil(float(retained_density) * maximum_links)))
+    link_limit = min(link_limit, maximum_links)
+    totals = kappa.sum(axis=1, keepdims=True)
+    relative = np.divide(
+        kappa, totals, out=np.zeros_like(kappa), where=totals > 1.0e-15
+    )
+    np.fill_diagonal(relative, 0.0)
+
+    # Kruskal maximum spanning tree over reciprocal pair strengths.
+    parent = list(range(m))
+    def find(node: int) -> int:
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+    selected: set[tuple[int, int]] = set()
+    pairs = sorted(
+        (
+            (max(relative[b, a], relative[a, b]), a, b)
+            for a in range(m) for b in range(a + 1, m)
+        ),
+        reverse=True,
+    )
+    for strength, a, b in pairs:
+        root_a, root_b = find(a), find(b)
+        if root_a == root_b or strength <= 0.0:
+            continue
+        parent[root_b] = root_a
+        selected.add((a, b) if relative[b, a] >= relative[a, b] else (b, a))
+        if len(selected) == m - 1:
+            break
+
+    local: dict[tuple[int, int], float] = {}
+    for receiver in range(m):
+        source = int(np.argmax(relative[receiver]))
+        if source != receiver and relative[receiver, source] > 0.0:
+            local[(source, receiver)] = float(relative[receiver, source])
+    for source in range(m):
+        receiver = int(np.argmax(relative[:, source]))
+        if receiver != source and relative[receiver, source] > 0.0:
+            local[(source, receiver)] = float(relative[receiver, source])
+    ranked = list(local.items())
+    ranked.extend(
+        ((source, receiver), float(relative[receiver, source]))
+        for source in range(m) for receiver in range(m)
+        if source != receiver and (source, receiver) not in local
+    )
+    for direction, _ in sorted(ranked, key=lambda item: item[1], reverse=True):
+        if len(selected) >= link_limit:
+            break
+        selected.add(direction)
+    mask = np.zeros((m, m), dtype=bool)
+    for source, receiver in selected:
+        mask[receiver, source] = True
+    return mask
+
+
+def prune_coupling_batch_to_backbone(
+    kappa_per_ns: np.ndarray,
+    phi_p_rad: np.ndarray,
+    retained_densities: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Prune a flattened candidate batch and return realized densities."""
+    pruned_kappa = np.zeros_like(kappa_per_ns)
+    pruned_phi = np.zeros_like(phi_p_rad)
+    realized = np.empty(len(kappa_per_ns), dtype=float)
+    for index, rho in enumerate(np.asarray(retained_densities).reshape(-1)):
+        mask = relative_coupling_backbone_mask(kappa_per_ns[index], float(rho))
+        pruned_kappa[index] = np.where(mask, kappa_per_ns[index], 0.0)
+        pruned_phi[index] = np.where(mask, phi_p_rad[index], 0.0)
+        m = mask.shape[0]
+        realized[index] = np.count_nonzero(mask) / (m * (m - 1))
+    return pruned_kappa, pruned_phi, realized
+
+
+def prune_coupling_batch_to_link_budget(
+    kappa_per_ns: np.ndarray,
+    phi_p_rad: np.ndarray,
+    active_link_counts: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Apply one exact connected directed-link budget per candidate."""
+    kappa = np.asarray(kappa_per_ns, dtype=float)
+    phi = np.asarray(phi_p_rad, dtype=float)
+    counts = np.asarray(active_link_counts, dtype=np.int64).reshape(-1)
+    if len(counts) != len(kappa):
+        raise ValueError("active_link_counts must have one value per candidate")
+    m = kappa.shape[1]
+    maximum_links = m * (m - 1)
+    if np.any(counts < m - 1) or np.any(counts > maximum_links):
+        raise ValueError("active link budgets must lie between M-1 and M*(M-1)")
+    # Subtract a tiny amount so ceil(rho*maximum_links) reproduces the exact
+    # integer budget despite floating-point roundoff.
+    rho = np.maximum(counts - 1.0e-9, m - 1) / maximum_links
+    return prune_coupling_batch_to_backbone(kappa, phi, rho)
+
+
+def sample_sparse_coupling_designs(
+    policy: nn.Module,
+    encoded_targets: torch.Tensor,
+    candidates_per_target: int,
+    *,
+    sample_gates: bool = True,
+    include_dense_reference: bool = False,
+    single_edge_probe_fraction: float = 0.0,
+    exploratory_mask_fraction: float = 0.0,
+    exploration_removal_fractions: tuple[float, ...] = (
+        0.05,
+        0.10,
+        0.20,
+        0.30,
+    ),
+    exploration_strength: float = 0.75,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample continuous actions, hard gates, and their joint log probability.
+
+    In addition to ordinary Bernoulli samples, sparse refinement may reserve
+    candidates for three explicit exploration roles: an all-open reference,
+    exactly-one-edge removal probes, and low-sparsity random masks.  The
+    latter use a differentiable mixture of the learned gate probabilities and
+    requested removal rates, so their score-function gradient remains valid.
+    During dense recovery, gates are held open and omitted from the score.
+    """
+    if not policy.enable_sparse_gates:
+        raise ValueError("sample_sparse_coupling_designs requires sparse gates")
+    if candidates_per_target < 1:
+        raise ValueError("candidates_per_target must be positive")
+    for name, fraction in (
+        ("single_edge_probe_fraction", single_edge_probe_fraction),
+        ("exploratory_mask_fraction", exploratory_mask_fraction),
+    ):
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(f"{name} must lie in [0, 1]")
+    if single_edge_probe_fraction + exploratory_mask_fraction > 1.0:
+        raise ValueError(
+            "single-edge and exploratory-mask fractions must sum to at "
+            "most one"
+        )
+    if not 0.0 <= exploration_strength <= 1.0:
+        raise ValueError("exploration_strength must lie in [0, 1]")
+    if not exploration_removal_fractions:
+        raise ValueError("exploration_removal_fractions must not be empty")
+    if any(
+        not 0.0 < fraction < 1.0
+        for fraction in exploration_removal_fractions
+    ):
+        raise ValueError(
+            "every exploration removal fraction must lie strictly in (0, 1)"
+        )
+
+    continuous_distribution = policy.distribution(encoded_targets)
+    sampled_actions = continuous_distribution.sample((candidates_per_target,))
+    continuous_log_probability = continuous_distribution.log_prob(
+        sampled_actions.detach()
+    )
+    action_count = sampled_actions.shape[2]
+
+    gate_distribution = policy.gate_distribution(encoded_targets)
+    gate_count = gate_distribution.probs.shape[1]
+    if sample_gates:
+        learned_gate_samples = gate_distribution.sample(
+            (candidates_per_target,)
+        )
+        gate_log_probability = gate_distribution.log_prob(
+            learned_gate_samples.detach()
+        ).sum(dim=2)
+        # Exploration roles overwrite selected masks below. Keep the samples
+        # saved by Bernoulli.log_prob untouched for autograd.
+        sampled_gates = learned_gate_samples.clone()
+        gate_decision_count = torch.full(
+            (candidates_per_target, 1),
+            float(gate_count),
+            device=sampled_actions.device,
+            dtype=sampled_actions.dtype,
+        )
+
+        candidate_start = 0
+        if include_dense_reference:
+            # Use the deterministic policy mean for the reference rather than
+            # a noisy Gaussian action.  This candidate is evaluated only as
+            # the same-target dense baseline and therefore carries no policy
+            # score of its own.
+            sampled_actions[0] = continuous_distribution.mean.detach()
+            continuous_log_probability[0].zero_()
+            sampled_gates[0].fill_(1.0)
+            gate_log_probability[0].zero_()
+            gate_decision_count[0].zero_()
+            candidate_start = 1
+
+        available_candidates = candidates_per_target - candidate_start
+        single_probe_count = min(
+            int(round(candidates_per_target * single_edge_probe_fraction)),
+            available_candidates,
+        )
+        if single_probe_count:
+            # This is the learned Bernoulli distribution conditioned on
+            # exactly one edge being off: P(edge=e) is proportional to
+            # (1-p_e)/p_e = exp(-logit_e).
+            removal_distribution = torch.distributions.Categorical(
+                logits=-gate_distribution.logits
+            )
+            removed_edges = removal_distribution.sample(
+                (single_probe_count,)
+            )
+            probe_slice = slice(
+                candidate_start, candidate_start + single_probe_count
+            )
+            probe_gates = torch.ones(
+                (
+                    single_probe_count,
+                    encoded_targets.shape[0],
+                    gate_count,
+                ),
+                device=sampled_actions.device,
+                dtype=sampled_actions.dtype,
+            )
+            probe_gates.scatter_(2, removed_edges.unsqueeze(2), 0.0)
+            sampled_gates[probe_slice] = probe_gates
+            gate_log_probability[probe_slice] = (
+                removal_distribution.log_prob(removed_edges)
+            )
+            gate_decision_count[probe_slice] = 1.0
+            candidate_start += single_probe_count
+
+        available_candidates = candidates_per_target - candidate_start
+        exploratory_count = min(
+            int(round(candidates_per_target * exploratory_mask_fraction)),
+            available_candidates,
+        )
+        if exploratory_count:
+            removal_rates = torch.as_tensor(
+                [
+                    exploration_removal_fractions[
+                        index % len(exploration_removal_fractions)
+                    ]
+                    for index in range(exploratory_count)
+                ],
+                device=sampled_actions.device,
+                dtype=sampled_actions.dtype,
+            ).view(exploratory_count, 1, 1)
+            learned_probabilities = gate_distribution.probs.unsqueeze(0)
+            exploratory_probabilities = (
+                (1.0 - exploration_strength) * learned_probabilities
+                + exploration_strength * (1.0 - removal_rates)
+            )
+            exploratory_distribution = torch.distributions.Bernoulli(
+                probs=exploratory_probabilities
+            )
+            exploratory_gates = exploratory_distribution.sample()
+            exploratory_slice = slice(
+                candidate_start, candidate_start + exploratory_count
+            )
+            sampled_gates[exploratory_slice] = exploratory_gates
+            gate_log_probability[exploratory_slice] = (
+                exploratory_distribution.log_prob(
+                    exploratory_gates.detach()
+                ).sum(dim=2)
+            )
+            candidate_start += exploratory_count
+
+        joint_log_probability = (
+            continuous_log_probability.sum(dim=2) + gate_log_probability
+        ) / (float(action_count) + gate_decision_count)
+    else:
+        sampled_gates = torch.ones(
+            (
+                candidates_per_target,
+                encoded_targets.shape[0],
+                gate_count,
+            ),
+            device=encoded_targets.device,
+            dtype=encoded_targets.dtype,
+        )
+        joint_log_probability = continuous_log_probability.mean(dim=2)
+
+    return (
+        sampled_actions.detach().permute(1, 0, 2),
+        sampled_gates.detach().permute(1, 0, 2),
+        joint_log_probability.permute(1, 0),
+    )
+
+
+def minimum_active_links_at(
+    iteration: int,
+    n_lasers: int,
+    config: DesignerConfig,
+) -> int:
+    """Return the sparsest budget exposed by the current curriculum."""
+    maximum_links = n_lasers * (n_lasers - 1)
+    minimum_links = n_lasers - 1
+    if iteration < config.edge_budget_warmup_iterations:
+        return maximum_links
+    if config.edge_budget_curriculum_iterations == 0:
+        progress = 1.0
+    else:
+        progress = np.clip(
+            (
+                iteration
+                - config.edge_budget_warmup_iterations
+                + 1
+            )
+            / config.edge_budget_curriculum_iterations,
+            0.0,
+            1.0,
+        )
+    removable_links = maximum_links - minimum_links
+    return maximum_links - int(round(progress * removable_links))
+
+
+def sample_active_link_counts(
+    count: int,
+    n_lasers: int,
+    rng: np.random.Generator,
+    iteration: int,
+    config: DesignerConfig,
+) -> np.ndarray:
+    """Sample exact connected-link budgets for one training batch."""
+    if count < 1:
+        raise ValueError("count must be positive")
+    maximum_links = n_lasers * (n_lasers - 1)
+    minimum_links = minimum_active_links_at(iteration, n_lasers, config)
+    return rng.integers(
+        minimum_links,
+        maximum_links + 1,
+        size=count,
+        dtype=np.int64,
+    )
+
+
+def sample_conditional_link_counts(
+    count: int,
+    n_lasers: int,
+    iteration: int,
+) -> np.ndarray:
+    """Sweep exact connected budgets evenly without extra simulations.
+
+    Each target still receives one budget and all of its stochastic coupling
+    candidates share that budget.  A size-specific cyclic sequence visits
+    every feasible integer link count; targets within one update are offset
+    across that sequence.  This gives the error model examples ranging from
+    a spanning tree through all-to-all coupling without changing the number
+    of VCSEL simulations.
+    """
+    if count < 1:
+        raise ValueError("count must be positive")
+    if n_lasers < 2:
+        raise ValueError("n_lasers must be at least 2")
+    minimum_links = n_lasers - 1
+    maximum_links = n_lasers * (n_lasers - 1)
+    feasible_count = maximum_links - minimum_links + 1
+    # Choose a size-dependent stride coprime to the number of budgets. This
+    # makes the base index traverse every exact count before repeating.
+    stride = max(1, int(round(0.61803398875 * feasible_count)))
+    while np.gcd(stride, feasible_count) != 1:
+        stride += 1
+    base_index = (iteration * stride + n_lasers) % feasible_count
+    offsets = np.floor(
+        np.arange(count, dtype=float) * feasible_count / count
+    ).astype(np.int64)
+    budget_indices = (base_index + offsets) % feasible_count
+    return minimum_links + budget_indices
+
+
+def sample_multibudget_candidate_counts(
+    target_count: int,
+    candidates_per_target: int,
+    n_lasers: int,
+    budget_levels_per_target: int,
+    rng: np.random.Generator,
+    iteration: int,
+) -> np.ndarray:
+    """Assign one exact connected budget to every existing candidate.
+
+    Each target receives up to ``budget_levels_per_target`` levels including
+    the spanning-tree and all-to-all endpoints. Candidate counts are balanced
+    across levels, and their ordering is shuffled. The returned shape is
+    ``(target_count, candidates_per_target)`` and therefore does not change
+    the number of VCSEL simulations.
+    """
+    if target_count < 1 or candidates_per_target < 1:
+        raise ValueError("target and candidate counts must be positive")
+    minimum_links = n_lasers - 1
+    maximum_links = n_lasers * (n_lasers - 1)
+    feasible_budget_count = maximum_links - minimum_links + 1
+    level_count = min(
+        budget_levels_per_target,
+        feasible_budget_count,
+        candidates_per_target,
+    )
+    levels = np.unique(
+        np.rint(
+            np.linspace(minimum_links, maximum_links, level_count)
+        ).astype(np.int64)
+    )
+    if len(levels) != level_count:
+        raise RuntimeError("failed to construct distinct exact budget levels")
+    assignments = np.empty(
+        (target_count, candidates_per_target), dtype=np.int64
+    )
+    base_count, remainder = divmod(candidates_per_target, level_count)
+    for target_index in range(target_count):
+        repeats = np.full(level_count, base_count, dtype=np.int64)
+        start = (iteration + target_index) % level_count
+        repeats[(start + np.arange(remainder)) % level_count] += 1
+        row = np.repeat(levels, repeats)
+        rng.shuffle(row)
+        assignments[target_index] = row
+    return assignments
+
+
+def deterministic_budget_candidate_mask(
+    active_link_count_matrix: np.ndarray,
+) -> np.ndarray:
+    """Select exactly one deterministic candidate for every target/budget."""
+    budgets = np.asarray(active_link_count_matrix, dtype=np.int64)
+    if budgets.ndim != 2 or budgets.shape[1] < 1:
+        raise ValueError("active_link_count_matrix must be a nonempty 2-D array")
+    deterministic = np.zeros_like(budgets, dtype=bool)
+    for target_index, row in enumerate(budgets):
+        _, first_indices = np.unique(row, return_index=True)
+        deterministic[target_index, first_indices] = True
+    return deterministic
+
+
+def nonincreasing_isotonic_fit(
+    values: np.ndarray,
+    weights: np.ndarray | None = None,
+) -> np.ndarray:
+    """Weighted least-squares isotonic fit constrained to be non-increasing."""
+    observations = np.asarray(values, dtype=float)
+    if observations.ndim != 1 or len(observations) < 1:
+        raise ValueError("values must be a nonempty one-dimensional array")
+    if weights is None:
+        sample_weights = np.ones_like(observations)
+    else:
+        sample_weights = np.asarray(weights, dtype=float)
+        if sample_weights.shape != observations.shape:
+            raise ValueError("weights must match values")
+        if np.any(sample_weights <= 0.0):
+            raise ValueError("weights must be positive")
+
+    # Pool adjacent violators. A block ordering a < b violates the requested
+    # non-increasing relation and is replaced by its weighted mean.
+    blocks: list[list[float | int]] = []
+    for index, (value, weight) in enumerate(
+        zip(observations, sample_weights)
+    ):
+        blocks.append([index, index + 1, float(weight), float(value)])
+        while len(blocks) >= 2 and blocks[-2][3] < blocks[-1][3]:
+            right = blocks.pop()
+            left = blocks.pop()
+            combined_weight = float(left[2]) + float(right[2])
+            combined_value = (
+                float(left[2]) * float(left[3])
+                + float(right[2]) * float(right[3])
+            ) / combined_weight
+            blocks.append(
+                [int(left[0]), int(right[1]), combined_weight, combined_value]
+            )
+    fitted = np.empty_like(observations)
+    for start, stop, _weight, value in blocks:
+        fitted[int(start) : int(stop)] = float(value)
+    return fitted
+
+
+def budget_group_standardized_advantages(
+    reward_matrix: np.ndarray,
+    active_link_count_matrix: np.ndarray,
+    candidate_mask: np.ndarray | None = None,
+) -> np.ndarray:
+    """Standardize rewards among eligible candidates at the same budget."""
+    rewards = np.asarray(reward_matrix, dtype=float)
+    budgets = np.asarray(active_link_count_matrix, dtype=np.int64)
+    if rewards.shape != budgets.shape or rewards.ndim != 2:
+        raise ValueError("rewards and budgets must have matching 2-D shapes")
+    if candidate_mask is None:
+        eligible = np.ones_like(rewards, dtype=bool)
+    else:
+        eligible = np.asarray(candidate_mask, dtype=bool)
+        if eligible.shape != rewards.shape:
+            raise ValueError("candidate_mask must match reward_matrix")
+    advantages = np.zeros_like(rewards)
+    for target_index in range(rewards.shape[0]):
+        for link_count in np.unique(budgets[target_index]):
+            mask = (
+                (budgets[target_index] == link_count)
+                & eligible[target_index]
+            )
+            group = rewards[target_index, mask]
+            if len(group) == 0:
+                continue
+            advantages[target_index, mask] = (
+                group - np.mean(group)
+            ) / (np.std(group) + 1.0e-8)
+    return advantages
+
+
+def budget_error_selector_loss(
+    policy: GNNPolicyNetwork,
+    node_features: torch.Tensor,
+    targets_rad: np.ndarray,
+    active_link_counts: np.ndarray,
+    aligned_achieved_phases_rad: np.ndarray,
+    n_lasers: int,
+    config: DesignerConfig,
+    rng: np.random.Generator,
+    deterministic_candidate_mask: np.ndarray | None = None,
+) -> tuple[torch.Tensor, float, float]:
+    """Train auxiliary heads from measured same-target multi-budget curves."""
+    target_relative = make_relative_to_laser_1(targets_rad)
+    circular_error = np.angle(
+        np.exp(
+            1.0j
+            * (
+                aligned_achieved_phases_rad
+                - target_relative[:, None, :]
+            )
+        )
+    )[:, :, 1:]
+    if config.selector_use_deterministic_max_error:
+        measured_error_fraction = np.max(
+            np.abs(circular_error), axis=2
+        ) / np.pi
+    else:
+        measured_error_fraction = np.sqrt(
+            np.mean(circular_error**2, axis=2)
+        ) / np.pi
+    target_count, candidate_count = measured_error_fraction.shape
+    budget_matrix = np.asarray(active_link_counts, dtype=np.int64)
+    if budget_matrix.ndim == 1:
+        if budget_matrix.shape != (target_count,):
+            raise ValueError("active_link_counts must have one row per target")
+        budget_matrix = np.broadcast_to(
+            budget_matrix[:, None], (target_count, candidate_count)
+        )
+    if budget_matrix.shape != (target_count, candidate_count):
+        raise ValueError(
+            "active_link_counts must match target and candidate dimensions"
+        )
+    deterministic_mask = None
+    if config.selector_use_deterministic_max_error:
+        if deterministic_candidate_mask is None:
+            raise ValueError(
+                "deterministic_candidate_mask is required for deterministic "
+                "maximum-error selector labels"
+            )
+        deterministic_mask = np.asarray(
+            deterministic_candidate_mask, dtype=bool
+        )
+        if deterministic_mask.shape != budget_matrix.shape:
+            raise ValueError(
+                "deterministic_candidate_mask must match candidate dimensions"
+            )
+    maximum_links = n_lasers * (n_lasers - 1)
+    minimum_links = n_lasers - 1
+    device = node_features.device
+
+    error_context_rows: list[torch.Tensor] = []
+    error_density_labels: list[float] = []
+    error_value_labels: list[float] = []
+    selector_context_rows: list[torch.Tensor] = []
+    selector_tolerance_labels: list[float] = []
+    selector_q_labels: list[float] = []
+    for target_index in range(target_count):
+        counts = np.unique(budget_matrix[target_index])
+        counts.sort()
+        group_sizes: list[float] = []
+        group_errors: list[float] = []
+        for count in counts:
+            group_mask = budget_matrix[target_index] == count
+            if deterministic_mask is not None:
+                group_mask &= deterministic_mask[target_index]
+                if np.count_nonzero(group_mask) != 1:
+                    raise ValueError(
+                        "each target and budget must contain exactly one "
+                        "deterministic selector candidate"
+                    )
+            group_sizes.append(float(np.count_nonzero(group_mask)))
+            group_errors.append(
+                float(
+                    np.mean(
+                        measured_error_fraction[target_index, group_mask]
+                    )
+                )
+            )
+        group_sizes_array = np.asarray(group_sizes, dtype=float)
+        group_errors_array = np.asarray(group_errors, dtype=float)
+        if config.selector_use_deterministic_max_error:
+            selector_curve_errors = group_errors_array
+        else:
+            selector_curve_errors = nonincreasing_isotonic_fit(
+                group_errors_array, group_sizes_array
+            )
+        for count, curve_error in zip(counts, selector_curve_errors):
+            error_context_rows.append(node_features[target_index])
+            error_density_labels.append(float(count) / maximum_links)
+            error_value_labels.append(float(curve_error))
+
+        error_high = float(np.max(selector_curve_errors))
+        error_low = float(np.min(selector_curve_errors))
+        if error_high - error_low <= 1.0e-8:
+            continue
+        label_count = config.selector_labels_per_target
+        stratified_positions = (
+            np.arange(label_count, dtype=float) + rng.random(label_count)
+        ) / label_count
+        tolerances = error_low + stratified_positions * (
+            error_high - error_low
+        )
+        normalized_q = (counts - minimum_links) / (
+            maximum_links - minimum_links
+        )
+        for tolerance in tolerances:
+            feasible_indices = np.flatnonzero(
+                selector_curve_errors <= tolerance
+            )
+            if len(feasible_indices) == 0:
+                # Do not repeat the original failure mode by converting an
+                # infeasible tolerance into an ordinary all-to-all label.
+                continue
+            selector_context_rows.append(node_features[target_index])
+            selector_tolerance_labels.append(float(tolerance))
+            selector_q_labels.append(
+                float(normalized_q[int(feasible_indices[0])])
+            )
+
+    error_context = torch.stack(error_context_rows)
+    error_density = torch.as_tensor(
+        error_density_labels, dtype=torch.float32, device=device
+    )
+    error_targets = torch.as_tensor(
+        error_value_labels, dtype=torch.float32, device=device
+    )
+    predicted_error = policy.predict_normalized_phase_error(
+        error_context, error_density
+    )
+    error_loss = torch.nn.functional.mse_loss(predicted_error, error_targets)
+
+    if selector_context_rows:
+        selector_context = torch.stack(selector_context_rows)
+        selector_tolerances = torch.as_tensor(
+            selector_tolerance_labels, dtype=torch.float32, device=device
+        )
+        teacher_q = torch.as_tensor(
+            selector_q_labels, dtype=torch.float32, device=device
+        )
+        predicted_q = policy.predict_normalized_budget(
+            selector_context, selector_tolerances
+        )
+        selector_loss = torch.nn.functional.mse_loss(predicted_q, teacher_q)
+        selector_budget_mae = float(
+            torch.mean(torch.abs(predicted_q - teacher_q)).detach().cpu()
+        )
+    else:
+        # Retain a valid graph-connected scalar without training the selector
+        # from an uninformative or infeasible curve.
+        selector_loss = sum(
+            parameter.sum() * 0.0
+            for parameter in policy.budget_selector_head.parameters()
+        )
+        selector_budget_mae = float("nan")
+    error_prediction_mae_deg = float(
+        torch.mean(torch.abs(predicted_error - error_targets))
+        .detach()
+        .cpu()
+        * 180.0
+    )
+    return (
+        error_loss + selector_loss,
+        error_prediction_mae_deg,
+        selector_budget_mae,
+    )
+
+
+def sample_connected_coupling_designs(
+    policy: nn.Module,
+    encoded_targets: torch.Tensor,
+    candidates_per_target: int,
+    active_link_counts: np.ndarray,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample Gaussian actions and exact-budget weakly connected masks.
+
+    A score-weighted growing tree first supplies ``M-1`` directed links whose
+    undirected projection spans every laser. Additional directed links are
+    sampled without replacement until each target's requested budget is met.
+    The categorical log probabilities are combined with the existing
+    Gaussian score, preserving the current REINFORCE training method.
+    """
+    if not getattr(policy, "enable_sparse_gates", False):
+        raise ValueError("connected sampling requires sparse gates")
+    if candidates_per_target < 1:
+        raise ValueError("candidates_per_target must be positive")
+    target_count, n_lasers, _ = encoded_targets.shape
+    maximum_links = n_lasers * (n_lasers - 1)
+    active_link_counts = np.asarray(active_link_counts, dtype=np.int64)
+    if active_link_counts.shape != (target_count,):
+        raise ValueError("active_link_counts must have one value per target")
+    if np.any(active_link_counts < n_lasers - 1) or np.any(
+        active_link_counts > maximum_links
+    ):
+        raise ValueError("active link budgets must lie in [M-1, M*(M-1)]")
+
+    continuous_distribution = policy.distribution(encoded_targets)
+    sampled_actions = continuous_distribution.sample((candidates_per_target,))
+    continuous_log_probability = continuous_distribution.log_prob(
+        sampled_actions.detach()
+    )
+    action_count = sampled_actions.shape[2]
+    gate_logits = policy.gate_distribution(encoded_targets).logits
+    if gate_logits.shape != (target_count, maximum_links):
+        raise ValueError(
+            "connected sampling currently requires one gate per directed link"
+        )
+    receivers, sources = directed_link_indices(n_lasers)
+
+    candidate_gates: list[torch.Tensor] = []
+    candidate_gate_log_probabilities: list[torch.Tensor] = []
+    for candidate_index in range(candidates_per_target):
+        target_gates: list[torch.Tensor] = []
+        target_log_probabilities: list[torch.Tensor] = []
+        for target_index, requested_count in enumerate(active_link_counts):
+            requested_count = int(requested_count)
+            if requested_count == maximum_links:
+                target_gates.append(torch.ones_like(gate_logits[target_index]))
+                target_log_probabilities.append(
+                    gate_logits[target_index].sum() * 0.0
+                )
+                continue
+
+            selected: list[int] = []
+            selected_set: set[int] = set()
+            connected_nodes = {
+                int((candidate_index + target_index) % n_lasers)
+            }
+            decision_log_probabilities: list[torch.Tensor] = []
+
+            while len(connected_nodes) < n_lasers:
+                crossing = [
+                    edge_index
+                    for edge_index, (receiver, source) in enumerate(
+                        zip(receivers, sources)
+                    )
+                    if (
+                        (int(receiver) in connected_nodes)
+                        != (int(source) in connected_nodes)
+                    )
+                ]
+                crossing_tensor = torch.as_tensor(
+                    crossing,
+                    dtype=torch.long,
+                    device=encoded_targets.device,
+                )
+                distribution = torch.distributions.Categorical(
+                    logits=gate_logits[target_index].index_select(
+                        0, crossing_tensor
+                    )
+                )
+                local_choice = distribution.sample()
+                edge_index = crossing[int(local_choice)]
+                decision_log_probabilities.append(
+                    distribution.log_prob(local_choice)
+                )
+                selected.append(edge_index)
+                selected_set.add(edge_index)
+                connected_nodes.add(int(receivers[edge_index]))
+                connected_nodes.add(int(sources[edge_index]))
+
+            while len(selected) < requested_count:
+                remaining = [
+                    edge_index
+                    for edge_index in range(maximum_links)
+                    if edge_index not in selected_set
+                ]
+                remaining_tensor = torch.as_tensor(
+                    remaining,
+                    dtype=torch.long,
+                    device=encoded_targets.device,
+                )
+                distribution = torch.distributions.Categorical(
+                    logits=gate_logits[target_index].index_select(
+                        0, remaining_tensor
+                    )
+                )
+                local_choice = distribution.sample()
+                edge_index = remaining[int(local_choice)]
+                decision_log_probabilities.append(
+                    distribution.log_prob(local_choice)
+                )
+                selected.append(edge_index)
+                selected_set.add(edge_index)
+
+            gate = torch.zeros_like(gate_logits[target_index])
+            gate[torch.as_tensor(
+                selected,
+                dtype=torch.long,
+                device=encoded_targets.device,
+            )] = 1.0
+            target_gates.append(gate)
+            target_log_probabilities.append(
+                torch.stack(decision_log_probabilities).sum()
+            )
+        candidate_gates.append(torch.stack(target_gates))
+        candidate_gate_log_probabilities.append(
+            torch.stack(target_log_probabilities)
+        )
+
+    sampled_gates = torch.stack(candidate_gates)
+    gate_log_probability = torch.stack(candidate_gate_log_probabilities)
+    if action_count != 2 * maximum_links:
+        raise ValueError(
+            "connected sampling requires one magnitude and one phase action "
+            "per directed link"
+        )
+    # Disabled links do not affect the simulator, so exclude their otherwise
+    # pure-noise magnitude and phase scores from the REINFORCE objective.
+    active_action_mask = torch.cat(
+        (sampled_gates, sampled_gates), dim=2
+    )
+    active_continuous_log_probability = (
+        continuous_log_probability * active_action_mask
+    ).sum(dim=2)
+    decision_counts = torch.as_tensor(
+        active_link_counts,
+        dtype=sampled_actions.dtype,
+        device=sampled_actions.device,
+    ).unsqueeze(0)
+    topology_decision_counts = torch.where(
+        decision_counts == float(maximum_links),
+        torch.zeros_like(decision_counts),
+        decision_counts,
+    )
+    joint_log_probability = (
+        active_continuous_log_probability + gate_log_probability
+    ) / (2.0 * decision_counts + topology_decision_counts)
+    return (
+        sampled_actions.detach().permute(1, 0, 2),
+        sampled_gates.detach().permute(1, 0, 2),
+        joint_log_probability.permute(1, 0),
+    )
+
+
+def sample_learned_connected_coupling_designs(
+    policy: nn.Module,
+    encoded_targets: torch.Tensor,
+    candidates_per_target: int,
+    *,
+    include_dense_reference: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Sample connected masks whose link counts are policy decisions.
+
+    The gate logits first define a categorical policy over the directed edges
+    that can grow a spanning tree.  Once all lasers are connected, every
+    remaining directed edge is sampled from its learned Bernoulli policy.
+    Thus connectivity is guaranteed, while both topology and active-link
+    count remain stochastic actions credited by the REINFORCE loss. When
+    requested, candidate zero is forced dense to provide a same-condition
+    phase reference; only its normally sampled continuous actions contribute
+    a score-function gradient.
+    """
+    if not getattr(policy, "enable_sparse_gates", False):
+        raise ValueError("learned connected sampling requires sparse gates")
+    if candidates_per_target < 1:
+        raise ValueError("candidates_per_target must be positive")
+
+    target_count, n_lasers, _ = encoded_targets.shape
+    maximum_links = n_lasers * (n_lasers - 1)
+    continuous_distribution = policy.distribution(encoded_targets)
+    sampled_actions = continuous_distribution.sample((candidates_per_target,))
+    continuous_log_probability = continuous_distribution.log_prob(
+        sampled_actions.detach()
+    )
+    if sampled_actions.shape[2] != 2 * maximum_links:
+        raise ValueError(
+            "learned connected sampling requires one magnitude and one "
+            "phase action per directed link"
+        )
+    gate_logits = policy.gate_distribution(encoded_targets).logits
+    if gate_logits.shape != (target_count, maximum_links):
+        raise ValueError(
+            "learned connected sampling requires one gate per directed link"
+        )
+    receivers, sources = directed_link_indices(n_lasers)
+
+    candidate_gates: list[torch.Tensor] = []
+    candidate_gate_log_probabilities: list[torch.Tensor] = []
+    for candidate_index in range(candidates_per_target):
+        target_gates: list[torch.Tensor] = []
+        target_log_probabilities: list[torch.Tensor] = []
+        for target_index in range(target_count):
+            if include_dense_reference and candidate_index == 0:
+                target_gates.append(
+                    torch.ones_like(gate_logits[target_index])
+                )
+                # The topology is deliberately forced rather than sampled,
+                # so it supplies no Bernoulli score-function gradient.  Its
+                # normally sampled continuous actions remain trainable.
+                target_log_probabilities.append(
+                    gate_logits[target_index].sum() * 0.0
+                )
+                continue
+            selected: list[int] = []
+            selected_set: set[int] = set()
+            connected_nodes = {
+                int((candidate_index + target_index) % n_lasers)
+            }
+            decision_log_probabilities: list[torch.Tensor] = []
+
+            while len(connected_nodes) < n_lasers:
+                crossing = [
+                    edge_index
+                    for edge_index, (receiver, source) in enumerate(
+                        zip(receivers, sources)
+                    )
+                    if (
+                        (int(receiver) in connected_nodes)
+                        != (int(source) in connected_nodes)
+                    )
+                ]
+                crossing_tensor = torch.as_tensor(
+                    crossing,
+                    dtype=torch.long,
+                    device=encoded_targets.device,
+                )
+                tree_distribution = torch.distributions.Categorical(
+                    logits=gate_logits[target_index].index_select(
+                        0, crossing_tensor
+                    )
+                )
+                local_choice = tree_distribution.sample()
+                edge_index = crossing[int(local_choice)]
+                decision_log_probabilities.append(
+                    tree_distribution.log_prob(local_choice)
+                )
+                selected.append(edge_index)
+                selected_set.add(edge_index)
+                connected_nodes.add(int(receivers[edge_index]))
+                connected_nodes.add(int(sources[edge_index]))
+
+            remaining = [
+                edge_index
+                for edge_index in range(maximum_links)
+                if edge_index not in selected_set
+            ]
+            remaining_tensor = torch.as_tensor(
+                remaining,
+                dtype=torch.long,
+                device=encoded_targets.device,
+            )
+            extra_distribution = torch.distributions.Bernoulli(
+                logits=gate_logits[target_index].index_select(
+                    0, remaining_tensor
+                )
+            )
+            extra_samples = extra_distribution.sample()
+            decision_log_probabilities.append(
+                extra_distribution.log_prob(extra_samples).sum()
+            )
+            for local_index in torch.nonzero(
+                extra_samples.detach() > 0.5, as_tuple=False
+            ).flatten().tolist():
+                selected.append(remaining[int(local_index)])
+
+            gate = torch.zeros_like(gate_logits[target_index])
+            gate[
+                torch.as_tensor(
+                    selected,
+                    dtype=torch.long,
+                    device=encoded_targets.device,
+                )
+            ] = 1.0
+            target_gates.append(gate)
+            target_log_probabilities.append(
+                torch.stack(decision_log_probabilities).sum()
+            )
+        candidate_gates.append(torch.stack(target_gates))
+        candidate_gate_log_probabilities.append(
+            torch.stack(target_log_probabilities)
+        )
+
+    sampled_gates = torch.stack(candidate_gates)
+    gate_log_probability = torch.stack(candidate_gate_log_probabilities)
+    active_action_mask = torch.cat((sampled_gates, sampled_gates), dim=2)
+    active_continuous_log_probability = (
+        continuous_log_probability * active_action_mask
+    ).sum(dim=2)
+    # Use a fixed denominator so choosing fewer links does not itself rescale
+    # the score-function estimator.
+    joint_log_probability = (
+        active_continuous_log_probability + gate_log_probability
+    ) / float(3 * maximum_links)
+    return (
+        sampled_actions.detach().permute(1, 0, 2),
+        sampled_gates.detach().permute(1, 0, 2),
+        joint_log_probability.permute(1, 0),
+    )
+
+
+def deterministic_connected_gates(
+    gate_logits: np.ndarray,
+    active_link_counts: np.ndarray,
+    n_lasers: int,
+) -> np.ndarray:
+    """Select a maximum-score spanning tree and exact-budget extra links."""
+    gate_logits = np.asarray(gate_logits, dtype=float)
+    active_link_counts = np.asarray(active_link_counts, dtype=np.int64)
+    maximum_links = n_lasers * (n_lasers - 1)
+    if gate_logits.ndim != 2 or gate_logits.shape[1] != maximum_links:
+        raise ValueError("gate_logits must have shape (batch, M*(M-1))")
+    if active_link_counts.shape != (gate_logits.shape[0],):
+        raise ValueError("active_link_counts must have one value per row")
+    receivers, sources = directed_link_indices(n_lasers)
+    edge_lookup = {
+        (int(receiver), int(source)): edge_index
+        for edge_index, (receiver, source) in enumerate(
+            zip(receivers, sources)
+        )
+    }
+    gates = np.zeros_like(gate_logits)
+    for row_index, requested_count in enumerate(active_link_counts):
+        requested_count = int(requested_count)
+        if not n_lasers - 1 <= requested_count <= maximum_links:
+            raise ValueError("active link budgets must lie in [M-1, M*(M-1)]")
+        parent = list(range(n_lasers))
+
+        def find(node: int) -> int:
+            while parent[node] != node:
+                parent[node] = parent[parent[node]]
+                node = parent[node]
+            return node
+
+        pair_candidates = []
+        for first in range(n_lasers):
+            for second in range(first + 1, n_lasers):
+                first_receives = edge_lookup[(first, second)]
+                second_receives = edge_lookup[(second, first)]
+                selected_direction = (
+                    first_receives
+                    if gate_logits[row_index, first_receives]
+                    >= gate_logits[row_index, second_receives]
+                    else second_receives
+                )
+                pair_candidates.append(
+                    (
+                        gate_logits[row_index, selected_direction],
+                        first,
+                        second,
+                        selected_direction,
+                    )
+                )
+        selected: list[int] = []
+        for _, first, second, edge_index in sorted(
+            pair_candidates, reverse=True
+        ):
+            first_root = find(first)
+            second_root = find(second)
+            if first_root == second_root:
+                continue
+            parent[first_root] = second_root
+            selected.append(edge_index)
+            if len(selected) == n_lasers - 1:
+                break
+        selected_set = set(selected)
+        remaining = sorted(
+            (
+                edge_index
+                for edge_index in range(maximum_links)
+                if edge_index not in selected_set
+            ),
+            key=lambda edge_index: gate_logits[row_index, edge_index],
+            reverse=True,
+        )
+        selected.extend(remaining[: requested_count - len(selected)])
+        gates[row_index, selected] = 1.0
+    return gates
+
+
+def deterministic_learned_connected_gates(
+    gate_logits: np.ndarray,
+    n_lasers: int,
+    probability_threshold: float = 0.5,
+) -> np.ndarray:
+    """Threshold learned gates while always retaining a spanning tree."""
+    gate_logits = np.asarray(gate_logits, dtype=float)
+    if not 0.0 < probability_threshold < 1.0:
+        raise ValueError("probability_threshold must lie strictly in (0, 1)")
+    spanning_tree = deterministic_connected_gates(
+        gate_logits,
+        np.full(gate_logits.shape[0], n_lasers - 1, dtype=np.int64),
+        n_lasers,
+    )
+    threshold_logit = np.log(
+        probability_threshold / (1.0 - probability_threshold)
+    )
+    return np.maximum(spanning_tree, gate_logits >= threshold_logit).astype(
+        float
+    )
 
 
 def run_architecture_sanity_checks(
@@ -1072,11 +3553,21 @@ def run_architecture_sanity_checks(
     for n_lasers in n_lasers_values:
         generator = torch.Generator(device="cpu")
         generator.manual_seed(config.random_seed + n_lasers)
+        feature_count = 4 if config.condition_on_edge_budget else 3
         node_features = torch.randn(
-            (2, n_lasers, 3),
+            (2, n_lasers, feature_count),
             generator=generator,
             dtype=torch.float32,
         ).to(torch.device(config.device))
+        if config.condition_on_edge_budget:
+            # The fourth feature is a broadcast retained-link fraction and
+            # must represent the same requested budget for every node.
+            budget_fraction = torch.tensor(
+                [1.0 / n_lasers, 1.0],
+                dtype=node_features.dtype,
+                device=node_features.device,
+            )
+            node_features[:, :, 3] = budget_fraction[:, None]
         action_means = policy(node_features)
         expected_width = policy.action_size_for(n_lasers)
         if action_means.shape != (2, expected_width):
@@ -1095,11 +3586,14 @@ def run_architecture_sanity_checks(
 
     optimizer.zero_grad()
     torch.stack(losses).sum().backward()
-    encoder_gradient = (
-        policy.global_encoder[0].weight.grad
-        if isinstance(policy, PolicyNetwork)
-        else policy.bigru.weight_ih_l0.grad
-    )
+    if isinstance(policy, PolicyNetwork):
+        encoder_gradient = policy.global_encoder[0].weight.grad
+    elif isinstance(policy, BiGRUPolicyNetwork):
+        encoder_gradient = policy.bigru.weight_ih_l0.grad
+    else:
+        encoder_gradient = (
+            policy.message_layers[0].message_mlp[0].weight.grad
+        )
     required_gradients = (
         policy.node_encoder[0].weight.grad,
         encoder_gradient,
@@ -1128,6 +3622,21 @@ def run_architecture_sanity_checks(
 # ---------------------------------------------------------------------------
 
 
+def effective_maximum_kappa_per_link(
+    maximum_kappa_per_ns: float,
+    n_lasers: int,
+    normalize_incoming_coupling_by_degree: bool = False,
+) -> float:
+    """Return the physical upper bound for one directed coupling link."""
+    if maximum_kappa_per_ns <= 0.0:
+        raise ValueError("maximum_kappa_per_ns must be positive")
+    if n_lasers < 2:
+        raise ValueError("n_lasers must be at least 2")
+    if normalize_incoming_coupling_by_degree:
+        return maximum_kappa_per_ns / float(n_lasers - 1)
+    return maximum_kappa_per_ns
+
+
 def decode_action(
     actions: np.ndarray,
     maximum_kappa_per_ns: float,
@@ -1135,6 +3644,8 @@ def decode_action(
     force_symmetric_kappa: bool = False,
     force_symmetric_phi_p: bool = False,
     balanced_coupling: bool = False,
+    magnitude_gates: np.ndarray | None = None,
+    normalize_incoming_coupling_by_degree: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Decode latent actions into complete ``N x N`` coupling matrices.
 
@@ -1150,6 +3661,11 @@ def decode_action(
     Args:
         actions: Shape ``(number_of_cases, action_size_for(...))``.
         maximum_kappa_per_ns: Upper magnitude bound in inverse nanoseconds.
+        magnitude_gates: Optional hard/soft gates shaped
+            ``(number_of_cases, n_magnitude_links)``.
+        normalize_incoming_coupling_by_degree: Divide every physical edge by
+            ``n_lasers - 1`` so a receiver's maximum incoming sum remains
+            ``maximum_kappa_per_ns`` for every array size.
 
     Returns:
         ``kappa_per_ns`` and ``phi_p_rad``, each shaped
@@ -1178,9 +3694,26 @@ def decode_action(
     magnitude_logits = np.clip(
         actions[:, :n_magnitude_links], -8.0, 8.0
     )
-    link_kappa_per_ns = maximum_kappa_per_ns / (
+    maximum_kappa_per_link = effective_maximum_kappa_per_link(
+        maximum_kappa_per_ns,
+        n_lasers,
+        normalize_incoming_coupling_by_degree,
+    )
+    link_kappa_per_ns = maximum_kappa_per_link / (
         1.0 + np.exp(-magnitude_logits)
     )
+    if magnitude_gates is not None:
+        magnitude_gates = np.asarray(magnitude_gates, dtype=float)
+        if magnitude_gates.shape != link_kappa_per_ns.shape:
+            raise ValueError(
+                "magnitude_gates must have shape "
+                f"{link_kappa_per_ns.shape}, got {magnitude_gates.shape}"
+            )
+        if not np.all(np.isfinite(magnitude_gates)):
+            raise ValueError("magnitude_gates must be finite")
+        if np.any((magnitude_gates < 0.0) | (magnitude_gates > 1.0)):
+            raise ValueError("magnitude_gates must lie in [0, 1]")
+        link_kappa_per_ns *= magnitude_gates
     link_phi_p_rad = np.angle(
         np.exp(1j * actions[:, n_magnitude_links:])
     )
@@ -1528,6 +4061,247 @@ def normalized_magnitude_symmetry_penalty(
     )
 
 
+def normalized_squared_coupling_cost(
+    kappa_per_ns: np.ndarray,
+    maximum_kappa_per_ns: float,
+) -> np.ndarray:
+    """Return mean squared active coupling, normalized to ``[0, 1]``.
+
+    The zero diagonal is excluded through the ``N*(N-1)`` denominator.  A
+    disabled link contributes zero, while an active link at the per-link
+    physical cap contributes one before averaging over all possible directed
+    links.
+    """
+    kappa_per_ns = np.asarray(kappa_per_ns, dtype=float)
+    if (
+        kappa_per_ns.ndim != 3
+        or kappa_per_ns.shape[1] != kappa_per_ns.shape[2]
+    ):
+        raise ValueError("kappa_per_ns must have shape (cases, N, N)")
+    if maximum_kappa_per_ns <= 0.0:
+        raise ValueError("maximum_kappa_per_ns must be positive")
+    n_lasers = kappa_per_ns.shape[1]
+    if n_lasers < 2:
+        raise ValueError("coupling matrices must contain at least two lasers")
+    normalized = kappa_per_ns / maximum_kappa_per_ns
+    return np.sum(normalized * normalized, axis=(1, 2)) / (
+        n_lasers * (n_lasers - 1)
+    )
+
+
+def successful_sparse_reward_components(
+    phase_reward_matrix: np.ndarray,
+    active_fraction_matrix: np.ndarray,
+    coupling_cost_matrix: np.ndarray,
+    *,
+    n_lasers: int,
+    phase_threshold: float,
+    sparsity_weight: float,
+    coupling_cost_tiebreak_fraction: float,
+    phase_reference: np.ndarray | None = None,
+    phase_retention_tolerance: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Build the phase-first, links-second, coupling-cost-third reward.
+
+    ``phase_reference`` optionally replaces the fixed phase threshold with
+    one reference value per target. The maximum coupling-cost bonus is a
+    configurable fraction below one of the reward increment produced by
+    removing a single directed link. Thus coupling magnitude can break ties
+    between equally sparse eligible designs, but can never make an extra-link
+    design preferable.
+    """
+    phase_reward_matrix = np.asarray(phase_reward_matrix, dtype=float)
+    active_fraction_matrix = np.asarray(active_fraction_matrix, dtype=float)
+    coupling_cost_matrix = np.asarray(coupling_cost_matrix, dtype=float)
+    if (
+        active_fraction_matrix.shape != phase_reward_matrix.shape
+        or coupling_cost_matrix.shape != phase_reward_matrix.shape
+    ):
+        raise ValueError(
+            "phase rewards, active fractions, and coupling costs must have "
+            "matching shapes"
+        )
+    if n_lasers < 2:
+        raise ValueError("n_lasers must be at least 2")
+    if not 0.0 <= phase_threshold <= 1.0:
+        raise ValueError("phase_threshold must lie in [0, 1]")
+    if phase_retention_tolerance < 0.0:
+        raise ValueError("phase_retention_tolerance must be nonnegative")
+    if sparsity_weight < 0.0:
+        raise ValueError("sparsity_weight must be nonnegative")
+    if not 0.0 <= coupling_cost_tiebreak_fraction < 1.0:
+        raise ValueError(
+            "coupling_cost_tiebreak_fraction must lie in [0, 1)"
+        )
+
+    if phase_reference is None:
+        required_phase_reward = np.full(
+            (phase_reward_matrix.shape[0], 1), phase_threshold
+        )
+    else:
+        phase_reference = np.asarray(phase_reference, dtype=float)
+        if phase_reference.shape == (phase_reward_matrix.shape[0],):
+            phase_reference = phase_reference[:, None]
+        if phase_reference.shape != (phase_reward_matrix.shape[0], 1):
+            raise ValueError(
+                "phase_reference must have one value per target"
+            )
+        required_phase_reward = (
+            phase_reference - phase_retention_tolerance
+        )
+    successful = phase_reward_matrix >= required_phase_reward
+    sparsity_bonus = (
+        sparsity_weight
+        * successful
+        * (1.0 - active_fraction_matrix)
+    )
+    maximum_links = n_lasers * (n_lasers - 1)
+    coupling_cost_bonus = (
+        sparsity_weight
+        * coupling_cost_tiebreak_fraction
+        / float(maximum_links)
+        * successful
+        * (1.0 - np.clip(coupling_cost_matrix, 0.0, 1.0))
+    )
+    phase_or_sparse_reward = np.where(
+        successful,
+        1.0 + sparsity_bonus + coupling_cost_bonus,
+        phase_reward_matrix,
+    )
+    return (
+        phase_or_sparse_reward,
+        sparsity_bonus,
+        coupling_cost_bonus,
+        successful,
+    )
+
+
+def lexicographic_resource_rank_advantages(
+    phase_reward_matrix: np.ndarray,
+    active_fraction_matrix: np.ndarray,
+    coupling_cost_matrix: np.ndarray,
+    *,
+    phase_reference: np.ndarray,
+    phase_retention_tolerance: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return weight-free ordinal advantages for hierarchical objectives.
+
+    Every phase-eligible candidate outranks every ineligible candidate.
+    Ineligible candidates are ordered only by phase reward. Eligible
+    candidates are ordered by fewer active links, lower coupling cost, then
+    higher phase reward. Rank zero is worst and rank ``C-1`` is best.
+    """
+    phase_reward_matrix = np.asarray(phase_reward_matrix, dtype=float)
+    active_fraction_matrix = np.asarray(active_fraction_matrix, dtype=float)
+    coupling_cost_matrix = np.asarray(coupling_cost_matrix, dtype=float)
+    if phase_reward_matrix.ndim != 2 or phase_reward_matrix.shape[1] < 1:
+        raise ValueError(
+            "phase_reward_matrix must have shape (targets, candidates >= 1)"
+        )
+    if (
+        active_fraction_matrix.shape != phase_reward_matrix.shape
+        or coupling_cost_matrix.shape != phase_reward_matrix.shape
+    ):
+        raise ValueError(
+            "phase rewards, active fractions, and coupling costs must have "
+            "matching shapes"
+        )
+    phase_reference = np.asarray(phase_reference, dtype=float)
+    if phase_reference.shape == phase_reward_matrix.shape:
+        # A per-candidate dense counterpart can serve as the reference when
+        # every sparse action is obtained by pruning that same continuous
+        # kappa/phi action.
+        pass
+    elif phase_reference.shape == (phase_reward_matrix.shape[0],):
+        phase_reference = phase_reference[:, None]
+    if phase_reference.shape not in {
+        phase_reward_matrix.shape,
+        (phase_reward_matrix.shape[0], 1),
+    }:
+        raise ValueError(
+            "phase_reference must have one value per target or candidate"
+        )
+    if phase_retention_tolerance < 0.0:
+        raise ValueError("phase_retention_tolerance must be nonnegative")
+
+    eligible = phase_reward_matrix >= (
+        phase_reference - phase_retention_tolerance
+    )
+    candidate_count = phase_reward_matrix.shape[1]
+    if candidate_count == 1:
+        # Ranking is only meaningful when candidates compete.  A single
+        # inference candidate is selected directly, so give it a neutral
+        # advantage while still reporting its eligibility.
+        zeros = np.zeros_like(phase_reward_matrix, dtype=float)
+        return zeros, eligible, zeros.copy()
+
+    ranks = np.empty_like(phase_reward_matrix, dtype=float)
+    candidate_index = np.arange(candidate_count)
+    for target_index in range(phase_reward_matrix.shape[0]):
+        target_eligible = eligible[target_index]
+        # ``np.lexsort`` treats the last key as primary and sorts ascending.
+        # These keys therefore list candidates from worst to best.
+        order = np.lexsort(
+            (
+                candidate_index,
+                phase_reward_matrix[target_index],
+                np.where(
+                    target_eligible,
+                    -coupling_cost_matrix[target_index],
+                    0.0,
+                ),
+                np.where(
+                    target_eligible,
+                    -active_fraction_matrix[target_index],
+                    0.0,
+                ),
+                target_eligible.astype(np.int8),
+            )
+        )
+        ranks[target_index, order] = np.arange(candidate_count, dtype=float)
+
+    advantages = 2.0 * ranks / float(candidate_count - 1) - 1.0
+    return advantages, eligible, ranks
+
+
+def active_training_n_lasers_at(
+    iteration: int,
+    config: DesignerConfig,
+) -> tuple[int, ...]:
+    """Return the array sizes eligible for sampling at one iteration."""
+    training_sizes = tuple(config.training_n_lasers)
+    if not config.enable_array_size_curriculum:
+        return training_sizes
+
+    active_count = config.array_size_curriculum_initial_count
+    if iteration >= config.array_size_curriculum_start_iteration:
+        additions = 1 + (
+            iteration - config.array_size_curriculum_start_iteration
+        ) // config.array_size_curriculum_add_interval
+        active_count += additions
+    return training_sizes[: min(active_count, len(training_sizes))]
+
+
+def minimum_log_std_at(
+    iteration: int,
+    config: DesignerConfig,
+) -> float:
+    """Return the scheduled lower bound on policy exploration."""
+    if not config.enable_minimum_log_std_annealing:
+        return config.minimum_log_std
+    start = config.minimum_log_std_anneal_start_iteration
+    if iteration <= start:
+        return config.initial_minimum_log_std
+    duration = config.minimum_log_std_anneal_iterations
+    if duration <= 0:
+        return config.minimum_log_std
+    progress = float(np.clip((iteration - start) / duration, 0.0, 1.0))
+    return (
+        (1.0 - progress) * config.initial_minimum_log_std
+        + progress * config.minimum_log_std
+    )
+
+
 def maximum_log_std_at(
     iteration: int,
     config: DesignerConfig,
@@ -1754,6 +4528,23 @@ def simulate_target_chunk(
         ) from error
 
 
+def simulate_indexed_target_chunk(
+    indexed_work_item: tuple[int, int, int, tuple[Any, ...]],
+) -> dict[str, int | np.ndarray]:
+    """Simulate one target/candidate chunk and retain both index ranges."""
+    (
+        size_batch_index,
+        candidate_start_index,
+        candidate_stop_index,
+        work_item,
+    ) = indexed_work_item
+    result = simulate_target_chunk(work_item)
+    result["size_batch_index"] = size_batch_index
+    result["candidate_start_index"] = candidate_start_index
+    result["candidate_stop_index"] = candidate_stop_index
+    return result
+
+
 def simulate_candidates_parallel(
     targets_rad: np.ndarray,
     kappa_per_ns: np.ndarray,
@@ -1873,6 +4664,10 @@ def run_training_batch(
 ) -> dict[str, float]:
     """Run one contextual-bandit batch and update the policy once."""
     policy.train()
+    current_minimum_log_std = minimum_log_std_at(iteration, config)
+    current_maximum_log_std = maximum_log_std_at(iteration, config)
+    policy.minimum_log_std = current_minimum_log_std
+    policy.maximum_log_std = current_maximum_log_std
     targets_rad = sample_target_phases(
         config.targets_per_batch,
         rng,
@@ -1888,20 +4683,63 @@ def run_training_batch(
     )
 
     # targets/detunings: (T, M); node features: (T, M, 3)
+    active_link_counts = None
+    if config.enable_connected_edge_budgets:
+        active_link_counts = sample_active_link_counts(
+            config.targets_per_batch,
+            config.n_lasers,
+            rng,
+            iteration,
+            config,
+        )
+    elif config.enable_conditional_backbone_budget:
+        active_link_counts = sample_conditional_link_counts(
+            config.targets_per_batch,
+            config.n_lasers,
+            iteration,
+        )
     node_features = encode_for_policy(
         targets_rad,
         policy,
         config,
         detuning_distributions_ghz,
+        active_link_counts=active_link_counts,
     )
-    actions, log_probabilities = sample_coupling_designs(
-        policy, node_features, config.candidates_per_target
-    )
+    if config.enable_connected_edge_budgets:
+        actions, gates, log_probabilities = sample_connected_coupling_designs(
+            policy,
+            node_features,
+            config.candidates_per_target,
+            active_link_counts,
+        )
+    elif config.enable_learned_connected_sparsity:
+        actions, gates, log_probabilities = (
+            sample_learned_connected_coupling_designs(
+                policy,
+                node_features,
+                config.candidates_per_target,
+                include_dense_reference=(
+                    config.include_dense_reference_candidate
+                ),
+            )
+        )
+    else:
+        actions, log_probabilities = sample_coupling_designs(
+            policy, node_features, config.candidates_per_target
+        )
+        gates = None
 
     # actions: (T, C, 2*N*(N-1)) -> flattened candidate actions
     actions_numpy = actions.detach().cpu().numpy()
     action_size = policy.action_size_for(config.n_lasers)
     flat_actions = actions_numpy.reshape(-1, action_size)
+    flat_gates = (
+        None
+        if gates is None
+        else gates.detach().cpu().numpy().reshape(
+            -1, policy.link_counts(config.n_lasers)[1]
+        )
+    )
     flat_kappa_per_ns, flat_phi_p_rad = decode_action(
         flat_actions,
         config.maximum_kappa_per_ns,
@@ -1909,7 +4747,21 @@ def run_training_batch(
         config.force_symmetric_kappa,
         config.force_symmetric_phi_p,
         config.balanced_coupling,
+        magnitude_gates=flat_gates,
+        normalize_incoming_coupling_by_degree=(
+            config.normalize_incoming_coupling_by_degree
+        ),
     )
+    if config.enable_conditional_backbone_budget:
+        flat_kappa_per_ns, flat_phi_p_rad, _ = (
+            prune_coupling_batch_to_link_budget(
+                flat_kappa_per_ns,
+                flat_phi_p_rad,
+                np.repeat(
+                    active_link_counts, config.candidates_per_target
+                ),
+            )
+        )
     grouped_matrix_shape = (
         config.targets_per_batch,
         config.candidates_per_target,
@@ -1929,31 +4781,122 @@ def run_training_batch(
     phase_reward_matrix = simulation["phase_reward"]
     phase_reward = phase_reward_matrix.reshape(-1)
     magnitude_symmetry_penalty = normalized_magnitude_symmetry_penalty(
-        flat_kappa_per_ns, config.maximum_kappa_per_ns
+        flat_kappa_per_ns,
+        effective_maximum_kappa_per_link(
+            config.maximum_kappa_per_ns,
+            config.n_lasers,
+            config.normalize_incoming_coupling_by_degree,
+        ),
     )
 
     # Keep the physical objective and engineering preference visibly separate.
-    training_reward = (
-        phase_reward
-        - config.magnitude_symmetry_weight
-        * magnitude_symmetry_penalty
+    coupling_cost = normalized_squared_coupling_cost(
+        flat_kappa_per_ns,
+        effective_maximum_kappa_per_link(
+            config.maximum_kappa_per_ns,
+            config.n_lasers,
+            config.normalize_incoming_coupling_by_degree,
+        ),
     )
-
-    # Compare candidates only with candidates generated for the same target.
-    reward_matrix = training_reward.reshape(
+    coupling_cost_matrix = coupling_cost.reshape(
         config.targets_per_batch, config.candidates_per_target
     )
-    advantages = reward_matrix - reward_matrix.mean(axis=1, keepdims=True)
-    advantages /= reward_matrix.std(axis=1, keepdims=True) + 1.0e-8
-    advantages_tensor = torch.as_tensor(
-        advantages,
-        dtype=torch.float32,
-        device=log_probabilities.device,
+    sparsity_bonus_matrix = np.zeros_like(phase_reward_matrix)
+    coupling_cost_bonus_matrix = np.zeros_like(phase_reward_matrix)
+    successful = np.zeros_like(phase_reward_matrix, dtype=bool)
+    phase_or_sparse_reward = phase_reward.copy()
+    rank_advantages = None
+    if config.enable_learned_connected_sparsity:
+        active_fraction_matrix = flat_gates.reshape(
+            config.targets_per_batch,
+            config.candidates_per_target,
+            -1,
+        ).mean(axis=2)
+        phase_reference = np.max(phase_reward_matrix, axis=1)
+        if config.use_lexicographic_rank_advantages:
+            rank_advantages, successful, _ = (
+                lexicographic_resource_rank_advantages(
+                    phase_reward_matrix,
+                    active_fraction_matrix,
+                    coupling_cost_matrix,
+                    phase_reference=phase_reference,
+                    phase_retention_tolerance=(
+                        config.phase_retention_tolerance
+                    ),
+                )
+            )
+        else:
+            (
+                phase_or_sparse_reward_matrix,
+                sparsity_bonus_matrix,
+                coupling_cost_bonus_matrix,
+                successful,
+            ) = successful_sparse_reward_components(
+                phase_reward_matrix,
+                active_fraction_matrix,
+                coupling_cost_matrix,
+                n_lasers=config.n_lasers,
+                phase_threshold=config.sparsity_phase_reward_threshold,
+                sparsity_weight=config.successful_sparsity_reward_weight,
+                coupling_cost_tiebreak_fraction=(
+                    config.coupling_cost_tiebreak_fraction
+                ),
+                phase_reference=(
+                    phase_reference
+                    if config.use_relative_phase_retention
+                    else None
+                ),
+                phase_retention_tolerance=(
+                    config.phase_retention_tolerance
+                ),
+            )
+            phase_or_sparse_reward = phase_or_sparse_reward_matrix.reshape(-1)
+    else:
+        successful = (
+            phase_reward_matrix >= config.sparsity_phase_reward_threshold
+        )
+    training_reward = (
+        phase_or_sparse_reward
+        - config.magnitude_symmetry_weight * magnitude_symmetry_penalty
     )
 
-    # Minimizing this raises the probability of above-average actions and
-    # lowers the probability of below-average actions.
-    loss = -(log_probabilities * advantages_tensor).mean()
+    auxiliary_loss = None
+    if config.enable_budget_error_selector:
+        auxiliary_loss, _, _ = budget_error_selector_loss(
+            policy,
+            node_features,
+            targets_rad,
+            active_link_counts,
+            simulation["aligned_achieved_phases_rad"],
+            config.n_lasers,
+            config,
+            rng,
+        )
+
+    # Compare candidates only with candidates generated for the same target.
+    if rank_advantages is None:
+        reward_matrix = training_reward.reshape(
+            config.targets_per_batch, config.candidates_per_target
+        )
+        advantages = reward_matrix - reward_matrix.mean(
+            axis=1, keepdims=True
+        )
+        advantages /= reward_matrix.std(axis=1, keepdims=True) + 1.0e-8
+        advantages_tensor = torch.as_tensor(
+            advantages,
+            dtype=torch.float32,
+            device=log_probabilities.device,
+        )
+        loss = -(log_probabilities * advantages_tensor).mean()
+    else:
+        advantages_tensor = torch.as_tensor(
+            rank_advantages,
+            dtype=torch.float32,
+            device=log_probabilities.device,
+        )
+        loss = -(log_probabilities * advantages_tensor).mean()
+    if auxiliary_loss is not None:
+        loss = loss + auxiliary_loss
 
     optimizer.zero_grad()
     loss.backward()
@@ -1961,26 +4904,18 @@ def run_training_batch(
         policy.parameters(), config.gradient_clip
     )
     optimizer.step()
-    current_maximum_log_std = maximum_log_std_at(iteration, config)
     with torch.no_grad():
         policy.log_std_kappa.clamp_(
-            config.minimum_log_std,
+            current_minimum_log_std,
             current_maximum_log_std,
         )
         policy.log_std_phi.clamp_(
-            config.minimum_log_std,
+            current_minimum_log_std,
             current_maximum_log_std,
         )
-    mean_action_std = float(
-        torch.exp(
-            torch.stack(
-                (
-                    policy.log_std_kappa.detach(),
-                    policy.log_std_phi.detach(),
-                )
-            )
-        ).mean().cpu()
-    )
+        mean_action_std = float(
+            policy.distribution(node_features).stddev.mean().cpu()
+        )
 
     return {
         "loss": float(loss.detach().cpu()),
@@ -1989,10 +4924,790 @@ def run_training_batch(
             np.mean(magnitude_symmetry_penalty)
         ),
         "training_reward": float(np.mean(training_reward)),
+        "sparsity_bonus": float(np.mean(sparsity_bonus_matrix)),
+        "normalized_coupling_cost": float(np.mean(coupling_cost_matrix)),
+        "coupling_cost_bonus": float(
+            np.mean(coupling_cost_bonus_matrix)
+        ),
+        "phase_reference_reward": float(
+            np.mean(np.max(phase_reward_matrix, axis=1))
+        ),
+        "phase_success_fraction": float(
+            np.mean(successful)
+        ),
         "gradient_norm": float(gradient_norm.detach().cpu()),
+        "minimum_log_std": current_minimum_log_std,
         "maximum_log_std": current_maximum_log_std,
         "mean_action_std": mean_action_std,
         "n_lasers": float(config.n_lasers),
+        "active_connection_fraction": (
+            1.0
+            if flat_gates is None
+            else float(np.mean(flat_gates))
+        ),
+    }
+
+
+def combine_task_gradients_pcgrad(
+    task_gradients: torch.Tensor,
+    maximum_task_norm: float,
+    rng: np.random.Generator,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
+    """Clip, conflict-project, and average flattened task gradients.
+
+    Rows correspond to tasks (one array size here). Each row is clipped
+    independently before PCGrad so one task cannot dominate merely because
+    its raw gradient norm is much larger. PCGrad then removes only components
+    that oppose another task gradient; no array size receives a fixed weight.
+    """
+    if task_gradients.ndim != 2 or task_gradients.shape[0] < 2:
+        raise ValueError("task_gradients must have shape (tasks >= 2, values)")
+    if maximum_task_norm <= 0.0:
+        raise ValueError("maximum_task_norm must be positive")
+
+    raw_norms = torch.linalg.vector_norm(task_gradients, dim=1)
+    clip_scales = torch.clamp(
+        maximum_task_norm / torch.clamp(raw_norms, min=1.0e-15),
+        max=1.0,
+    )
+    clipped = task_gradients * clip_scales[:, None]
+    clipped_norms = torch.linalg.vector_norm(clipped, dim=1)
+    cosine_denominator = torch.clamp(
+        clipped_norms[:, None] * clipped_norms[None, :],
+        min=1.0e-15,
+    )
+    cosine = torch.clamp(
+        (clipped @ clipped.T) / cosine_denominator,
+        -1.0,
+        1.0,
+    )
+
+    projected = clipped.clone()
+    task_count = clipped.shape[0]
+    for task_index in range(task_count):
+        for other_index_value in rng.permutation(task_count):
+            other_index = int(other_index_value)
+            if other_index == task_index:
+                continue
+            other_gradient = clipped[other_index]
+            dot_product = torch.dot(projected[task_index], other_gradient)
+            if float(dot_product.detach().cpu()) < 0.0:
+                other_squared_norm = torch.dot(
+                    other_gradient, other_gradient
+                ).clamp_min(1.0e-15)
+                projected[task_index] = (
+                    projected[task_index]
+                    - dot_product / other_squared_norm * other_gradient
+                )
+
+    upper_triangle = torch.triu_indices(
+        task_count,
+        task_count,
+        offset=1,
+        device=task_gradients.device,
+    )
+    pairwise_cosines = cosine[
+        upper_triangle[0], upper_triangle[1]
+    ]
+    diagnostics: dict[str, torch.Tensor | float] = {
+        "raw_task_norms": raw_norms,
+        "clipped_task_norms": clipped_norms,
+        "gradient_cosine_matrix": cosine,
+        "negative_gradient_pair_fraction": float(
+            torch.mean((pairwise_cosines < 0.0).to(torch.float32)).cpu()
+        ),
+        "mean_gradient_cosine": float(pairwise_cosines.mean().cpu()),
+    }
+    return projected.mean(dim=0), diagnostics
+
+
+def run_multisize_training_batch(
+    policy: PolicyNetwork,
+    optimizer: torch.optim.Optimizer,
+    config: DesignerConfig,
+    rng: np.random.Generator,
+    iteration: int,
+    *,
+    simulation_pool: Any | None = None,
+) -> dict[str, Any]:
+    """Update once from a fixed total of targets spread across array sizes.
+
+    The cyclic schedule is balanced over successive iterations. With 14
+    targets and sizes M=2,...,10, every update contains every size once and
+    five sizes receive one rotating extra target. Each target's candidates
+    are split into small vectorized worker tasks for dynamic load balancing.
+    """
+    policy.train()
+    current_minimum_log_std = minimum_log_std_at(iteration, config)
+    current_maximum_log_std = maximum_log_std_at(iteration, config)
+    policy.minimum_log_std = current_minimum_log_std
+    policy.maximum_log_std = current_maximum_log_std
+    training_sizes = tuple(config.training_n_lasers)
+    size_count = len(training_sizes)
+    schedule_offset = (iteration * config.targets_per_batch) % size_count
+    target_sizes = [
+        training_sizes[(schedule_offset + index) % size_count]
+        for index in range(config.targets_per_batch)
+    ]
+    target_counts = {
+        n_lasers: target_sizes.count(n_lasers)
+        for n_lasers in training_sizes
+        if n_lasers in target_sizes
+    }
+    prepared_batches: list[dict[str, Any]] = []
+    indexed_work_items: list[tuple[int, int, int, tuple[Any, ...]]] = []
+
+    for size_batch_index, (n_lasers, target_count) in enumerate(
+        target_counts.items()
+    ):
+        size_config = replace(config, n_lasers=n_lasers)
+        targets_rad = sample_target_phases(
+            target_count,
+            rng,
+            n_lasers,
+            config.structured_target_fraction,
+            config.structured_target_jitter_rad,
+        )
+        detuning_distributions_ghz = sample_detuning_distributions(
+            target_count,
+            rng,
+            size_config,
+            iteration=iteration,
+        )
+        targets_rad, detuning_distributions_ghz = sort_by_detuning(
+            targets_rad, detuning_distributions_ghz
+        )
+        active_link_counts = None
+        active_link_count_matrix = None
+        deterministic_candidate_mask = None
+        reinforce_candidate_mask = None
+        if config.enable_connected_edge_budgets:
+            active_link_counts = sample_active_link_counts(
+                target_count, n_lasers, rng, iteration, size_config
+            )
+        elif config.enable_budget_error_selector:
+            active_link_count_matrix = sample_multibudget_candidate_counts(
+                target_count,
+                config.candidates_per_target,
+                n_lasers,
+                config.selector_budget_levels_per_target,
+                rng,
+                iteration,
+            )
+            if config.selector_use_deterministic_max_error:
+                deterministic_candidate_mask = (
+                    deterministic_budget_candidate_mask(
+                        active_link_count_matrix
+                    )
+                )
+                reinforce_candidate_mask = ~deterministic_candidate_mask
+        elif config.enable_conditional_backbone_budget:
+            active_link_counts = sample_conditional_link_counts(
+                target_count,
+                n_lasers,
+                iteration,
+            )
+        context_link_counts = active_link_counts
+        if active_link_count_matrix is not None:
+            context_link_counts = np.full(
+                target_count,
+                n_lasers * (n_lasers - 1),
+                dtype=np.int64,
+            )
+        node_features = encode_for_policy(
+            targets_rad,
+            policy,
+            size_config,
+            detuning_distributions_ghz,
+            active_link_counts=context_link_counts,
+        )
+        action_node_features = node_features
+        if active_link_count_matrix is not None:
+            repeated_targets = np.repeat(
+                targets_rad, config.candidates_per_target, axis=0
+            )
+            repeated_detunings = np.repeat(
+                detuning_distributions_ghz,
+                config.candidates_per_target,
+                axis=0,
+            )
+            action_node_features = encode_for_policy(
+                repeated_targets,
+                policy,
+                size_config,
+                repeated_detunings,
+                active_link_counts=active_link_count_matrix.reshape(-1),
+            )
+            action_distribution = policy.distribution(action_node_features)
+            sampled_actions = action_distribution.sample()
+            if deterministic_candidate_mask is not None:
+                flat_deterministic_mask = torch.as_tensor(
+                    deterministic_candidate_mask.reshape(-1),
+                    dtype=torch.bool,
+                    device=sampled_actions.device,
+                )
+                sampled_actions = sampled_actions.clone()
+                sampled_actions[flat_deterministic_mask] = (
+                    action_distribution.mean[flat_deterministic_mask]
+                )
+            actions = sampled_actions.reshape(
+                target_count,
+                config.candidates_per_target,
+                policy.action_size_for(n_lasers),
+            )
+            log_probabilities = action_distribution.log_prob(
+                sampled_actions.detach()
+            ).mean(dim=1).reshape(
+                target_count, config.candidates_per_target
+            )
+            gates = None
+        elif config.enable_connected_edge_budgets:
+            actions, gates, log_probabilities = (
+                sample_connected_coupling_designs(
+                    policy,
+                    node_features,
+                    config.candidates_per_target,
+                    active_link_counts,
+                )
+            )
+        elif config.enable_learned_connected_sparsity:
+            actions, gates, log_probabilities = (
+                sample_learned_connected_coupling_designs(
+                    policy,
+                    node_features,
+                    config.candidates_per_target,
+                    include_dense_reference=(
+                        config.include_dense_reference_candidate
+                    ),
+                )
+            )
+        elif config.enable_learned_backbone_density:
+            actions, sampled_rho, log_probabilities = (
+                sample_coupling_designs_with_backbone_density(
+                    policy,
+                    node_features,
+                    config.candidates_per_target,
+                )
+            )
+            gates = None
+        else:
+            actions, log_probabilities = sample_coupling_designs(
+                policy, node_features, config.candidates_per_target
+            )
+            gates = None
+        actions_numpy = actions.detach().cpu().numpy()
+        action_size = policy.action_size_for(n_lasers)
+        flat_actions = actions_numpy.reshape(-1, action_size)
+        flat_gates = (
+            None
+            if gates is None
+            else gates.detach().cpu().numpy().reshape(
+                -1, policy.link_counts(n_lasers)[1]
+            )
+        )
+        flat_kappa_per_ns, flat_phi_p_rad = decode_action(
+            flat_actions,
+            config.maximum_kappa_per_ns,
+            n_lasers,
+            config.force_symmetric_kappa,
+            config.force_symmetric_phi_p,
+            config.balanced_coupling,
+            magnitude_gates=flat_gates,
+            normalize_incoming_coupling_by_degree=(
+                config.normalize_incoming_coupling_by_degree
+            ),
+        )
+        realized_rho = None
+        if config.enable_learned_backbone_density:
+            flat_kappa_per_ns, flat_phi_p_rad, realized_rho = (
+                prune_coupling_batch_to_backbone(
+                    flat_kappa_per_ns,
+                    flat_phi_p_rad,
+                    sampled_rho.detach().cpu().numpy().reshape(-1),
+                )
+            )
+        elif config.enable_conditional_backbone_budget:
+            candidate_link_counts = (
+                active_link_count_matrix.reshape(-1)
+                if active_link_count_matrix is not None
+                else np.repeat(
+                    active_link_counts, config.candidates_per_target
+                )
+            )
+            flat_kappa_per_ns, flat_phi_p_rad, realized_rho = (
+                prune_coupling_batch_to_link_budget(
+                    flat_kappa_per_ns,
+                    flat_phi_p_rad,
+                    candidate_link_counts,
+                )
+            )
+        grouped_shape = (
+            target_count,
+            config.candidates_per_target,
+            n_lasers,
+            n_lasers,
+        )
+        grouped_kappa_per_ns = flat_kappa_per_ns.reshape(grouped_shape)
+        grouped_phi_p_rad = flat_phi_p_rad.reshape(grouped_shape)
+        candidate_chunk_size = min(
+            config.candidates_per_worker_task,
+            config.candidates_per_target,
+        )
+        for candidate_start in range(
+            0, config.candidates_per_target, candidate_chunk_size
+        ):
+            candidate_stop = min(
+                candidate_start + candidate_chunk_size,
+                config.candidates_per_target,
+            )
+            work_items = split_simulation_batch(
+                targets_rad,
+                grouped_kappa_per_ns[:, candidate_start:candidate_stop],
+                grouped_phi_p_rad[:, candidate_start:candidate_stop],
+                size_config,
+                detuning_distributions_ghz=detuning_distributions_ghz,
+                n_jobs=target_count,
+            )
+            indexed_work_items.extend(
+                (
+                    size_batch_index,
+                    candidate_start,
+                    candidate_stop,
+                    work_item,
+                )
+                for work_item in work_items
+            )
+        prepared_batches.append(
+            {
+                "n_lasers": n_lasers,
+                "target_count": target_count,
+                "config": size_config,
+                "targets_rad": targets_rad,
+                "node_features": node_features,
+                "active_link_counts": (
+                    active_link_count_matrix
+                    if active_link_count_matrix is not None
+                    else active_link_counts
+                ),
+                "deterministic_candidate_mask": (
+                    deterministic_candidate_mask
+                ),
+                "reinforce_candidate_mask": reinforce_candidate_mask,
+                "log_probabilities": log_probabilities,
+                "flat_kappa_per_ns": flat_kappa_per_ns,
+                "flat_gates": flat_gates,
+                "realized_rho": realized_rho,
+                "active_connection_fraction": (
+                    1.0
+                    if flat_gates is None
+                    else float(np.mean(flat_gates))
+                ),
+                "chunk_results": [],
+                "mean_action_std": float(
+                    policy.distribution(action_node_features).stddev.mean()
+                    .detach().cpu()
+                ),
+            }
+        )
+
+    # Start the expensive large-M chunks first. Shorter small-M chunks then
+    # fill gaps near the end instead of leaving one large-array straggler.
+    indexed_work_items.sort(
+        key=lambda item: prepared_batches[item[0]]["n_lasers"],
+        reverse=True,
+    )
+
+    if config.n_jobs == 1:
+        chunk_results = [
+            simulate_indexed_target_chunk(item)
+            for item in indexed_work_items
+        ]
+    elif simulation_pool is not None:
+        chunk_results = list(
+            simulation_pool.imap_unordered(
+                simulate_indexed_target_chunk, indexed_work_items
+            )
+        )
+    else:
+        spawn_context = mp.get_context("spawn")
+        temporary_pool = spawn_context.Pool(
+            processes=min(config.n_jobs, len(indexed_work_items)),
+            initializer=_initialize_simulation_worker,
+        )
+        try:
+            chunk_results = list(
+                temporary_pool.imap_unordered(
+                    simulate_indexed_target_chunk, indexed_work_items
+                )
+            )
+        finally:
+            temporary_pool.close()
+            temporary_pool.join()
+
+    for result in chunk_results:
+        prepared_batches[int(result["size_batch_index"])][
+            "chunk_results"
+        ].append(result)
+
+    losses = []
+    size_metrics: dict[int, dict[str, float]] = {}
+    for prepared in prepared_batches:
+        phase_reward_matrix = np.empty(
+            (prepared["target_count"], config.candidates_per_target),
+            dtype=float,
+        )
+        candidate_coverage = np.zeros(
+            (prepared["target_count"], config.candidates_per_target),
+            dtype=int,
+        )
+        aligned_phase_matrix = None
+        if config.enable_budget_error_selector:
+            aligned_phase_matrix = np.empty(
+                (
+                    prepared["target_count"],
+                    config.candidates_per_target,
+                    prepared["n_lasers"],
+                ),
+                dtype=float,
+            )
+        for result in prepared["chunk_results"]:
+            start_index = int(result["start_index"])
+            stop_index = int(result["stop_index"])
+            candidate_start = int(result["candidate_start_index"])
+            candidate_stop = int(result["candidate_stop_index"])
+            phase_reward_matrix[
+                start_index:stop_index, candidate_start:candidate_stop
+            ] = result["phase_reward"]
+            if aligned_phase_matrix is not None:
+                aligned_phase_matrix[
+                    start_index:stop_index,
+                    candidate_start:candidate_stop,
+                ] = result["aligned_achieved_phases_rad"]
+            candidate_coverage[
+                start_index:stop_index, candidate_start:candidate_stop
+            ] += 1
+        if not np.all(candidate_coverage == 1):
+            raise RuntimeError(
+                "multi-size simulation did not return every candidate exactly "
+                f"once for M={prepared['n_lasers']}"
+            )
+
+        phase_reward = phase_reward_matrix.reshape(-1)
+        symmetry_penalty = normalized_magnitude_symmetry_penalty(
+            prepared["flat_kappa_per_ns"],
+            effective_maximum_kappa_per_link(
+                config.maximum_kappa_per_ns,
+                prepared["n_lasers"],
+                config.normalize_incoming_coupling_by_degree,
+            ),
+        )
+        coupling_cost = normalized_squared_coupling_cost(
+            prepared["flat_kappa_per_ns"],
+            effective_maximum_kappa_per_link(
+                config.maximum_kappa_per_ns,
+                prepared["n_lasers"],
+                config.normalize_incoming_coupling_by_degree,
+            ),
+        )
+        coupling_cost_matrix = coupling_cost.reshape(
+            prepared["target_count"], config.candidates_per_target
+        )
+        sparsity_bonus_matrix = np.zeros_like(phase_reward_matrix)
+        coupling_cost_bonus_matrix = np.zeros_like(phase_reward_matrix)
+        successful = np.zeros_like(phase_reward_matrix, dtype=bool)
+        phase_or_sparse_reward = phase_reward.copy()
+        rank_advantages = None
+        if config.enable_learned_backbone_density:
+            active_fraction_matrix = prepared["realized_rho"].reshape(
+                prepared["target_count"], config.candidates_per_target
+            )
+            rank_advantages, successful, _ = (
+                lexicographic_resource_rank_advantages(
+                    phase_reward_matrix,
+                    active_fraction_matrix,
+                    coupling_cost_matrix,
+                    phase_reference=np.max(phase_reward_matrix, axis=1),
+                    phase_retention_tolerance=config.phase_retention_tolerance,
+                )
+            )
+            phase_or_sparse_reward = phase_reward.copy()
+        elif config.enable_learned_connected_sparsity:
+            active_fraction_matrix = prepared[
+                "flat_gates"
+            ].reshape(
+                prepared["target_count"],
+                config.candidates_per_target,
+                -1,
+            ).mean(axis=2)
+            phase_reference = np.max(phase_reward_matrix, axis=1)
+            if config.use_lexicographic_rank_advantages:
+                rank_advantages, successful, _ = (
+                    lexicographic_resource_rank_advantages(
+                        phase_reward_matrix,
+                        active_fraction_matrix,
+                        coupling_cost_matrix,
+                        phase_reference=phase_reference,
+                        phase_retention_tolerance=(
+                            config.phase_retention_tolerance
+                        ),
+                    )
+                )
+            else:
+                (
+                    phase_or_sparse_reward_matrix,
+                    sparsity_bonus_matrix,
+                    coupling_cost_bonus_matrix,
+                    successful,
+                ) = successful_sparse_reward_components(
+                    phase_reward_matrix,
+                    active_fraction_matrix,
+                    coupling_cost_matrix,
+                    n_lasers=prepared["n_lasers"],
+                    phase_threshold=config.sparsity_phase_reward_threshold,
+                    sparsity_weight=config.successful_sparsity_reward_weight,
+                    coupling_cost_tiebreak_fraction=(
+                        config.coupling_cost_tiebreak_fraction
+                    ),
+                    phase_reference=(
+                        phase_reference
+                        if config.use_relative_phase_retention
+                        else None
+                    ),
+                    phase_retention_tolerance=(
+                        config.phase_retention_tolerance
+                    ),
+                )
+                phase_or_sparse_reward = (
+                    phase_or_sparse_reward_matrix.reshape(-1)
+                )
+        else:
+            successful = (
+                phase_reward_matrix
+                >= config.sparsity_phase_reward_threshold
+            )
+        training_reward = (
+            phase_or_sparse_reward
+            - config.magnitude_symmetry_weight * symmetry_penalty
+        )
+        auxiliary_loss = None
+        error_prediction_mae_deg = float("nan")
+        selector_budget_mae = float("nan")
+        if config.enable_budget_error_selector:
+            (
+                auxiliary_loss,
+                error_prediction_mae_deg,
+                selector_budget_mae,
+            ) = budget_error_selector_loss(
+                policy,
+                prepared["node_features"],
+                prepared["targets_rad"],
+                prepared["active_link_counts"],
+                aligned_phase_matrix,
+                prepared["n_lasers"],
+                config,
+                rng,
+                deterministic_candidate_mask=prepared[
+                    "deterministic_candidate_mask"
+                ],
+            )
+        if rank_advantages is None:
+            reward_matrix = training_reward.reshape(
+                prepared["target_count"], config.candidates_per_target
+            )
+            if config.enable_budget_error_selector:
+                advantages = budget_group_standardized_advantages(
+                    reward_matrix,
+                    prepared["active_link_counts"],
+                    candidate_mask=prepared["reinforce_candidate_mask"],
+                )
+            else:
+                advantages = reward_matrix - reward_matrix.mean(
+                    axis=1, keepdims=True
+                )
+                advantages /= (
+                    reward_matrix.std(axis=1, keepdims=True) + 1.0e-8
+                )
+            advantages_tensor = torch.as_tensor(
+                advantages,
+                dtype=torch.float32,
+                device=prepared["log_probabilities"].device,
+            )
+            reinforce_candidate_mask = prepared[
+                "reinforce_candidate_mask"
+            ]
+            if reinforce_candidate_mask is None:
+                size_loss = -(
+                    prepared["log_probabilities"] * advantages_tensor
+                ).mean()
+            else:
+                reinforce_mask_tensor = torch.as_tensor(
+                    reinforce_candidate_mask,
+                    dtype=torch.bool,
+                    device=prepared["log_probabilities"].device,
+                )
+                size_loss = -(
+                    prepared["log_probabilities"][reinforce_mask_tensor]
+                    * advantages_tensor[reinforce_mask_tensor]
+                ).mean()
+        else:
+            advantages_tensor = torch.as_tensor(
+                rank_advantages,
+                dtype=torch.float32,
+                device=prepared["log_probabilities"].device,
+            )
+            size_loss = -(
+                prepared["log_probabilities"] * advantages_tensor
+            ).mean()
+        if auxiliary_loss is not None:
+            size_loss = size_loss + auxiliary_loss
+        losses.append(size_loss)
+        size_metrics[int(prepared["n_lasers"])] = {
+            "phase_reward": float(np.mean(phase_reward)),
+            "training_reward": float(np.mean(training_reward)),
+            "sparsity_bonus": float(np.mean(sparsity_bonus_matrix)),
+            "normalized_coupling_cost": float(
+                np.mean(coupling_cost_matrix)
+            ),
+            "coupling_cost_bonus": float(
+                np.mean(coupling_cost_bonus_matrix)
+            ),
+            "phase_reference_reward": float(
+                np.mean(np.max(phase_reward_matrix, axis=1))
+            ),
+            "phase_success_fraction": float(
+                np.mean(successful)
+            ),
+            "magnitude_symmetry_penalty": float(
+                np.mean(symmetry_penalty)
+            ),
+            "loss": float(size_loss.detach().cpu()),
+            "mean_action_std": prepared["mean_action_std"],
+            "active_connection_fraction": prepared[
+                "active_connection_fraction"
+            ],
+            "error_prediction_mae_deg": error_prediction_mae_deg,
+            "selector_budget_mae": selector_budget_mae,
+        }
+        if prepared["realized_rho"] is not None:
+            size_metrics[int(prepared["n_lasers"])][
+                "active_connection_fraction"
+            ] = float(np.mean(prepared["realized_rho"]))
+
+    # Every array size contributes one equally weighted scalar loss. The
+    # optional PCGrad path changes only the gradient-combination rule, not
+    # the per-size REINFORCE objectives above.
+    loss = torch.stack(losses).mean()
+    optimizer.zero_grad(set_to_none=True)
+    gradient_diagnostics: dict[str, torch.Tensor | float] = {
+        "negative_gradient_pair_fraction": float("nan"),
+        "mean_gradient_cosine": float("nan"),
+    }
+    if config.gradient_combination_mode == "pcgrad":
+        parameters = [
+            parameter
+            for parameter in policy.parameters()
+            if parameter.requires_grad
+        ]
+        flattened_task_gradients = []
+        for size_loss in losses:
+            task_gradient = torch.autograd.grad(
+                size_loss,
+                parameters,
+                allow_unused=True,
+            )
+            flattened_task_gradients.append(
+                torch.cat(
+                    [
+                        torch.zeros_like(parameter).reshape(-1)
+                        if gradient is None
+                        else gradient.detach().reshape(-1)
+                        for parameter, gradient in zip(
+                            parameters, task_gradient
+                        )
+                    ]
+                )
+            )
+        combined_gradient, gradient_diagnostics = (
+            combine_task_gradients_pcgrad(
+                torch.stack(flattened_task_gradients),
+                config.per_size_gradient_clip,
+                rng,
+            )
+        )
+        offset = 0
+        for parameter in parameters:
+            parameter_size = parameter.numel()
+            parameter.grad = combined_gradient[
+                offset : offset + parameter_size
+            ].reshape_as(parameter).clone()
+            offset += parameter_size
+        raw_task_norms = gradient_diagnostics["raw_task_norms"]
+        clipped_task_norms = gradient_diagnostics["clipped_task_norms"]
+        if not isinstance(raw_task_norms, torch.Tensor):
+            raise RuntimeError("PCGrad did not return task gradient norms")
+        if not isinstance(clipped_task_norms, torch.Tensor):
+            raise RuntimeError("PCGrad did not return clipped gradient norms")
+        for index, prepared in enumerate(prepared_batches):
+            metrics = size_metrics[int(prepared["n_lasers"])]
+            metrics["raw_gradient_norm"] = float(
+                raw_task_norms[index].cpu()
+            )
+            metrics["clipped_gradient_norm"] = float(
+                clipped_task_norms[index].cpu()
+            )
+    else:
+        loss.backward()
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        policy.parameters(), config.gradient_clip
+    )
+    optimizer.step()
+    with torch.no_grad():
+        policy.log_std_kappa.clamp_(
+            current_minimum_log_std, current_maximum_log_std
+        )
+        policy.log_std_phi.clamp_(
+            current_minimum_log_std, current_maximum_log_std
+        )
+        if config.enable_learned_backbone_density:
+            policy.backbone_density_log_std.clamp_(
+                current_minimum_log_std, current_maximum_log_std
+            )
+
+    def mean_size_metric(name: str) -> float:
+        return float(np.mean([values[name] for values in size_metrics.values()]))
+
+    return {
+        "loss": float(loss.detach().cpu()),
+        "phase_reward": mean_size_metric("phase_reward"),
+        "training_reward": mean_size_metric("training_reward"),
+        "sparsity_bonus": mean_size_metric("sparsity_bonus"),
+        "normalized_coupling_cost": mean_size_metric(
+            "normalized_coupling_cost"
+        ),
+        "coupling_cost_bonus": mean_size_metric("coupling_cost_bonus"),
+        "phase_reference_reward": mean_size_metric(
+            "phase_reference_reward"
+        ),
+        "phase_success_fraction": mean_size_metric(
+            "phase_success_fraction"
+        ),
+        "magnitude_symmetry_penalty": mean_size_metric(
+            "magnitude_symmetry_penalty"
+        ),
+        "gradient_norm": float(gradient_norm.detach().cpu()),
+        "minimum_log_std": current_minimum_log_std,
+        "maximum_log_std": current_maximum_log_std,
+        "mean_action_std": mean_size_metric("mean_action_std"),
+        "active_connection_fraction": mean_size_metric(
+            "active_connection_fraction"
+        ),
+        "size_metrics": size_metrics,
+        "negative_gradient_pair_fraction": float(
+            gradient_diagnostics["negative_gradient_pair_fraction"]
+        ),
+        "mean_gradient_cosine": float(
+            gradient_diagnostics["mean_gradient_cosine"]
+        ),
     }
 
 
@@ -2007,9 +5722,15 @@ def evaluate_policy(
     config: DesignerConfig,
     *,
     detuning_distributions_ghz: np.ndarray | None = None,
+    active_link_counts: np.ndarray | int | None = None,
     simulation_pool: Any | None = None,
 ) -> dict[str, np.ndarray]:
-    """Simulate the deterministic policy mean for explicit conditions."""
+    """Simulate the deterministic policy mean for explicit conditions.
+
+    Connected-budget policies default to the maximally sparse connected
+    budget ``M-1``. Pass an explicit scalar or per-target vector to evaluate
+    another exact link count.
+    """
     targets = np.asarray(target_phases_rad, dtype=float)
     if targets.ndim == 1:
         targets = targets[None, :]
@@ -2044,6 +5765,34 @@ def evaluate_policy(
     targets, detuning_distributions_ghz = sort_by_detuning(
         targets, detuning_distributions_ghz
     )
+    if (
+        config.enable_connected_edge_budgets
+        or config.enable_conditional_backbone_budget
+    ):
+        if active_link_counts is None:
+            default_count = (
+                config.n_lasers - 1
+                if config.enable_connected_edge_budgets
+                else config.n_lasers * (config.n_lasers - 1)
+            )
+            active_link_counts_array = np.full(
+                len(targets), default_count, dtype=np.int64
+            )
+        else:
+            active_link_counts_array = np.asarray(
+                active_link_counts, dtype=np.int64
+            )
+            if active_link_counts_array.ndim == 0:
+                active_link_counts_array = np.full(
+                    len(targets), int(active_link_counts_array), dtype=np.int64
+                )
+            if active_link_counts_array.shape != (len(targets),):
+                raise ValueError(
+                    "active_link_counts must be scalar or have one value "
+                    "per target"
+                )
+    else:
+        active_link_counts_array = None
 
     policy.eval()
     with torch.no_grad():
@@ -2052,8 +5801,41 @@ def evaluate_policy(
             policy,
             config,
             detuning_distributions_ghz,
+            active_link_counts=active_link_counts_array,
         )
         actions = policy(encoded).detach().cpu().numpy()
+        predicted_rho = None
+        if config.enable_learned_backbone_density:
+            predicted_rho = torch.sigmoid(
+                policy.backbone_density_distribution(encoded).mean
+            ).detach().cpu().numpy().reshape(-1)
+        if getattr(policy, "enable_sparse_gates", False):
+            gate_distribution = policy.gate_distribution(encoded)
+            gate_probabilities = (
+                gate_distribution.probs.detach().cpu().numpy()
+            )
+            if config.enable_connected_edge_budgets:
+                magnitude_gates = deterministic_connected_gates(
+                    gate_distribution.logits.detach().cpu().numpy(),
+                    active_link_counts_array,
+                    config.n_lasers,
+                )
+            elif config.enable_learned_connected_sparsity:
+                magnitude_gates = deterministic_learned_connected_gates(
+                    gate_distribution.logits.detach().cpu().numpy(),
+                    config.n_lasers,
+                    config.gate_probability_threshold,
+                )
+            else:
+                magnitude_gates = (
+                    policy.deterministic_gates(encoded).detach().cpu().numpy()
+                )
+        else:
+            _, n_magnitude_links, _ = policy.link_counts(config.n_lasers)
+            gate_probabilities = np.ones(
+                (len(targets), n_magnitude_links), dtype=float
+            )
+            magnitude_gates = gate_probabilities.copy()
     kappa_per_ns, phi_p_rad = decode_action(
         actions,
         config.maximum_kappa_per_ns,
@@ -2061,7 +5843,32 @@ def evaluate_policy(
         config.force_symmetric_kappa,
         config.force_symmetric_phi_p,
         config.balanced_coupling,
+        magnitude_gates=magnitude_gates,
+        normalize_incoming_coupling_by_degree=(
+            config.normalize_incoming_coupling_by_degree
+        ),
     )
+    if config.enable_conditional_backbone_budget:
+        kappa_per_ns, phi_p_rad, conditional_rho = (
+            prune_coupling_batch_to_link_budget(
+                kappa_per_ns,
+                phi_p_rad,
+                active_link_counts_array,
+            )
+        )
+        predicted_rho = conditional_rho
+        receivers, sources = directed_link_indices(config.n_lasers)
+        magnitude_gates = (
+            kappa_per_ns[:, receivers, sources] > 0.0
+        ).astype(float)
+    elif predicted_rho is not None:
+        kappa_per_ns, phi_p_rad, predicted_rho = (
+            prune_coupling_batch_to_backbone(
+                kappa_per_ns, phi_p_rad, predicted_rho
+            )
+        )
+        receivers, sources = directed_link_indices(config.n_lasers)
+        magnitude_gates = (kappa_per_ns[:, receivers, sources] > 0.0).astype(float)
     simulation = simulate_candidates_parallel(
         targets,
         kappa_per_ns[:, None, :, :],
@@ -2076,6 +5883,33 @@ def evaluate_policy(
         "actions": actions,
         "kappa_per_ns": kappa_per_ns,
         "phi_p_rad": phi_p_rad,
+        "gate_probabilities": gate_probabilities,
+        "magnitude_gates": magnitude_gates,
+        "predicted_rho": predicted_rho,
+        "active_link_counts": np.sum(magnitude_gates, axis=1).astype(int),
+        "normalized_coupling_budget": np.sum(
+            kappa_per_ns, axis=(1, 2)
+        )
+        / (
+            config.n_lasers
+            * (config.n_lasers - 1)
+            * effective_maximum_kappa_per_link(
+                config.maximum_kappa_per_ns,
+                config.n_lasers,
+                config.normalize_incoming_coupling_by_degree,
+            )
+        ),
+        "normalized_squared_coupling_cost": (
+            normalized_squared_coupling_cost(
+                kappa_per_ns,
+                effective_maximum_kappa_per_link(
+                    config.maximum_kappa_per_ns,
+                    config.n_lasers,
+                    config.normalize_incoming_coupling_by_degree,
+                ),
+            )
+        ),
+        "active_connection_fraction": np.mean(magnitude_gates, axis=1),
         "phase_reward": simulation["phase_reward"][:, 0],
         "mean_phase_score": simulation["mean_phase_score"][:, 0],
         "worst_phase_score": simulation["worst_phase_score"][:, 0],
@@ -2107,11 +5941,53 @@ def update_training_figure(
 ) -> None:
     """Update the two essential learning curves."""
     axes[0].clear()
-    axes[0].plot(history["training_reward"], label="total reward")
+    rank_mode = history.get("uses_lexicographic_rank_advantages", False)
+    rho_mode = history.get("uses_learned_backbone_density", False)
+    selector_mode = history.get("uses_budget_error_selector", False)
+    if selector_mode:
+        axes[0].plot(history["training_reward"], label="mean phase reward")
+        axes[0].plot(
+            history.get("normalized_sparsity_score", []),
+            color="tab:green",
+            linewidth=2.0,
+            linestyle="--",
+            label="normalized sparsity score",
+        )
+    elif rho_mode:
+        axes[0].plot(history["phase_reward"], label="mean phase reward")
+        axes[0].plot(
+            history.get("active_connection_fraction", []),
+            color="tab:green",
+            linewidth=2.0,
+            linestyle="--",
+            label=r"mean realized $\rho$",
+        )
+    elif rank_mode:
+        axes[0].plot(history["phase_reward"], label="mean sampled phase")
+        axes[0].plot(
+            history["phase_reference_reward"],
+            label="best sampled phase per target",
+        )
+    else:
+        axes[0].plot(history["training_reward"], label="total reward")
     axes[0].set(
-        title="REINFORCE training",
+        title=(
+            "REINFORCE phase + sparsity training"
+            if selector_mode
+            else "REINFORCE phase + sparsity training"
+            if rho_mode
+            else "REINFORCE lexicographic-rank training"
+            if rank_mode
+            else "REINFORCE training"
+        ),
         xlabel="iteration",
-        ylabel="mean total reward",
+        ylabel=(
+            "mean phase reward / normalized sparsity score"
+            if selector_mode
+            else "mean phase reward / retained-link fraction"
+            if (rank_mode or rho_mode)
+            else "mean total reward"
+        ),
         ylim=(0.0, 1.0),
     )
     axes[0].legend(loc="lower left")
@@ -2126,8 +6002,18 @@ def update_training_figure(
         linewidth=2.0,
         label="overall",
     )
+    validation_title = "Fixed held-out targets by array size"
+    validation_spans = history.get("validation_detuning_span_ghz", [])
+    if (
+        history.get("validation_follows_detuning_curriculum", False)
+        and validation_spans
+    ):
+        validation_title = (
+            "Held-out targets at current detuning span "
+            f"($D_{{\\max}}={validation_spans[-1]:.2f}$ GHz)"
+        )
     axes[1].set(
-        title="Fixed held-out targets by array size",
+        title=validation_title,
         xlabel="iteration",
         ylabel="mean phase reward",
         ylim=(0.0, 1.0),
@@ -2146,7 +6032,7 @@ def train_reinforce(
     *,
     live_plot: bool = True,
 ) -> tuple[PolicyNetwork, torch.optim.Optimizer, dict[str, Any]]:
-    """Train one policy while uniformly alternating array sizes."""
+    """Train one policy using one randomly selected array size per update."""
     rng = set_random_seed(config.random_seed)
     device = torch.device(config.device)
     policy = make_policy(config).to(device) if policy is None else policy
@@ -2157,6 +6043,10 @@ def train_reinforce(
     )
     for parameter_group in optimizer.param_groups:
         parameter_group["lr"] = config.learning_rate
+    # Generate held-out targets and full-span detuning templates once. When
+    # curriculum-following validation is selected, only the physical scale of
+    # each template changes; the phase targets, span quantiles, and relative
+    # positions of the lasers remain fixed.
     held_out_sets: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     for n_lasers in config.training_n_lasers:
         size_config = replace(config, n_lasers=n_lasers)
@@ -2181,13 +6071,38 @@ def train_reinforce(
         "n_lasers": [],
         "phase_reward": [],
         "training_reward": [],
+        "sparsity_bonus": [],
+        "normalized_coupling_cost": [],
+        "coupling_cost_bonus": [],
+        "phase_reference_reward": [],
+        "phase_success_fraction": [],
         "magnitude_symmetry_penalty": [],
         "loss": [],
         "gradient_norm": [],
+        "minimum_log_std": [],
         "maximum_log_std": [],
         "mean_action_std": [],
+        "active_connection_fraction": [],
+        "negative_gradient_pair_fraction": [],
+        "mean_gradient_cosine": [],
+        "uses_lexicographic_rank_advantages": (
+            config.use_lexicographic_rank_advantages
+        ),
+        "uses_learned_backbone_density": (
+            config.enable_learned_backbone_density
+        ),
+        "uses_budget_error_selector": config.enable_budget_error_selector,
+        "normalized_sparsity_score": [],
+        "validation_follows_detuning_curriculum": (
+            config.validation_follows_detuning_curriculum
+        ),
+        "validation_detuning_span_ghz": [],
         "held_out_reward": [],
         "held_out_reward_by_m": {
+            n_lasers: [] for n_lasers in config.training_n_lasers
+        },
+        "held_out_rho": [],
+        "held_out_rho_by_m": {
             n_lasers: [] for n_lasers in config.training_n_lasers
         },
     }
@@ -2195,7 +6110,17 @@ def train_reinforce(
     latest_held_out_by_m = {
         n_lasers: np.nan for n_lasers in config.training_n_lasers
     }
+    latest_held_out_rho = np.nan
+    latest_normalized_sparsity_score = np.nan
+    latest_sparsity_score_by_m = {
+        n_lasers: np.nan for n_lasers in config.training_n_lasers
+    }
+    latest_held_out_rho_by_m = {
+        n_lasers: np.nan for n_lasers in config.training_n_lasers
+    }
+    latest_validation_span_ghz = np.nan
     best_held_out_reward = -np.inf
+    best_validation_span_ghz = -np.inf
     figure_and_axes = make_training_figure(config) if live_plot else None
     progress_figure_directory = None
     if live_plot:
@@ -2203,26 +6128,21 @@ def train_reinforce(
         progress_figure_directory.mkdir(parents=True, exist_ok=True)
     simulation_pool = None
     if config.n_jobs == 1:
+        target_description = (
+            "targets spread across every M"
+            if config.train_all_sizes_each_iteration
+            else "same-size targets"
+        )
         print(
             "VCSEL simulation: serial vectorized path for "
-            f"{config.targets_per_batch} targets"
+            f"{config.targets_per_batch} {target_description} per update"
         )
     else:
-        active_training_jobs = min(
-            config.n_jobs, config.targets_per_batch
-        )
-        split_sizes = [
-            len(indices)
-            for indices in np.array_split(
-                np.arange(config.targets_per_batch),
-                active_training_jobs,
-            )
-        ]
+        active_training_jobs = min(config.n_jobs, config.targets_per_batch)
         print(
             f"VCSEL simulation: {active_training_jobs} worker processes "
-            f"for {config.targets_per_batch} targets"
+            f"for {config.targets_per_batch} same-size targets per update"
         )
-        print(f"Targets per worker: {split_sizes}")
         spawn_context = mp.get_context("spawn")
         simulation_pool = spawn_context.Pool(
             processes=active_training_jobs,
@@ -2235,53 +6155,169 @@ def train_reinforce(
                 for parameter_group in optimizer.param_groups:
                     parameter_group["lr"] = config.learning_rate_after_switch
 
-            selected_n_lasers = int(rng.choice(config.training_n_lasers))
-            iteration_config = replace(
-                config, n_lasers=selected_n_lasers
+            active_training_sizes = active_training_n_lasers_at(
+                iteration, config
             )
-            metrics = run_training_batch(
-                policy,
-                optimizer,
-                iteration_config,
-                rng,
-                iteration,
-                simulation_pool=simulation_pool,
-            )
+            if config.train_all_sizes_each_iteration:
+                metrics = run_multisize_training_batch(
+                    policy,
+                    optimizer,
+                    config,
+                    rng,
+                    iteration,
+                    simulation_pool=simulation_pool,
+                )
+                selected_n_lasers: int | tuple[int, ...] = (
+                    active_training_sizes
+                )
+                selected_n_lasers_text = "all"
+            else:
+                selection_probabilities = None
+                if config.training_n_laser_weights is not None:
+                    active_count = len(active_training_sizes)
+                    selection_probabilities = np.asarray(
+                        config.training_n_laser_weights[:active_count],
+                        dtype=float,
+                    )
+                    selection_probabilities /= selection_probabilities.sum()
+                selected_n_lasers = int(
+                    rng.choice(
+                        active_training_sizes,
+                        p=selection_probabilities,
+                    )
+                )
+                selected_n_lasers_text = str(selected_n_lasers)
+                iteration_config = replace(
+                    config, n_lasers=selected_n_lasers
+                )
+                metrics = run_training_batch(
+                    policy,
+                    optimizer,
+                    iteration_config,
+                    rng,
+                    iteration,
+                    simulation_pool=simulation_pool,
+                )
             history["n_lasers"].append(selected_n_lasers)
             for key in (
                 "phase_reward",
                 "training_reward",
+                "sparsity_bonus",
+                "normalized_coupling_cost",
+                "coupling_cost_bonus",
+                "phase_reference_reward",
+                "phase_success_fraction",
                 "magnitude_symmetry_penalty",
                 "loss",
                 "gradient_norm",
+                "minimum_log_std",
                 "maximum_log_std",
                 "mean_action_std",
             ):
                 history[key].append(metrics[key])
+            history["active_connection_fraction"].append(
+                metrics.get("active_connection_fraction", 1.0)
+            )
+            history["negative_gradient_pair_fraction"].append(
+                metrics.get("negative_gradient_pair_fraction", np.nan)
+            )
+            history["mean_gradient_cosine"].append(
+                metrics.get("mean_gradient_cosine", np.nan)
+            )
 
             should_validate = (
                 iteration == 0
                 or (iteration + 1) % config.validation_interval == 0
                 or iteration + 1 == config.training_iterations
             )
+            validation_half_span = (
+                detuning_curriculum_half_span_at(iteration, config)
+                if config.validation_follows_detuning_curriculum
+                else 0.5 * config.detuning_span_ghz
+            )
+            validation_span_ghz = 2.0 * validation_half_span
             if should_validate:
+                latest_validation_span_ghz = validation_span_ghz
                 for n_lasers in config.training_n_lasers:
-                    held_out_targets, held_out_detunings = held_out_sets[
-                        n_lasers
-                    ]
+                    (
+                        held_out_targets,
+                        full_span_held_out_detunings,
+                    ) = held_out_sets[n_lasers]
+                    held_out_detunings = full_span_held_out_detunings
+                    if config.validation_follows_detuning_curriculum:
+                        held_out_detunings = (
+                            full_span_held_out_detunings
+                            * validation_half_span
+                            / (0.5 * config.detuning_span_ghz)
+                        )
                     validation = evaluate_policy(
                         policy,
                         held_out_targets,
                         replace(config, n_lasers=n_lasers),
                         detuning_distributions_ghz=held_out_detunings,
+                        active_link_counts=(
+                            np.rint(
+                                np.linspace(
+                                    n_lasers - 1,
+                                    n_lasers * (n_lasers - 1),
+                                    len(held_out_targets),
+                                )
+                            ).astype(np.int64)
+                            if config.enable_conditional_backbone_budget
+                            else None
+                        ),
                         simulation_pool=simulation_pool,
                     )
                     latest_held_out_by_m[n_lasers] = float(
                         np.mean(validation["phase_reward"])
                     )
+                    if config.enable_budget_error_selector:
+                        with torch.no_grad():
+                            selector_features = encode_for_policy(
+                                held_out_targets,
+                                policy,
+                                replace(config, n_lasers=n_lasers),
+                                held_out_detunings,
+                                active_link_counts=np.full(
+                                    len(held_out_targets),
+                                    n_lasers * (n_lasers - 1),
+                                    dtype=np.int64,
+                                ),
+                            )
+                            tolerance = torch.full(
+                                (len(held_out_targets),),
+                                config.selector_validation_error_deg / 180.0,
+                                dtype=torch.float32,
+                                device=selector_features.device,
+                            )
+                            predicted_q = policy.predict_normalized_budget(
+                                selector_features, tolerance
+                            )
+                            latest_sparsity_score_by_m[n_lasers] = float(
+                                torch.mean(1.0 - predicted_q).cpu()
+                            )
+                    if validation["predicted_rho"] is not None:
+                        latest_held_out_rho_by_m[n_lasers] = float(
+                            np.mean(validation["predicted_rho"])
+                        )
                 latest_held_out_reward = float(
                     np.mean(list(latest_held_out_by_m.values()))
                 )
+                if config.enable_learned_backbone_density:
+                    latest_held_out_rho = float(
+                        np.mean(list(latest_held_out_rho_by_m.values()))
+                    )
+                if config.enable_budget_error_selector:
+                    latest_normalized_sparsity_score = float(
+                        np.mean(list(latest_sparsity_score_by_m.values()))
+                    )
+                # When validation difficulty follows the curriculum, prefer
+                # any checkpoint evaluated at a wider span over checkpoints
+                # from an easier stage. Once the final span is reached, select
+                # the highest reward normally within that fixed difficulty.
+                if validation_span_ghz > best_validation_span_ghz + 1.0e-12:
+                    best_validation_span_ghz = validation_span_ghz
+                    best_held_out_reward = -np.inf
                 if latest_held_out_reward > best_held_out_reward:
                     best_held_out_reward = latest_held_out_reward
                     save_checkpoint(
@@ -2293,9 +6329,19 @@ def train_reinforce(
                         held_out_reward=best_held_out_reward,
                     )
             history["held_out_reward"].append(latest_held_out_reward)
+            history["held_out_rho"].append(latest_held_out_rho)
+            history["normalized_sparsity_score"].append(
+                latest_normalized_sparsity_score
+            )
+            history["validation_detuning_span_ghz"].append(
+                latest_validation_span_ghz
+            )
             for n_lasers in config.training_n_lasers:
                 history["held_out_reward_by_m"][n_lasers].append(
                     latest_held_out_by_m[n_lasers]
+                )
+                history["held_out_rho_by_m"][n_lasers].append(
+                    latest_held_out_rho_by_m[n_lasers]
                 )
 
             # Overwrite one atomic snapshot every iteration so an external
@@ -2311,25 +6357,55 @@ def train_reinforce(
 
             if config.jupyter_mode:
                 clear_output(wait=True)
+            objective_text = (
+                f"reference={metrics['phase_reference_reward']:.3f}"
+                if (
+                    config.use_lexicographic_rank_advantages
+                    or config.enable_learned_backbone_density
+                )
+                else f"training={metrics['training_reward']:.3f}"
+            )
             print(
                 f"Iteration {iteration + 1:4d}/"
                 f"{config.training_iterations} | "
-                f"M={selected_n_lasers} | "
+                f"M={selected_n_lasers_text} | "
+                f"active-M={active_training_sizes[0]}-"
+                f"{active_training_sizes[-1]} | "
                 f"phase={metrics['phase_reward']:.3f} | "
-                f"training={metrics['training_reward']:.3f} | "
+                f"{objective_text} | "
                 f"held-out={latest_held_out_reward:.3f} | "
                 f"K-sym={metrics['magnitude_symmetry_penalty']:.3f} | "
+                f"K-cost={metrics['normalized_coupling_cost']:.3f} | "
                 f"action-std={metrics['mean_action_std']:.3f} | "
+                f"active={metrics.get('active_connection_fraction', 1.0):.3f} | "
+                f"{'eligible' if config.use_relative_phase_retention else 'success'}="
+                f"{metrics.get('phase_success_fraction', 0.0):.3f} | "
+                f"std-floor={np.exp(metrics['minimum_log_std']):.3f} | "
                 f"lr={optimizer.param_groups[0]['lr']:.1e} | "
                 f"loss={metrics['loss']:.3f}"
             )
+            if config.gradient_combination_mode == "pcgrad":
+                print(
+                    "PCGrad | conflicting pairs="
+                    f"{metrics['negative_gradient_pair_fraction']:.3f} | "
+                    "mean cosine="
+                    f"{metrics['mean_gradient_cosine']:+.3f}"
+                )
             if should_validate:
                 validation_text = " | ".join(
                     f"M={n_lasers}: {latest_held_out_by_m[n_lasers]:.3f}"
                     for n_lasers in config.training_n_lasers
                 )
-                print(f"Validation | {validation_text} | overall: "
-                      f"{latest_held_out_reward:.3f}")
+                print(
+                    f"Validation | D_max={validation_span_ghz:.3f} GHz | "
+                    f"{validation_text} | overall: "
+                    f"{latest_held_out_reward:.3f}"
+                    + (
+                        f" | mean-rho={latest_held_out_rho:.3f}"
+                        if config.enable_learned_backbone_density
+                        else ""
+                    )
+                )
 
             should_plot = (
                 live_plot
@@ -2387,6 +6463,68 @@ def plot_training_history(
 # ---------------------------------------------------------------------------
 
 
+def predict_conditional_link_budget(
+    policy: GNNPolicyNetwork,
+    target_phases_rad: np.ndarray,
+    detuning_distribution_ghz: np.ndarray,
+    config: DesignerConfig,
+    allowable_rms_phase_error_deg: float,
+) -> dict[str, float | int]:
+    """Predict one connected-link budget from the configured error bound.
+
+    The legacy argument name is retained for checkpoint and notebook
+    compatibility. For deterministic maximum-error selector checkpoints, the
+    value is interpreted as a maximum per-laser circular phase error.
+    """
+    if not config.enable_budget_error_selector:
+        raise ValueError("checkpoint does not contain a budget selector")
+    if not 0.0 < allowable_rms_phase_error_deg <= 180.0:
+        metric_name = (
+            "maximum"
+            if config.selector_use_deterministic_max_error
+            else "RMS"
+        )
+        raise ValueError(
+            f"allowable {metric_name} phase error must lie in (0, 180]"
+        )
+    target = make_relative_to_laser_1(target_phases_rad)
+    detuning = np.asarray(detuning_distribution_ghz, dtype=float)
+    target, detuning = sort_by_detuning(target, detuning)
+    maximum_links = config.n_lasers * (config.n_lasers - 1)
+    minimum_links = config.n_lasers - 1
+    encoded = encode_for_policy(
+        target,
+        policy,
+        config,
+        detuning,
+        active_link_counts=np.asarray([maximum_links], dtype=np.int64),
+    )
+    policy.eval()
+    with torch.no_grad():
+        predicted_q = float(
+            policy.predict_normalized_budget(
+                encoded,
+                torch.as_tensor(
+                    [allowable_rms_phase_error_deg / 180.0],
+                    dtype=torch.float32,
+                    device=encoded.device,
+                ),
+            )[0].cpu()
+        )
+    active_link_count = minimum_links + int(
+        round(predicted_q * (maximum_links - minimum_links))
+    )
+    active_link_count = int(
+        np.clip(active_link_count, minimum_links, maximum_links)
+    )
+    return {
+        "normalized_budget_q": predicted_q,
+        "active_link_count": active_link_count,
+        "rho": active_link_count / maximum_links,
+        "normalized_sparsity_score": 1.0 - predicted_q,
+    }
+
+
 def design_for_target(
     policy: PolicyNetwork,
     target_phases_rad: np.ndarray,
@@ -2395,8 +6533,11 @@ def design_for_target(
     number_of_candidates: int = 128,
     top_k: int = 1,
     detuning_distribution_ghz: np.ndarray | None = None,
+    active_link_count: int | None = None,
+    include_deterministic_candidate: bool = True,
+    mirror_if_lower_triangle_disabled: bool = False,
     simulation_pool: Any | None = None,
-) -> list[dict[str, np.ndarray | float | int]]:
+) -> list[dict[str, np.ndarray | float | int | bool | None]]:
     """Sample designs for one target condition and return the best."""
     target = make_relative_to_laser_1(target_phases_rad)
     if target.shape != (config.n_lasers,):
@@ -2425,6 +6566,15 @@ def design_for_target(
     target, detuning_distribution_ghz = sort_by_detuning(
         target, detuning_distribution_ghz
     )
+    if (
+        config.enable_connected_edge_budgets
+        or config.enable_conditional_backbone_budget
+    ):
+        if active_link_count is None:
+            active_link_count = config.n_lasers * (config.n_lasers - 1)
+        active_link_counts = np.asarray([active_link_count], dtype=np.int64)
+    else:
+        active_link_counts = None
 
     policy.eval()
     with torch.no_grad():
@@ -2433,11 +6583,91 @@ def design_for_target(
             policy,
             config,
             detuning_distribution_ghz,
+            active_link_counts=active_link_counts,
         )
         distribution = policy.distribution(encoded)
-        actions = distribution.sample((number_of_candidates,))[:, 0, :]
-        actions[0] = distribution.mean[0]  # always include deterministic design
+        if config.enable_connected_edge_budgets:
+            sampled_actions, sampled_gates, _ = (
+                sample_connected_coupling_designs(
+                    policy,
+                    encoded,
+                    number_of_candidates,
+                    active_link_counts,
+                )
+            )
+            actions = sampled_actions[0]
+            magnitude_gates = sampled_gates[0]
+            if include_deterministic_candidate:
+                actions[0] = distribution.mean[0]
+                gate_logits = policy.gate_distribution(encoded).logits
+                deterministic_gate = deterministic_connected_gates(
+                    gate_logits.detach().cpu().numpy(),
+                    active_link_counts,
+                    config.n_lasers,
+                )[0]
+                magnitude_gates[0] = torch.as_tensor(
+                    deterministic_gate,
+                    dtype=magnitude_gates.dtype,
+                    device=magnitude_gates.device,
+                )
+        elif config.enable_learned_connected_sparsity:
+            sampled_actions, sampled_gates, _ = (
+                sample_learned_connected_coupling_designs(
+                    policy,
+                    encoded,
+                    number_of_candidates,
+                )
+            )
+            actions = sampled_actions[0]
+            magnitude_gates = sampled_gates[0]
+            if include_deterministic_candidate:
+                actions[0] = distribution.mean[0]
+                deterministic_gate = deterministic_learned_connected_gates(
+                    policy.gate_distribution(encoded)
+                    .logits.detach().cpu().numpy(),
+                    config.n_lasers,
+                    config.gate_probability_threshold,
+                )[0]
+                magnitude_gates[0] = torch.as_tensor(
+                    deterministic_gate,
+                    dtype=magnitude_gates.dtype,
+                    device=magnitude_gates.device,
+                )
+        else:
+            actions = distribution.sample((number_of_candidates,))[:, 0, :]
+            if include_deterministic_candidate:
+                actions[0] = distribution.mean[0]
+        predicted_rho = None
+        if config.enable_learned_backbone_density:
+            rho_distribution = policy.backbone_density_distribution(encoded)
+            rho_logits = rho_distribution.sample(
+                (number_of_candidates,)
+            )[:, 0, 0]
+            if include_deterministic_candidate:
+                rho_logits[0] = rho_distribution.mean[0, 0]
+            predicted_rho = torch.sigmoid(rho_logits).detach().cpu().numpy()
+        if (
+            getattr(policy, "enable_sparse_gates", False)
+            and not config.enable_connected_edge_budgets
+            and not config.enable_learned_connected_sparsity
+        ):
+            gate_distribution = policy.gate_distribution(encoded)
+            magnitude_gates = gate_distribution.sample(
+                (number_of_candidates,)
+            )[:, 0, :]
+            if include_deterministic_candidate:
+                magnitude_gates[0] = policy.deterministic_gates(encoded)[0]
+        elif (
+            not config.enable_connected_edge_budgets
+            and not config.enable_learned_connected_sparsity
+        ):
+            magnitude_gates = None
     actions_numpy = actions.detach().cpu().numpy()
+    magnitude_gates_numpy = (
+        None
+        if magnitude_gates is None
+        else magnitude_gates.detach().cpu().numpy()
+    )
     kappa_per_ns, phi_p_rad = decode_action(
         actions_numpy,
         config.maximum_kappa_per_ns,
@@ -2445,7 +6675,58 @@ def design_for_target(
         config.force_symmetric_kappa,
         config.force_symmetric_phi_p,
         config.balanced_coupling,
+        magnitude_gates=magnitude_gates_numpy,
+        normalize_incoming_coupling_by_degree=(
+            config.normalize_incoming_coupling_by_degree
+        ),
     )
+    realized_rho = None
+    if predicted_rho is not None:
+        kappa_per_ns, phi_p_rad, realized_rho = (
+            prune_coupling_batch_to_backbone(
+                kappa_per_ns, phi_p_rad, predicted_rho
+            )
+        )
+        receivers, sources = directed_link_indices(config.n_lasers)
+        magnitude_gates_numpy = (
+            kappa_per_ns[:, receivers, sources] > 0.0
+        ).astype(float)
+    elif config.enable_conditional_backbone_budget:
+        candidate_counts = np.full(
+            number_of_candidates, active_link_count, dtype=np.int64
+        )
+        kappa_per_ns, phi_p_rad, realized_rho = (
+            prune_coupling_batch_to_link_budget(
+                kappa_per_ns, phi_p_rad, candidate_counts
+            )
+        )
+        predicted_rho = realized_rho.copy()
+        receivers, sources = directed_link_indices(config.n_lasers)
+        magnitude_gates_numpy = (
+            kappa_per_ns[:, receivers, sources] > 0.0
+        ).astype(float)
+    mirrored_about_diagonal = np.zeros(number_of_candidates, dtype=bool)
+    if mirror_if_lower_triangle_disabled:
+        for candidate_index in range(number_of_candidates):
+            upper_kappa = np.triu(kappa_per_ns[candidate_index], k=1)
+            lower_kappa = np.tril(kappa_per_ns[candidate_index], k=-1)
+            if np.sum(upper_kappa) >= np.sum(lower_kappa):
+                upper_kappa = np.triu(kappa_per_ns[candidate_index], k=1)
+                upper_phi = np.triu(phi_p_rad[candidate_index], k=1)
+                kappa_per_ns[candidate_index] = upper_kappa + upper_kappa.T
+                phi_p_rad[candidate_index] = upper_phi + upper_phi.T
+            else:
+                lower_kappa = np.tril(kappa_per_ns[candidate_index], k=-1)
+                lower_phi = np.tril(phi_p_rad[candidate_index], k=-1)
+                kappa_per_ns[candidate_index] = lower_kappa + lower_kappa.T
+                phi_p_rad[candidate_index] = lower_phi + lower_phi.T
+            mirrored_about_diagonal[candidate_index] = True
+        if np.any(mirrored_about_diagonal):
+            receivers, sources = directed_link_indices(config.n_lasers)
+            magnitude_gates_numpy = (
+                kappa_per_ns[:, receivers, sources] > 0.0
+            ).astype(float)
+            realized_rho = np.mean(magnitude_gates_numpy, axis=1)
     simulation = simulate_candidates_parallel(
         target[None, :],
         kappa_per_ns[None, :, :, :],
@@ -2455,14 +6736,81 @@ def design_for_target(
         simulation_pool=simulation_pool,
     )
     magnitude_symmetry_penalty = normalized_magnitude_symmetry_penalty(
-        kappa_per_ns, config.maximum_kappa_per_ns
+        kappa_per_ns,
+        effective_maximum_kappa_per_link(
+            config.maximum_kappa_per_ns,
+            config.n_lasers,
+            config.normalize_incoming_coupling_by_degree,
+        ),
     )
     phase_reward = simulation["phase_reward"][0]
+    coupling_cost = normalized_squared_coupling_cost(
+        kappa_per_ns,
+        effective_maximum_kappa_per_link(
+            config.maximum_kappa_per_ns,
+            config.n_lasers,
+            config.normalize_incoming_coupling_by_degree,
+        ),
+    )
     ranking_reward = (
         phase_reward
         - config.magnitude_symmetry_weight
         * magnitude_symmetry_penalty
     )
+    if config.enable_learned_backbone_density:
+        active_fractions = realized_rho
+        ranking_reward, _, _ = lexicographic_resource_rank_advantages(
+            phase_reward[None, :],
+            active_fractions[None, :],
+            coupling_cost[None, :],
+            phase_reference=np.array([np.max(phase_reward)]),
+            phase_retention_tolerance=config.phase_retention_tolerance,
+        )
+        ranking_reward = ranking_reward[0]
+    elif config.enable_learned_connected_sparsity:
+        active_fractions = np.mean(magnitude_gates_numpy, axis=1)
+        phase_reference = np.array([np.max(phase_reward)])
+        if config.use_lexicographic_rank_advantages:
+            ranking_reward, _, _ = (
+                lexicographic_resource_rank_advantages(
+                    phase_reward[None, :],
+                    active_fractions[None, :],
+                    coupling_cost[None, :],
+                    phase_reference=phase_reference,
+                    phase_retention_tolerance=(
+                        config.phase_retention_tolerance
+                    ),
+                )
+            )
+            ranking_reward = ranking_reward[0]
+        else:
+            relative_reference = (
+                phase_reference
+                if config.use_relative_phase_retention
+                else None
+            )
+            phase_or_sparse_reward, _, _, _ = (
+                successful_sparse_reward_components(
+                    phase_reward[None, :],
+                    active_fractions[None, :],
+                    coupling_cost[None, :],
+                    n_lasers=config.n_lasers,
+                    phase_threshold=config.sparsity_phase_reward_threshold,
+                    sparsity_weight=config.successful_sparsity_reward_weight,
+                    coupling_cost_tiebreak_fraction=(
+                        config.coupling_cost_tiebreak_fraction
+                    ),
+                    phase_reference=relative_reference,
+                    phase_retention_tolerance=(
+                        config.phase_retention_tolerance
+                    ),
+                )
+            )
+            ranking_reward = phase_or_sparse_reward[0]
+        ranking_reward = ranking_reward - (
+            config.magnitude_symmetry_weight
+            * magnitude_symmetry_penalty
+        )
     order = np.argsort(ranking_reward)[::-1][: min(top_k, number_of_candidates)]
 
     results: list[dict[str, np.ndarray | float | int]] = []
@@ -2476,6 +6824,50 @@ def design_for_target(
                 ),
                 "kappa_per_ns": kappa_per_ns[index].copy(),
                 "phi_p_rad": phi_p_rad[index].copy(),
+                "magnitude_gates": (
+                    np.ones(
+                        policy.link_counts(config.n_lasers)[1], dtype=float
+                    )
+                    if magnitude_gates_numpy is None
+                    else magnitude_gates_numpy[index].copy()
+                ),
+                "normalized_coupling_budget": float(
+                    np.sum(kappa_per_ns[index])
+                    / (
+                        config.n_lasers
+                        * (config.n_lasers - 1)
+                        * effective_maximum_kappa_per_link(
+                            config.maximum_kappa_per_ns,
+                            config.n_lasers,
+                            config.normalize_incoming_coupling_by_degree,
+                        )
+                    )
+                ),
+                "active_connection_fraction": float(
+                    realized_rho[index]
+                    if realized_rho is not None
+                    else 1.0
+                    if magnitude_gates_numpy is None
+                    else np.mean(magnitude_gates_numpy[index])
+                ),
+                "active_link_count": int(
+                    policy.link_counts(config.n_lasers)[1]
+                    if magnitude_gates_numpy is None
+                    else np.sum(magnitude_gates_numpy[index])
+                ),
+                "predicted_rho": (
+                    None
+                    if predicted_rho is None
+                    else float(predicted_rho[index])
+                ),
+                "realized_rho": (
+                    None
+                    if realized_rho is None
+                    else float(realized_rho[index])
+                ),
+                "mirrored_about_diagonal": bool(
+                    mirrored_about_diagonal[index]
+                ),
                 "achieved_phases_rad": simulation[
                     "achieved_phases_rad"
                 ][0, index].copy(),
@@ -2486,6 +6878,9 @@ def design_for_target(
                     simulation["orientation"][0, index]
                 ),
                 "phase_reward": float(phase_reward[index]),
+                "normalized_squared_coupling_cost": float(
+                    coupling_cost[index]
+                ),
                 "magnitude_symmetry_penalty": float(
                     magnitude_symmetry_penalty[index]
                 ),
@@ -2493,6 +6888,49 @@ def design_for_target(
             }
         )
     return results
+
+
+def design_sparsest_for_target(
+    policy: PolicyNetwork,
+    target_phases_rad: np.ndarray,
+    config: DesignerConfig,
+    *,
+    minimum_phase_reward: float = 0.98,
+    number_of_candidates: int = 128,
+    detuning_distribution_ghz: np.ndarray | None = None,
+    simulation_pool: Any | None = None,
+) -> dict[str, np.ndarray | float | int | bool]:
+    """Return the first exact edge budget that meets the phase threshold."""
+    if not config.enable_connected_edge_budgets:
+        raise ValueError(
+            "sparsest-design search requires connected edge budgets"
+        )
+    if not 0.0 <= minimum_phase_reward <= 1.0:
+        raise ValueError("minimum_phase_reward must lie in [0, 1]")
+    maximum_links = config.n_lasers * (config.n_lasers - 1)
+    last_result: dict[str, np.ndarray | float | int | bool] | None = None
+    for active_link_count in range(config.n_lasers - 1, maximum_links + 1):
+        result = dict(
+            design_for_target(
+                policy,
+                target_phases_rad,
+                config,
+                number_of_candidates=number_of_candidates,
+                top_k=1,
+                detuning_distribution_ghz=detuning_distribution_ghz,
+                active_link_count=active_link_count,
+                simulation_pool=simulation_pool,
+            )[0]
+        )
+        result["active_link_count"] = active_link_count
+        satisfied = float(result["phase_reward"]) >= minimum_phase_reward
+        result["phase_target_satisfied"] = satisfied
+        last_result = result
+        if satisfied:
+            return result
+    if last_result is None:
+        raise RuntimeError("sparsest-design search did not evaluate a budget")
+    return last_result
 
 
 def validate_policy(
@@ -2572,20 +7010,47 @@ def save_checkpoint(
     iteration: int,
     held_out_reward: float,
 ) -> Path:
-    """Save a variable-size pooled or legacy BiGRU policy checkpoint."""
+    """Save a variable-size pooled, BiGRU, or GNN policy checkpoint."""
     path = Path(filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = path.with_name(f".{path.name}.tmp")
     torch.save(
         {
             "format": (
-                BIGRU_CHECKPOINT_FORMAT
-                if isinstance(policy, BiGRUPolicyNetwork)
-                else CHECKPOINT_FORMAT
+                GNN_CHECKPOINT_FORMAT
+                if isinstance(policy, GNNPolicyNetwork)
+                else (
+                    (
+                        BIGRU_MODULATED_CHECKPOINT_FORMAT
+                        if policy.modulate_edge_decoder_by_n_lasers
+                        else (
+                            BIGRU_SPARSE_CHECKPOINT_FORMAT
+                            if policy.enable_sparse_gates
+                            else (
+                                BIGRU_EDGE_STD_CHECKPOINT_FORMAT
+                                if policy.edge_conditioned_log_std
+                                else (
+                                    BIGRU_M_CONDITIONED_CHECKPOINT_FORMAT
+                                    if policy.condition_on_n_lasers
+                                    or policy.condition_log_std_on_n_lasers
+                                    else BIGRU_CHECKPOINT_FORMAT
+                                )
+                            )
+                        )
+                    )
+                    if isinstance(policy, BiGRUPolicyNetwork)
+                    else CHECKPOINT_FORMAT
+                )
             ),
             "variable_m_policy": True,
             "encoder_architecture": (
-                "bigru" if isinstance(policy, BiGRUPolicyNetwork) else "pooled"
+                "gnn"
+                if isinstance(policy, GNNPolicyNetwork)
+                else (
+                    "bigru"
+                    if isinstance(policy, BiGRUPolicyNetwork)
+                    else "pooled"
+                )
             ),
             "training_n_lasers": tuple(config.training_n_lasers),
             "node_embedding_dim": int(config.node_embedding_dim),
@@ -2618,31 +7083,50 @@ def load_checkpoint(
     DesignerConfig,
     dict[str, float | int],
 ]:
-    """Load a pooled checkpoint or an archived BiGRU checkpoint.
+    """Load a pooled, BiGRU, or graph-policy checkpoint.
 
     ``architecture`` may be ``"auto"`` (detect from checkpoint metadata),
-    ``"pooled"``, or ``"bigru"``.  The explicit option is useful in an
-    inspector while ``"auto"`` keeps normal pooled usage simple.
+    ``"pooled"``, ``"bigru"``, or ``"gnn"``.
     """
-    if architecture not in {"auto", "pooled", "bigru"}:
-        raise ValueError("architecture must be 'auto', 'pooled', or 'bigru'")
+    if architecture not in {"auto", "pooled", "bigru", "gnn"}:
+        raise ValueError(
+            "architecture must be 'auto', 'pooled', 'bigru', or 'gnn'"
+        )
     checkpoint = torch.load(
         filename,
         map_location=device or "cpu",
         weights_only=False,
     )
     checkpoint_format = checkpoint.get("format")
-    if checkpoint_format not in {CHECKPOINT_FORMAT, BIGRU_CHECKPOINT_FORMAT}:
+    if checkpoint_format not in {
+        CHECKPOINT_FORMAT,
+        BIGRU_CHECKPOINT_FORMAT,
+        BIGRU_M_CONDITIONED_CHECKPOINT_FORMAT,
+        BIGRU_EDGE_STD_CHECKPOINT_FORMAT,
+        BIGRU_SPARSE_CHECKPOINT_FORMAT,
+        BIGRU_MODULATED_CHECKPOINT_FORMAT,
+        GNN_CHECKPOINT_FORMAT,
+    }:
         raise ValueError(
-            "This checkpoint is not a variable-M pooled or BiGRU policy. "
+            "This checkpoint is not a variable-M pooled, BiGRU, or GNN "
+            "policy. "
             "Fixed-size conditional-coupling checkpoints have incompatible "
             "encoder and edge-decoder shapes."
         )
     if not checkpoint.get("variable_m_policy", False):
         raise ValueError("Checkpoint is missing variable_m_policy=True")
-    checkpoint_architecture = (
-        "bigru" if checkpoint_format == BIGRU_CHECKPOINT_FORMAT else "pooled"
-    )
+    if checkpoint_format == GNN_CHECKPOINT_FORMAT:
+        checkpoint_architecture = "gnn"
+    elif checkpoint_format in {
+            BIGRU_CHECKPOINT_FORMAT,
+            BIGRU_M_CONDITIONED_CHECKPOINT_FORMAT,
+            BIGRU_EDGE_STD_CHECKPOINT_FORMAT,
+            BIGRU_SPARSE_CHECKPOINT_FORMAT,
+            BIGRU_MODULATED_CHECKPOINT_FORMAT,
+    }:
+        checkpoint_architecture = "bigru"
+    else:
+        checkpoint_architecture = "pooled"
     if architecture != "auto" and architecture != checkpoint_architecture:
         raise ValueError(
             f"Requested {architecture} architecture, but checkpoint contains "
@@ -2650,6 +7134,11 @@ def load_checkpoint(
         )
     saved_config = dict(checkpoint["config"])
     saved_config["encoder_architecture"] = checkpoint_architecture
+    if checkpoint_format == BIGRU_CHECKPOINT_FORMAT:
+        # Archived BiGRU checkpoints predate explicit M conditioning and must
+        # retain their original decoder and exploration parameter shapes.
+        saved_config["condition_on_n_lasers"] = False
+        saved_config["condition_log_std_on_n_lasers"] = False
     if "force_symmetric_coupling" in saved_config:
         old_forced_symmetry = bool(
             saved_config.pop("force_symmetric_coupling")
@@ -2692,43 +7181,116 @@ def load_checkpoint(
     return policy, optimizer, config, metadata
 
 
+def add_sparse_gates_to_policy(
+    policy: nn.Module,
+    config: DesignerConfig,
+    *,
+    initial_gate_logit: float = 5.0,
+    gate_probability_threshold: float = 0.5,
+) -> tuple[nn.Module, DesignerConfig]:
+    """Copy a dense BiGRU or GNN into a gate-enabled refinement policy."""
+    if not isinstance(policy, (BiGRUPolicyNetwork, GNNPolicyNetwork)):
+        raise ValueError(
+            "sparse refinement requires a BiGRU or GNN policy"
+        )
+    if policy.enable_sparse_gates:
+        return policy, config
+    sparse_config = replace(
+        config,
+        enable_sparse_gates=True,
+        initial_gate_logit=float(initial_gate_logit),
+        gate_probability_threshold=float(gate_probability_threshold),
+    )
+    policy_type = type(policy)
+    sparse_policy = policy_type(sparse_config).to(next(policy.parameters()).device)
+    incompatible = sparse_policy.load_state_dict(
+        policy.state_dict(), strict=False
+    )
+    expected_missing = {"edge_gate_head.weight", "edge_gate_head.bias"}
+    if set(incompatible.missing_keys) != expected_missing:
+        raise RuntimeError(
+            "unexpected parameters were missing while adding sparse gates: "
+            f"{incompatible.missing_keys}"
+        )
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "unexpected dense-policy parameters while adding sparse gates: "
+            f"{incompatible.unexpected_keys}"
+        )
+    sparse_policy.train(policy.training)
+    return sparse_policy, sparse_config
+
+
 __all__ = [
     "BIGRU_CHECKPOINT_FORMAT",
+    "BIGRU_EDGE_STD_CHECKPOINT_FORMAT",
+    "BIGRU_M_CONDITIONED_CHECKPOINT_FORMAT",
+    "BIGRU_MODULATED_CHECKPOINT_FORMAT",
+    "BIGRU_SPARSE_CHECKPOINT_FORMAT",
     "CHECKPOINT_FORMAT",
+    "GNN_CHECKPOINT_FORMAT",
     "DEFAULT_N_LASERS",
     "DesignerConfig",
     "PHASE_TICK_LABELS",
     "PHASE_TICKS",
     "PolicyNetwork",
     "BiGRUPolicyNetwork",
+    "GNNPolicyNetwork",
+    "GraphMessagePassingLayer",
+    "active_training_n_lasers_at",
+    "add_sparse_gates_to_policy",
     "action_size_for",
+    "budget_error_selector_loss",
+    "budget_group_standardized_advantages",
     "calculate_phase_reward",
     "canonicalize_global_phase_conjugate",
+    "combine_task_gradients_pcgrad",
     "decode_action",
+    "deterministic_budget_candidate_mask",
+    "deterministic_connected_gates",
+    "deterministic_learned_connected_gates",
     "design_for_target",
+    "design_sparsest_for_target",
+    "detuning_curriculum_half_span_at",
     "directed_link_indices",
     "encode_detuning_distributions",
     "encode_for_policy",
     "encode_target_phases",
+    "effective_maximum_kappa_per_link",
     "evaluate_policy",
     "load_checkpoint",
+    "lexicographic_resource_rank_advantages",
     "make_relative_to_laser_1",
     "make_policy",
     "make_vcsel_physical_parameters",
+    "minimum_log_std_at",
+    "minimum_active_links_at",
     "maximum_log_std_at",
     "named_phase_targets",
+    "nonincreasing_isotonic_fit",
     "normalized_magnitude_symmetry_penalty",
+    "normalized_squared_coupling_cost",
     "plot_training_history",
+    "predict_conditional_link_budget",
     "run_training_batch",
+    "run_multisize_training_batch",
     "run_architecture_sanity_checks",
     "sample_coupling_designs",
+    "sample_connected_coupling_designs",
+    "sample_learned_connected_coupling_designs",
+    "sample_active_link_counts",
+    "sample_conditional_link_counts",
+    "sample_multibudget_candidate_counts",
+    "sample_sparse_coupling_designs",
     "sample_detuning_distributions",
     "sample_target_phases",
     "sort_by_detuning",
+    "successful_sparse_reward_components",
     "save_checkpoint",
     "set_random_seed",
     "simulate_candidates_parallel",
     "simulate_target_chunk",
+    "simulate_indexed_target_chunk",
     "simulate_with_vcsel",
     "split_simulation_batch",
     "train_reinforce",

@@ -33,7 +33,7 @@ N_LASERS = 2
 MODEL_SUFFIX = "_asymmetric_kappa_asymmetric_phi"  # Optional checkpoint suffix.
 
 # Output location and optional suffix for both saved figures.
-FIGURE_DIRECTORY = RESULTS_DIR / "7_laser_results"
+FIGURE_DIRECTORY = RESULTS_DIR / "inference" / "fixed_size" / "7_laser"
 FIGURE_SUFFIX = "random_detuning"  # For example: "_splay_noise"
 
 # Enter target phases as multiples of pi. The first entry is the reference.

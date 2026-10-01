@@ -677,7 +677,7 @@ def test_train_loop_updates_one_progress_png(
 
     conditional.train_reinforce(config, live_plot=True)
 
-    progress_directory = tmp_path / "results"
+    progress_directory = tmp_path / "results" / "training" / "progress"
     progress_file = progress_directory / (
         f"{Path(config.current_checkpoint_file).stem}_training_progress.png"
     )

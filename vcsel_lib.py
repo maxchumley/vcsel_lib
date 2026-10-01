@@ -50,6 +50,8 @@ class VCSEL:
         operating regimes. See scale_params() for exact transforms used.
     """
 
+    _PHASE_MODELS = frozenset({"ma_2019", "standard_lk", "chumley_2026"})
+
     def __init__(self, phys_params):
         """
         Initialize VCSEL object.
@@ -70,6 +72,9 @@ class VCSEL:
               - I: injection current (A)
               - q: electron charge (C)
               - alpha: linewidth enhancement factor (dimensionless)
+              - phase_model: intrinsic phase-gain convention. One of
+                ``'ma_2019'``, ``'standard_lk'``, or ``'chumley_2026'``;
+                defaults to ``'chumley_2026'`` to preserve historical behavior.
               - delta: frequency detuning (rad/s)
               - coupling: inter-laser coupling coefficient (dimensionless, default 1.0)
               - self_feedback: self-feedback coefficient (dimensionless, default 0.0)
@@ -85,6 +90,49 @@ class VCSEL:
         """
         self.phys = phys_params
         self.nd = None  # will hold nondimensional parameters after scale_params()
+
+    @staticmethod
+    def _intrinsic_phase_gain(n, S, s, nbar, alpha, phase_model):
+        """Return intrinsic phase drift and its derivatives in scaled units.
+
+        The returned tuple is ``(phase_drift, d_drift_dn, d_drift_dS)``.
+        Keeping the three expressions together ensures that the integrator,
+        equilibrium residual, and DDE stability Jacobian use one convention.
+
+        ``ma_2019``
+            Ma et al. (2019), Eq. (1): ``alpha / 2 * (n - nbar)``.
+            It reproduces that paper's deterministic intrinsic equations when
+            gain saturation is disabled (``s = 0``).
+        ``standard_lk``
+            Saturated net-gain Lang--Kobayashi convention:
+            ``alpha / 2 * ((1 + n) / (1 + s*S) - 1)``.
+        ``chumley_2026``
+            Historical vcsel_lib behavior:
+            ``alpha / 2 * (n - nbar) / (1 + s*S)``.
+        """
+        if phase_model not in VCSEL._PHASE_MODELS:
+            allowed = ", ".join(sorted(VCSEL._PHASE_MODELS))
+            raise ValueError(
+                f"Unknown phase_model {phase_model!r}. Expected one of: {allowed}."
+            )
+
+        half_alpha = 0.5 * alpha
+        denom = 1.0 + s * S
+
+        if phase_model == "ma_2019":
+            drift = half_alpha * (n - nbar)
+            d_drift_dn = half_alpha * np.ones_like(n, dtype=float)
+            d_drift_dS = np.zeros_like(S, dtype=float)
+        elif phase_model == "standard_lk":
+            drift = half_alpha * ((1.0 + n) / denom - 1.0)
+            d_drift_dn = half_alpha / denom
+            d_drift_dS = -half_alpha * s * (1.0 + n) / denom**2
+        else:  # chumley_2026
+            drift = half_alpha * (n - nbar) / denom
+            d_drift_dn = half_alpha / denom
+            d_drift_dS = -half_alpha * s * (n - nbar) / denom**2
+
+        return drift, d_drift_dn, d_drift_dS
 
     # -------------------------------------------------------------------------
     # Parameter Scaling
@@ -117,7 +165,8 @@ class VCSEL:
             rest of the code (stored also on self.nd). Keys include:
               - tau: nondimensional delay (tau / tau_p)
               - tau_p, T (tau_n/tau_p), s (rescaled), kappa (rescaled by gamma)
-              - p, alpha, phi_p, n0, nbar, sbar, Gs, beta_n, beta_const, delta_p
+              - p, alpha, phase_model, phi_p, n0, nbar, sbar, Gs, beta_n,
+                beta_const, delta_p
               - coupling, self_feedback, noise_amplitude
               - dt, Tmax, steps, delay_steps (time discretization info)
         """
@@ -133,6 +182,12 @@ class VCSEL:
         kappa = phys['kappa_c_mat']
         phi_p = phys['phi_p_mat']
         alpha = phys['alpha']
+        phase_model = phys.get('phase_model', 'chumley_2026')
+        if phase_model not in self._PHASE_MODELS:
+            allowed = ", ".join(sorted(self._PHASE_MODELS))
+            raise ValueError(
+                f"Unknown phase_model {phase_model!r}. Expected one of: {allowed}."
+            )
         delta = phys['delta']
         current_I = phys.get('I', None)
         q = phys['q']
@@ -185,6 +240,7 @@ class VCSEL:
         p = g0 * tau_p * (current_I * tau_n / (q) - N0) - 1
         nd['p'] = p
         nd['alpha'] = alpha
+        nd['phase_model'] = phase_model
         nd['phi_p'] = phi_p
         nd['n0'] = g0 * tau_p * N0  # nondimensional carrier offset
         # nondimensional steady-state carrier and photon numbers
@@ -276,6 +332,7 @@ class VCSEL:
         beta_n = nd["beta_n"]
         beta_c = nd["beta_const"]
         alpha  = nd["alpha"]
+        phase_model = nd.get("phase_model", "chumley_2026")
 
         delta_p = np.asarray(nd["delta_p"], dtype=float)
         if delta_p.ndim == 0:
@@ -390,7 +447,10 @@ class VCSEL:
         denom = 1 + s*S
         dn = (1/T)*(p - n - (1+n)*S/denom)
         dS = ((1+n)/denom - 1)*S + beta_n*n + beta_c
-        dphi = (alpha*0.5)*(n - nbar)/denom + delta
+        phase_drift, _, _ = self._intrinsic_phase_gain(
+            n, S, s, nbar, alpha, phase_model
+        )
+        dphi = phase_drift + delta
 
         # ----------------- MUTUAL COUPLING -----------------
         # shape: (n_cases, N, N)
@@ -1777,6 +1837,7 @@ class VCSEL:
         beta_n = nd.get('beta_n', 0.0)
         beta_const = nd.get('beta_const', 0.0)
         alpha = nd.get('alpha', 0.0)
+        phase_model = nd.get('phase_model', 'chumley_2026')
         tau = nd.get('tau', 0.0)
         coupling = nd.get('coupling', 0.0)
         self_fb = nd.get('self_feedback', 0.0)
@@ -1816,6 +1877,9 @@ class VCSEL:
         # Safety clip
         S_c = np.clip(S, 1e-11, None)
         sqrt_S = np.sqrt(S_c)
+        phase_drift, _, _ = self._intrinsic_phase_gain(
+            n, S_c, s, nbar, alpha, phase_model
+        )
 
         # Delay-induced phase rotation
         w_tau = omega * tau
@@ -1855,7 +1919,7 @@ class VCSEL:
             # -----------------------------
             # Phase equation: self-feedback
             # -----------------------------
-            dphi[i] = (alpha * 0.5) * (n[i] - nbar) / (1.0 + s * S_c[i]) \
+            dphi[i] = phase_drift[i] \
                     + np.diag(kappa_c)[i] * self_fb * np.sin(phi_fb) + delta[i]
 
             # -----------------------------
@@ -2156,6 +2220,7 @@ class VCSEL:
         nbar   = nd["nbar"]
         beta_n = nd["beta_n"]
         alpha  = nd["alpha"]
+        phase_model = nd.get("phase_model", "chumley_2026")
 
         phi_p = np.array(nd["phi_p"])
         if phi_p.ndim == 3:
@@ -2183,6 +2248,9 @@ class VCSEL:
         phi_p_mutual = phi_p - np.diag(phi_p_self)
 
         denom = 1 + s*S
+        _, phase_drift_dn, phase_drift_dS = self._intrinsic_phase_gain(
+            n, S, s, nbar, alpha, phase_model
+        )
 
         # =========================================================
         # allocate
@@ -2204,8 +2272,8 @@ class VCSEL:
             A0[idx(i,0),idx(i,1)] = -1/T * ((denom[i]*(1+n[i]) - (1+n[i])*S[i]*s)/(denom[i]**2)) # dn_i/dS_i
             A0[idx(i,1),idx(i,0)] = S[i]/denom[i] + beta_n # dS_i/dn_i
             A0[idx(i,1),idx(i,1)] = (denom[i]*(1+n[i]) - (1+n[i])*S[i]*s)/(denom[i]**2) - 1 # dS_i/dS_i
-            A0[idx(i,2),idx(i,0)] = alpha*0.5/denom[i] # dphi_i/dn_i
-            A0[idx(i,2),idx(i,1)] = -alpha*0.5*(n[i]-nbar)*s/(denom[i]**2) # dphi_i/dS_i
+            A0[idx(i,2),idx(i,0)] = phase_drift_dn[i] # dphi_i/dn_i
+            A0[idx(i,2),idx(i,1)] = phase_drift_dS[i] # dphi_i/dS_i
 
         # =========================================================
         # delayed + instantaneous coupling (ALL VERIFIED)

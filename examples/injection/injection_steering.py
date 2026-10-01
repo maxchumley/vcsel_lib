@@ -18,20 +18,42 @@ import matplotlib
 
 from IPython.display import clear_output
 import gc
-from scipy.ndimage import uniform_filter1d
+from scipy.ndimage import gaussian_filter1d, uniform_filter1d
 from scipy.signal import argrelextrema
 from joblib import Parallel, delayed
 import time 
 from scipy.constants import hbar, c
 from pathlib import Path
+import sys
 
-try:
-    from examples._paths import INJECTION_DATA_DIR, INJECTION_RESULTS_DIR
-except ModuleNotFoundError:
-    import sys
+# Notebook kernels commonly start in ``examples/injection`` (or another
+# directory outside the repository root), and do not define a useful
+# ``__file__``.  Find the root from the current working directory first, then
+# from this source file when it is being run as a script.
+_path_search_starts = [Path.cwd().resolve()]
+if "__file__" in globals():
+    _path_search_starts.append(Path(__file__).resolve().parent)
+for _path_start in _path_search_starts:
+    for _candidate in (_path_start, *_path_start.parents):
+        if (_candidate / "examples" / "_paths.py").is_file():
+            if str(_candidate) not in sys.path:
+                sys.path.insert(0, str(_candidate))
+            break
+    else:
+        continue
+    break
+else:
+    raise ModuleNotFoundError(
+        "Could not locate the vcsel_lib repository root containing examples/_paths.py."
+    )
 
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from examples._paths import INJECTION_DATA_DIR, INJECTION_RESULTS_DIR
+# Prefer this repository's package if a notebook previously imported another
+# installed package named ``examples``.
+for _module_name in tuple(sys.modules):
+    if _module_name == "examples" or _module_name.startswith("examples."):
+        del sys.modules[_module_name]
+
+from examples._paths import INJECTION_DATA_DIR, INJECTION_RESULTS_DIR
 
 DATA_DIR = INJECTION_DATA_DIR
 INJECTION_TESTS_DIR = INJECTION_RESULTS_DIR / "injection_tests"
@@ -62,7 +84,11 @@ I = eta*current_threshold * q/ tau_n * (N0 + 1/(g0*tau_p))
 
 self_feedback = 0.0
 coupling = 1.0
-noise_amplitude = 1.0
+noise_amplitude = 0.0
+# The history generator uses NumPy's legacy global RNG.  Set it explicitly so
+# this target plot and its derived frames are reproducible across reruns.
+random_seed = 0
+np.random.seed(random_seed)
 
 N_lasers = 2
 coupling_scheme = 'CUSTOM'
@@ -84,7 +110,9 @@ results = None
 phi_p = 0#np.pi
 
 dt = 1*tau_p# 1 ps
-Tmax = 1e-6
+# Four monotonically increasing branch-steering pulses, followed by a settling
+# interval.  No reverse (high-to-low) sweep is performed.
+Tmax = 3e-6
 steps = int(Tmax / dt)
 time_arr = np.linspace(0, Tmax, steps)
 delay_steps = int(tau / dt)
@@ -98,9 +126,18 @@ ramp_start = 10
 ramp_shape = 50
 
 
-final_kappa_arr = np.linspace(0.001e9,20e9,11)
-final_kappa_arr = np.linspace(0e9,40e9,500)
-start_kappa_index = 0  # e.g., set to 158 to skip directly to final_kappa_arr[158]
+# Default to one coupling value: this notebook is configured to produce the
+# injection-steering / far-field animation, not a continuation sweep.  Change
+# `run_full_continuation_sweep` only when branch data across the whole range is
+# explicitly needed.
+selected_final_kappa = 40e9  # s^-1; 40 ns^-1, matching the existing animation
+run_full_continuation_sweep = False
+final_kappa_arr = (
+    np.linspace(0e9, 40e9, 500)
+    if run_full_continuation_sweep
+    else np.array([selected_final_kappa])
+)
+start_kappa_index = 0
 
 if not (0 <= start_kappa_index < len(final_kappa_arr)):
     raise ValueError(
@@ -122,7 +159,8 @@ delta = detuning * 2 * np.pi * 1e9  # convert GHz to rad/s
 # Create evenly distributed detuning for both even and odd N_lasers
 delta_dist = np.sort(np.concatenate([delta/2 * np.linspace(-1, 1, N_lasers)]))
 
-n_cases = 50
+# A single deterministic realization: no stochastic noise or ensemble envelope.
+n_cases = 1
 
 phi_p_vals = np.array([0.0])
 
@@ -156,9 +194,11 @@ phys['kappa_c_mat'] = kappa_arr[-1,:,:]
 
 
 
-run_injection_steering = True  # True: injection steering on; False: free run compared to the same target branch
+run_injection_steering = True
 phys['injection'] = run_injection_steering
-inject_max_etot_only = True  # True: inject only into the stable equilibrium with maximum E_tot
+# Target every stable equilibrium once in ascending total-power order; the
+# sequence ends at the highest-power branch and does not steer back down.
+inject_max_etot_only = False
 
 # n_kappa = len(kappa_c)-1
 
@@ -166,12 +206,12 @@ inject_max_etot_only = True  # True: inject only into the stable equilibrium wit
 
 # Gaussian kappa injection centered at peak_time with controllable width
 
-peak_time = 50*tau                     # center (s), e.g. peak = 3*tau above
+peak_time = 200*tau                    # first pulse center: 0.2 us
 peak_spacing_tau = 500                 # separation between Gaussian peaks (in units of tau)
 midpoint_window_tau = 10.0              # averaging half-window (in units of tau) around each midpoint
 cache_frame_data = True                # cache one solved case for frame generation cell
 use_saved_midpoint_power_data = False  # True: reload the summary plot data instead of rerunning/using live arrays
-save_midpoint_power_data = True
+save_midpoint_power_data = False  # not needed for a single animation run
 injection_label = "injection_on" if phys.get("injection", False) else "injection_off"
 noise_label = "noise_on" if not np.isclose(noise_amplitude, 0.0) else "noise_off"
 steering_label = "steering_max_etot" if inject_max_etot_only else "steering_all_eq"
@@ -188,6 +228,8 @@ percent_difference_overlay_paths = [
 
 extrema = []
 all_eq_points = []
+INJECTION_TESTS_DIR.mkdir(parents=True, exist_ok=True)
+(INJECTION_TESTS_DIR / "injection_steering_plots").mkdir(parents=True, exist_ok=True)
 S_idx   = [3*i + 1 for i in range(N_lasers)]
 phi_idx = [3*i + 2 for i in range(N_lasers)]
 # --- Loop over segments of kappa --- 
@@ -278,6 +320,7 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
             phys['injected_frequency'] = np.zeros(len(time_arr))
             peak_times = []
             omega_targets = []
+            phase_diff_targets = []
             
             # Sort stable equilibria by total equilibrium intensity.
             stable_indices = stable_indices[np.argsort(E_tot[stable_indices])]
@@ -303,6 +346,7 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
                     phys['kappa_injection'] += gaussian_peak
                     peak_times.append(current_peak_time)
                     omega_targets.append(omega_target)
+                    phase_diff_targets.append(phi_diff_target)
 
                 # Piecewise-constant injected frequency:
                 # jump to the next omega_target at the midpoint between adjacent peaks.
@@ -403,7 +447,7 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
             # Colorblind-safe palette, with linestyle/markers so curves remain
             # distinguishable even in grayscale printouts.
             laser_colors = [
-                '#0072B2', '#D55E00', '#009E73', '#CC79A7',
+                '#0072B2', '#D60000', '#009E73', '#CC79A7',
                 '#56B4E9', '#E69F00', '#000000'
             ]
             pair_colors = ['#332288', '#117733', '#CC6677', '#AA4499', '#44AA99', '#999933']
@@ -632,7 +676,7 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
             axs[2].grid(True, alpha=0.2)
             axs[2].axvspan(0, 2*delay_steps*dt*1e6, color='gray', alpha=0.2)
             axs[2].tick_params(axis='both', which='major', labelsize=24)
-            axs[2].set_ylim(0, 4)
+            axs[2].set_ylim(0, 8)
 
             ax2 = axs[2].twinx()
             # Keep twin-axis artists above primary-axis artists.
@@ -663,7 +707,7 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
                     ax2.plot(
                         time_plot_full,
                         inj_series,
-                        color='#1F77B4',
+                        color='#20B221',
                         linestyle=(0, (6, 2, 1, 2)),
                         alpha=0.9,
                         linewidth=2,
@@ -711,6 +755,15 @@ for k in range(start_kappa_index, len(final_kappa_arr)):
                     "inj_freq_plot": None if inj_freq_plot is None else inj_freq_plot.copy(),
                     "P_c": P_c.copy(),
                     "inj_series": None if inj_series_for_frames is None else inj_series_for_frames.copy(),
+                    # Keep the physical fields, rather than only their summary
+                    # statistics, so a synchronized far-field animation can be
+                    # rendered after this plotting cell has released `y`.
+                    "field_time_s": t.copy(),
+                    "field_S": S.copy(),
+                    "field_phi": phi.copy(),
+                    "injection_peak_times_us": np.asarray(peak_times, dtype=float) * 1e6,
+                    "injection_target_frequencies_ghz": np.asarray(omega_targets, dtype=float),
+                    "injection_target_phase_diffs": np.asarray(phase_diff_targets, dtype=float),
                     "delay_shade_end_us": float(2 * delay_steps * dt * 1e6),
                     "kappa_title": rf'$\kappa_c = {final_kappa*1e-9:.2f}\,\mathrm{{ns}}^{{-1}},\ \kappa_{{\mathrm{{ratio}}}} = {kappa_ratio:.2f}$',
                     "N_lasers": int(N_lasers),
@@ -1088,19 +1141,30 @@ else:
             "No cached steering data found. Run the simulation cell once with cache_frame_data=True."
         )
 
-frames_dir = INJECTION_TESTS_DIR / "injection_steering_frames"
+# Composite time-series + far-field frames for the single animation.
+frames_dir = INJECTION_TESTS_DIR / "far_field_inj_steering"
 frames_dir.mkdir(parents=True, exist_ok=True)
+# Regeneration must not leave stale trailing frames from a previous schedule.
+for _old_frame_path in frames_dir.glob("frame_*.png"):
+    _old_frame_path.unlink()
 
-# Frame controls
-n_frames = 240
+# Frame controls. Render the initial transient much more slowly than the later
+# branch-steering sequence. Duplicate endpoint indices are intentional: saved
+# simulation samples are coarser than 500 frames in the first 0.25 us.
+slow_window_end_us = 0.25
+slow_window_frames = 500
+remaining_window_frames = 500
 min_points = 10
 frame_plot_stride = 1  # additional decimation for frame rendering
 frame_dpi = 180
 
 # Style (match main steering plot)
 line_styles = ['-', '--', '-.', ':', (0, (3, 1, 1, 1)), (0, (5, 2))]
-laser_colors = ['#0072B2', '#D55E00', '#009E73', '#CC79A7', '#56B4E9', '#E69F00', '#000000']
+# Palette sampled from the original steering animation: blue/red laser traces,
+# deep-purple relative phase, and green injection pulses.
+laser_colors = ['#0072B2', '#D60000', '#009E73', '#CC79A7', '#56B4E9', '#E69F00', '#000000']
 pair_colors = ['#332288', '#117733', '#CC6677', '#AA4499', '#44AA99', '#999933']
+injection_color = '#20B221'
 
 time_top = fd["time_plot"][::frame_plot_stride]
 time_full = fd["time_plot_full"][::frame_plot_stride]
@@ -1132,13 +1196,144 @@ n_top = len(time_top)
 if n_top < min_points:
     raise RuntimeError("Not enough time points to generate animation frames.")
 
-frame_end_idx = np.unique(np.linspace(min_points, n_top, n_frames, dtype=int))
+slow_window_end_idx = int(
+    np.searchsorted(time_top, slow_window_end_us, side="right")
+)
+slow_window_end_idx = min(max(slow_window_end_idx, min_points), n_top)
+if slow_window_end_idx >= n_top:
+    raise RuntimeError(
+        f"The {slow_window_end_us:g} us slow window reaches the end of the simulation."
+    )
+frame_end_idx = np.concatenate(
+    (
+        np.rint(
+            np.linspace(min_points, slow_window_end_idx, slow_window_frames)
+        ).astype(int),
+        np.rint(
+            np.linspace(slow_window_end_idx + 1, n_top, remaining_window_frames)
+        ).astype(int),
+    )
+)
+
+# Far-field data for the lower animation panel.  Each frame shows one
+# instantaneous horizontal angular slice; its normalization is global so the
+# beam remains comparable from frame to frame.
+if not {"field_time_s", "field_S", "field_phi"}.issubset(fd):
+    raise RuntimeError(
+        "The combined time-series/far-field frames require cached fields. "
+        "Re-run the simulation cell with cache_frame_data=True."
+    )
+
+# Display geometry: an effective one-wavelength pitch produces a clear
+# in-phase central lobe and out-of-phase central null/side-lobe pair.  The
+# dynamical coupling model is unchanged; this affects only the plotted field.
+far_field_emitter_spacing_m = lam
+far_field_theta_range_deg = (-180.0, 180.0)
+far_field_n_theta = 801
+far_field_element_fwhm_deg = 100.0
+far_field_blur_fwhm_deg = 1.0
+field_time_s = np.asarray(fd["field_time_s"], dtype=float)
+field_S = np.asarray(fd["field_S"], dtype=float)
+field_phi = np.asarray(fd["field_phi"], dtype=float)
+far_field_theta_deg = np.linspace(
+    *far_field_theta_range_deg, far_field_n_theta
+)
+far_field_positions_m = (
+    np.arange(field_S.shape[1]) - 0.5 * (field_S.shape[1] - 1)
+) * far_field_emitter_spacing_m
+far_field_steering = np.exp(
+    1j * (2.0 * np.pi / lam) * np.outer(
+        np.sin(np.deg2rad(far_field_theta_deg)), far_field_positions_m
+    )
+)
+far_field_element_envelope = np.exp(
+    -4.0 * np.log(2.0)
+    * (far_field_theta_deg / far_field_element_fwhm_deg) ** 2
+)
+far_field_theta_step_deg = far_field_theta_deg[1] - far_field_theta_deg[0]
+far_field_blur_sigma_samples = (
+    far_field_blur_fwhm_deg
+    / (2.0 * np.sqrt(2.0 * np.log(2.0)) * far_field_theta_step_deg)
+)
+far_field_sample_indices = np.array(
+    [
+        int(np.argmin(np.abs(field_time_s - time_top[end_idx - 1] * 1e-6)))
+        for end_idx in frame_end_idx
+    ],
+    dtype=int,
+)
+
+
+def instantaneous_far_field_slice(sample_index):
+    fields = np.sqrt(np.clip(field_S[:, :, sample_index], 0.0, None)) * np.exp(
+        1j * np.remainder(field_phi[:, :, sample_index], 2.0 * np.pi)
+    )
+    array_field = np.einsum("ae,ce->ac", far_field_steering, fields, optimize=False)
+    return np.mean(np.abs(array_field) ** 2, axis=1) * far_field_element_envelope
+
+
+def smooth_far_field_profile(profile):
+    """Apply the optional display-only angular blur."""
+    if far_field_blur_fwhm_deg <= 0.0:
+        return np.asarray(profile, dtype=float).copy()
+    return gaussian_filter1d(
+        profile,
+        sigma=far_field_blur_sigma_samples,
+        mode="nearest",
+    )
+
+
+far_field_slices = np.vstack(
+    [instantaneous_far_field_slice(sample_index) for sample_index in far_field_sample_indices]
+)
+far_field_slice_max = float(np.max(far_field_slices))
+if not np.isfinite(far_field_slice_max) or far_field_slice_max <= 0.0:
+    raise RuntimeError("Far-field slices have zero or non-finite intensity.")
+far_field_slices /= far_field_slice_max
+zero_angle_index = int(np.argmin(np.abs(far_field_theta_deg)))
+
+# Color the far-field curve continuously from the simulated instantaneous
+# frequency of laser 1.  Anchor jet_r to the injection-target range so the
+# lowest target frequency is red and the highest is blue.
+if "injection_target_frequencies_ghz" not in fd:
+    raise RuntimeError(
+        "Frequency coloring requires cached injection targets. Re-run the simulation cell."
+    )
+injection_target_frequencies_ghz = np.asarray(
+    fd["injection_target_frequencies_ghz"], dtype=float
+)
+if injection_target_frequencies_ghz.size == 0:
+    raise RuntimeError("Cached injection-target frequency array is empty.")
+_frame_time_indices = np.clip(frame_end_idx - 1, 0, len(time_top) - 1)
+frame_dphi_1_ghz = dphi_mean_f[0, _frame_time_indices]
+frequency_color_min = float(np.min(injection_target_frequencies_ghz))
+frequency_color_max = float(np.max(injection_target_frequencies_ghz))
+if np.isclose(frequency_color_min, frequency_color_max):
+    frequency_color_max = frequency_color_min + 1.0
+frequency_to_color = matplotlib.colors.Normalize(
+    frequency_color_min, frequency_color_max, clip=True
+)
+frequency_colormap = plt.get_cmap("jet_r")
+frame_far_field_colors = [
+    frequency_colormap(frequency_to_color(_frequency))
+    for _frequency in frame_dphi_1_ghz
+]
 
 for frame_id, end_idx in enumerate(frame_end_idx):
     end_full = min(end_idx + 1, len(time_full))
     marker_every = max(1, end_idx // 24)
 
-    fig, axs = plt.subplots(3, 1, figsize=(14, 14), dpi=frame_dpi, sharex=True)
+    fig = plt.figure(figsize=(16, 18), dpi=frame_dpi)
+    grid = fig.add_gridspec(
+        4, 1,
+        height_ratios=(1.0, 1.0, 1.12, 1.30),
+        hspace=0.42,
+    )
+    # Use the canvas efficiently: GridSpec defaults reserve wide outer margins
+    # that become very noticeable in animation frames.
+    fig.subplots_adjust(left=0.095, right=0.955, bottom=0.045, top=0.975)
+    axs = [fig.add_subplot(grid[row, 0]) for row in range(3)]
+    far_field_ax = fig.add_subplot(grid[3, 0])
 
     if inj_freq_f is not None:
         axs[0].plot(
@@ -1179,7 +1374,7 @@ for frame_id, end_idx in enumerate(frame_end_idx):
     axs[0].axvspan(0, fd["delay_shade_end_us"], color="gray", alpha=0.2)
     axs[0].tick_params(axis="both", which="major", labelsize=24)
     if fd.get("kappa_title"):
-        axs[0].set_title(fd["kappa_title"], fontsize=30, pad=20)
+        axs[0].set_title(fd["kappa_title"], fontsize=30, pad=8)
     if fd["N_lasers"] <= 6:
         axs[0].legend(loc="upper right", fontsize=16)
 
@@ -1275,7 +1470,7 @@ for frame_id, end_idx in enumerate(frame_end_idx):
         ax2.plot(
             time_full[:end_full],
             inj_series_f[:end_full],
-            color="#1F77B4",
+            color=injection_color,
             linestyle=(0, (6, 2, 1, 2)),
             alpha=0.9,
             linewidth=2.0,
@@ -1302,11 +1497,185 @@ for frame_id, end_idx in enumerate(frame_end_idx):
             frameon=True,
         )
 
-    axs[2].set_xlim(time_full[0], time_full[-1])
-    plt.tight_layout()
+    # The first two panels contain the decimated frequency/phase timeline and
+    # would otherwise autoscale to the animation's current endpoint.  Keep all
+    # time-series axes on the full run window, like the far-field panel below.
+    for time_series_ax in axs:
+        time_series_ax.set_xlim(time_full[0], time_full[-1])
+
+    current_far_field_global = far_field_slices[frame_id]
+    current_on_axis_intensity = current_far_field_global[zero_angle_index]
+    far_field_color = frame_far_field_colors[frame_id]
+    current_far_field = smooth_far_field_profile(current_far_field_global)
+    # Normalize each displayed angular slice to its own peak: this emphasizes
+    # the central-lobe versus central-null modal structure, while the curve
+    # color continues to convey the absolute on-axis intensity.
+    current_far_field /= np.max(current_far_field)
+    far_field_ax.plot(
+        far_field_theta_deg,
+        current_far_field,
+        color=far_field_color,
+        linewidth=3.2,
+    )
+    far_field_ax.fill_between(
+        far_field_theta_deg,
+        0.0,
+        current_far_field,
+        color=far_field_color,
+        alpha=0.14,
+    )
+    far_field_ax.set(
+        xlim=far_field_theta_range_deg,
+        ylim=(0.0, 1.05),
+        xlabel=r"Far-field angle $\theta$ (degrees)",
+        ylabel="Globally normalized intensity",
+        title=(
+            rf"Instantaneous far-field slice  |  "
+            rf"$\dot{{\phi}}_1={frame_dphi_1_ghz[frame_id]:.2f}\,\mathrm{{GHz}},\ "
+            rf"I(\theta=0^\circ)={current_on_axis_intensity:.3f}$"
+        ),
+    )
+    far_field_ax.set_xlabel(r"Far-field angle $\theta$ (degrees)", fontsize=20, labelpad=8)
+    far_field_ax.set_ylabel("Globally normalized intensity", fontsize=20, labelpad=10)
+    far_field_ax.set_title(far_field_ax.get_title(), fontsize=20, pad=13)
+    far_field_ax.tick_params(axis="both", which="major", labelsize=17)
+    far_field_ax.grid(alpha=0.25)
+
     fig.savefig(frames_dir / f"frame_{frame_id:05d}.png")
     plt.close(fig)
 
 print(f"Saved {len(frame_end_idx)} frames to: {frames_dir}")
 print("Example ffmpeg command:")
 print(f"ffmpeg -framerate 30 -i {frames_dir}/frame_%05d.png -pix_fmt yuv420p injection_steering.mp4")
+
+
+#%% SYNCHRONIZED FAR-FIELD FRAMES
+#
+# Render one instantaneous far-field frame for each steering time-series
+# animation frame.  The time coordinate is taken from `frame_end_idx`, so
+# far_field_inj_steering/frame_00042.png corresponds exactly to
+# injection_steering_frames/frame_00042.png.  This cell deliberately only
+# writes PNGs; it does not assemble a movie.
+if not {"field_time_s", "field_S", "field_phi"}.issubset(fd):
+    raise RuntimeError(
+        "Far-field frames require cached fields. Re-run the simulation cell "
+        "with cache_frame_data=True after updating this script."
+    )
+
+from examples.visualization.far_field_intensity import angle_grid, emitter_positions
+
+# Optional far-field-only frames.  Keep them distinct from the composite
+# animation frames above so running this cell cannot overwrite those PNGs.
+far_field_frames_dir = INJECTION_TESTS_DIR / "far_field_inj_steering_only"
+far_field_frames_dir.mkdir(parents=True, exist_ok=True)
+
+# Optical geometry.  These match the repository's two-VCSEL far-field example;
+# adjust `far_field_emitter_spacing_m` to match the fabricated array.
+far_field_emitter_spacing_m = 10e-6
+far_field_theta_range_deg = (-30.0, 30.0)
+far_field_n_theta = 801
+far_field_element_fwhm_deg = 20.0
+far_field_dpi = 180
+
+field_time_s = np.asarray(fd["field_time_s"], dtype=float)
+field_S = np.asarray(fd["field_S"], dtype=float)
+field_phi = np.asarray(fd["field_phi"], dtype=float)
+if field_S.ndim != 3 or field_phi.shape != field_S.shape:
+    raise ValueError("Cached field arrays must have shape (case, laser, time).")
+if field_S.shape[1] != fd["N_lasers"]:
+    raise ValueError("Cached field laser count does not match steering_frame_data.")
+
+theta_deg = angle_grid(far_field_theta_range_deg, n_theta=far_field_n_theta)
+positions_m = emitter_positions(field_S.shape[1], d=far_field_emitter_spacing_m)
+steering_matrix = np.exp(
+    1j * (2.0 * np.pi / lam) * np.outer(np.sin(np.deg2rad(theta_deg)), positions_m)
+)
+element_envelope = np.exp(
+    -4.0 * np.log(2.0) * (theta_deg / far_field_element_fwhm_deg) ** 2
+)
+
+# `end_idx - 1` is the latest plotted sample in the matching time-series
+# frame.  Locate it in the raw fields rather than assuming save_every=1.
+far_field_sample_indices = np.array(
+    [
+        int(np.argmin(np.abs(field_time_s - time_top[end_idx - 1] * 1e-6)))
+        for end_idx in frame_end_idx
+    ],
+    dtype=int,
+)
+far_field_frame_times_us = field_time_s[far_field_sample_indices] * 1e6
+
+
+def instantaneous_far_field(sample_index):
+    """Ensemble-average instantaneous intensity at one saved simulation time."""
+    fields = np.sqrt(np.clip(field_S[:, :, sample_index], 0.0, None)) * np.exp(
+        1j * np.remainder(field_phi[:, :, sample_index], 2.0 * np.pi)
+    )
+    array_field = np.einsum("ae,ce->ac", steering_matrix, fields, optimize=False)
+    return np.mean(np.abs(array_field) ** 2, axis=1) * element_envelope
+
+
+far_field_intensities = np.vstack(
+    [instantaneous_far_field(sample_index) for sample_index in far_field_sample_indices]
+)
+global_far_field_max = float(np.max(far_field_intensities))
+if not np.isfinite(global_far_field_max) or global_far_field_max <= 0.0:
+    raise RuntimeError("The synchronized far-field frames have zero or non-finite intensity.")
+far_field_intensities /= global_far_field_max
+
+# A solution is identified by the circular-mean relative phase, binned into
+# eight phase sectors.  Require a sector to persist for two frames so numerical
+# noise does not recolor the plot.  Each accepted solution transition advances
+# the curve color slightly, making steering events immediately visible.
+relative_phases = np.angle(
+    np.mean(np.exp(1j * (field_phi[:, 0, :][:, far_field_sample_indices]
+                         - field_phi[:, 1, :][:, far_field_sample_indices])), axis=0)
+)
+phase_sectors = np.floor((relative_phases + np.pi) / (2.0 * np.pi) * 8).astype(int) % 8
+solution_ids = np.zeros(len(phase_sectors), dtype=int)
+active_sector = int(phase_sectors[0])
+pending_sector = active_sector
+pending_count = 0
+for i, sector in enumerate(phase_sectors[1:], start=1):
+    solution_changed = False
+    if sector == active_sector:
+        pending_sector, pending_count = active_sector, 0
+    elif sector == pending_sector:
+        pending_count += 1
+        if pending_count >= 2:
+            active_sector, pending_count = int(sector), 0
+            solution_changed = True
+    else:
+        pending_sector, pending_count = int(sector), 1
+    solution_ids[i] = solution_ids[i - 1] + int(solution_changed)
+
+solution_colors = plt.get_cmap("viridis")(
+    0.22 + 0.62 * ((solution_ids % 9) / 8.0)
+)
+for frame_id, (intensity, time_us, phase_rad, solution_id, color) in enumerate(
+    zip(far_field_intensities, far_field_frame_times_us, relative_phases, solution_ids, solution_colors)
+):
+    fig, ax = plt.subplots(figsize=(12, 7), dpi=far_field_dpi)
+    ax.plot(theta_deg, intensity, color=color, linewidth=3.0)
+    ax.fill_between(theta_deg, 0.0, intensity, color=color, alpha=0.16)
+    ax.set(
+        xlim=far_field_theta_range_deg,
+        ylim=(0.0, 1.05),
+        xlabel=r"Far-field angle $\theta$ (degrees)",
+        ylabel="Globally normalized intensity",
+        title=(rf"Injection steering far field  |  $t={time_us:.4f}\,\mu$s$"
+               rf"  |  $\Delta\phi={phase_rad:.2f}$ rad  |  solution {solution_id}"),
+    )
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    fig.savefig(far_field_frames_dir / f"frame_{frame_id:05d}.png")
+    plt.close(fig)
+
+np.savetxt(
+    far_field_frames_dir / "frame_times_us.csv",
+    np.column_stack((np.arange(len(far_field_frame_times_us)), far_field_frame_times_us)),
+    delimiter=",",
+    header="frame_id,time_us",
+    comments="",
+)
+print(f"Saved {len(far_field_sample_indices)} synchronized far-field frames to: {far_field_frames_dir}")
