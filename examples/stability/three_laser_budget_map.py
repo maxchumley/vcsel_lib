@@ -48,7 +48,7 @@ from vcsel_lib import VCSEL
 
 
 # Set the three laser frequencies here in GHz, before centering.
-UNCENTERED_DETUNINGS_GHZ = np.array([-1.0, 0.0, 2.0])
+UNCENTERED_DETUNINGS_GHZ = np.array([1.5,-0.5,-1.5])
 TAU_P = 5.4e-12
 
 
@@ -211,9 +211,13 @@ def plot_map(rows: list[dict], grid: int, max_budget: float, output: Path) -> No
         bars.bar([r"$a_{12}$", r"$a_{13}$", r"$a_{23}$"], values)
         bars.set_title(f"Lowest threshold: {best['threshold_per_ns']:.2f} ns$^{{-1}}$")
     bars.set(ylabel="Pair coupling fraction", ylim=(0, 1))
-    fig.suptitle(f"Detunings: 1, 2 GHz gaps; search through {max_budget:g} ns$^{{-1}}$; "
-                 r"$\phi_{nm}=0$")
-    fig.tight_layout()
+    gap_12, gap_23 = np.abs(np.diff(UNCENTERED_DETUNINGS_GHZ))
+    fig.suptitle(
+        rf"Adjacent detuning gaps: {gap_12:g}, {gap_23:g} GHz; $\phi_{{nm}}=0$" "\n"
+        rf"Unique-link budget through {max_budget:g} ns$^{{-1}}$ "
+        rf"(full matrix sum through {2 * max_budget:g} ns$^{{-1}}$)"
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.91))
     fig.savefig(output, dpi=180)
     plt.close(fig)
 
@@ -330,8 +334,8 @@ def load_optimal_coupling(csv_path: Path) -> tuple[dict, np.ndarray]:
 
 
 #%% Run the scan (run this cell after the imports/functions cell)
-GRID = 5
-BUDGET_STEP_PER_NS = 0.1
+GRID = 20
+BUDGET_STEP_PER_NS = 0.2
 MAX_BUDGET_PER_NS = 50.0
 PHASE_COUNT = 5
 FREQ_COUNT = 25
