@@ -137,7 +137,7 @@ def plot_selected_design(
     *,
     vertical_layout: bool = False,
 ) -> plt.Figure:
-    """Plot one selected design and its settled phase relationship."""
+    """Plot one selected design with one-based laser labels."""
     if vertical_layout:
         # Reserve the same colorbar column beside every row so the four main
         # plotting axes have identical left and right boundaries.
@@ -199,6 +199,18 @@ def plot_selected_design(
         xlabel="receiver",
         ylabel="source",
     )
+    if run_config.n_lasers <= 10:
+        laser_tick_positions = np.arange(run_config.n_lasers)
+    else:
+        laser_tick_positions = np.unique(
+            np.rint(
+                np.linspace(0, run_config.n_lasers - 1, 6)
+            ).astype(int)
+        )
+    laser_tick_labels = laser_tick_positions + 1
+    for matrix_axis in axes[:2]:
+        matrix_axis.set_xticks(laser_tick_positions, laser_tick_labels)
+        matrix_axis.set_yticks(laser_tick_positions, laser_tick_labels)
     phase_colorbar_kwargs = (
         {"cax": colorbar_axes[1]} if vertical_layout else {"ax": axes[1]}
     )
@@ -357,7 +369,7 @@ def plot_selected_design(
         axes[3].text(
             positions[node][0],
             positions[node][1],
-            str(node),
+            str(node + 1),
             ha="center",
             va="center",
             color="white" if luminance < 0.52 else "0.15",
