@@ -300,6 +300,13 @@ class VCSEL:
         RETURNS:
             out: (n_cases, 3N)
             same ordering for [dn_i, dS_i, dphi_i] for i=0..N-1
+
+        When injection is enabled, injection_topology may have shape (N,)
+        for a mask shared by all cases or (n_cases, N) for one mask per case.
+        kappa_inj may vary by case with shape (n_cases, steps).
+        Alternatively, injection_forcing may contain a complex, already
+        summed source field with shape (N, steps) or (n_cases, N, steps).
+        Its units are nondimensional kappa times sqrt(injected photon number).
         """
 
         if nd is None:
@@ -481,10 +488,34 @@ class VCSEL:
             dphi += nd["self_feedback"] * kappa_diag * ((sqrtS_2t / sqrtS) * sin_self)
 
         # ----------------- INJECTION (optional) -----------------
+        injection_forcing = nd.get("injection_forcing", None)
         injection_topology = nd.get("injection_topology", None)
-        if nd.get("injection", False) and injection_topology is not None:
-
-            assert injection_topology.shape == (N,), "injection_topology must be shape (N,) indicating which lasers receive injection."
+        if nd.get("injection", False) and injection_forcing is not None:
+            forcing = np.asarray(injection_forcing)
+            if forcing.ndim == 2 and forcing.shape[0] == N and j < forcing.shape[1]:
+                forcing_now = forcing[:, j][None, :]
+            elif (forcing.ndim == 3 and forcing.shape[:2] == (n_cases, N)
+                  and j < forcing.shape[2]):
+                forcing_now = forcing[:, :, j]
+            else:
+                raise ValueError(
+                    "injection_forcing must have shape (N, steps) or "
+                    f"({n_cases}, N, steps); got {forcing.shape} at step {j}"
+                )
+            forcing_in_laser_frame = forcing_now * np.exp(-1j * phi)
+            dS += 2 * sqrtS * forcing_in_laser_frame.real
+            dphi += forcing_in_laser_frame.imag / sqrtS
+        elif nd.get("injection", False) and injection_topology is not None:
+            injection_topology = np.asarray(injection_topology, dtype=bool)
+            if injection_topology.shape == (N,):
+                injection_cases = np.broadcast_to(injection_topology, (n_cases, N))
+            elif injection_topology.shape == (n_cases, N):
+                injection_cases = injection_topology
+            else:
+                raise ValueError(
+                    "injection_topology must have shape "
+                    f"({N},) or ({n_cases},{N}); got {injection_topology.shape}"
+                )
 
             inj_strength = nd["injected_strength"]
             inj_phase    = nd["injected_phase_diff"]
@@ -497,8 +528,8 @@ class VCSEL:
             t = j*nd["dt"]
 
             for p in range(N):
-
-                if not injection_topology[p]:
+                active_cases = injection_cases[:, p]
+                if not np.any(active_cases):
                     continue
 
                 S0   = S[:, p]
@@ -506,8 +537,9 @@ class VCSEL:
 
                 inj_cos = np.cos(omega_inj*t + inj_phase - phi0)
                 inj_sin = np.sin(omega_inj*t + inj_phase - phi0)
-                dS[:, p]  += 2*kappa_inj*np.sqrt(S0*inj_strength)*inj_cos
-                dphi[:, p] +=     kappa_inj*np.sqrt(inj_strength/S0)*inj_sin
+                injection_rate = kappa_inj * active_cases
+                dS[:, p]  += 2*injection_rate*np.sqrt(S0*inj_strength)*inj_cos
+                dphi[:, p] +=     injection_rate*np.sqrt(inj_strength/S0)*inj_sin
         elif nd.get("injection", False) and injection_topology is None:
             raise ValueError("Injection topology must be provided when injection is enabled.")
 
@@ -1524,22 +1556,23 @@ class VCSEL:
             )
 
         if shape == 'FR':
-            # Free-running steady-state: steady carriers and photons; phi2 may
-            # accumulate according to detuning.
+            # Match the phase rate in f_nd at the free-running carrier and
+            # photon steady state, including the selected phase model's drift.
             history = np.zeros((n_cases, 3 * N_lasers, length))
-            history[:, 0::3, :] = nd['nbar']         # n1
-            history[:, 1::3, :] = nd['sbar']         # S1 (nondimensional)
-            freq_hist = np.zeros((n_cases, N_lasers, length))
-            delta_cases = _delta_cases_for_history()
+            history[:, 0::3, :] = nd['nbar']
+            history[:, 1::3, :] = nd['sbar']
+            phase_drift, _, _ = self._intrinsic_phase_gain(
+                np.asarray(nd['nbar']), np.asarray(nd['sbar']), nd['s'],
+                nd['nbar'], nd['alpha'],
+                nd.get('phase_model', 'chumley_2026'),
+            )
+            omega_cases = _delta_cases_for_history() + phase_drift
             t_hist = np.arange(length) * nd['dt']
-
-            for p in range(N_lasers):
-                history[:, 3 * p + 2, :] = delta_cases[:, p, None] * t_hist[None, :]
-                freq_hist[:, p, :] = (
-                    delta_cases[:, p, None]
-                    / (2 * np.pi * 1e9 * nd['tau_p'])
-                )
-
+            history[:, 2::3, :] = omega_cases[:, :, None] * t_hist[None, None, :]
+            freq_hist = np.broadcast_to(
+                omega_cases[:, :, None] / (2 * np.pi * 1e9 * nd['tau_p']),
+                (n_cases, N_lasers, length),
+            ).copy()
             return history, freq_hist, eq, results
 
 

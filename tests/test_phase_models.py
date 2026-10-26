@@ -112,3 +112,31 @@ def test_missing_phase_model_preserves_chumley_2026_behavior():
 def test_invalid_phase_model_is_rejected():
     with pytest.raises(ValueError, match="Unknown phase_model"):
         VCSEL._intrinsic_phase_gain(0.0, 1.0, 0.0, 0.0, 2.0, "not_a_model")
+
+
+@pytest.mark.parametrize("phase_model", ["ma_2019", "standard_lk", "chumley_2026"])
+def test_free_running_history_phase_rate_matches_dynamics(phase_model):
+    vcsel = VCSEL({})
+    nd = _nd(phase_model)
+    nd.update(sbar=1.3, tau_p=5.4e-12, dt=0.1, delay_steps=3)
+    nd["delta_p"] = np.array([[-0.02, 0.03], [-0.04, 0.05]])
+
+    history, freq_hist, _, _ = vcsel.generate_history(nd, shape="FR", n_cases=2)
+    free_running_gain = (
+        nd["alpha"] / 2 * ((1 + nd["nbar"]) / (1 + nd["s"] * nd["sbar"]) - 1)
+        if phase_model == "standard_lk" else 0.0
+    )
+    expected_rate = nd["delta_p"] + free_running_gain
+    np.testing.assert_allclose(
+        history[:, 2::3, 1] - history[:, 2::3, 0],
+        expected_rate * nd["dt"],
+    )
+    np.testing.assert_allclose(
+        freq_hist[:, :, 0],
+        expected_rate / (2 * np.pi * 1e9 * nd["tau_p"]),
+    )
+    derivative = vcsel.f_nd(
+        history[:, :, -1], history[:, :, -1], history[:, :, -1],
+        2 * nd["delay_steps"] - 1, nd["phi_p"], nd,
+    )
+    np.testing.assert_allclose(derivative[:, 2::3], expected_rate)
