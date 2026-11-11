@@ -1199,114 +1199,116 @@ class VCSEL:
 
             for n in range(start_idx, steps - 1):
 
-                if use_stream:
-                    y_n = y_buf[:, :, n % buffer_len]
-                    if delay_interp in ("linear", "cubic"):
-                        idx_hi = max(n - k0, 0)
-                        idx_lo = max(n - k0 - 1, 0)
-                        y_tau_hi = y_buf[:, :, idx_hi % buffer_len]
-                        y_tau_lo = y_buf[:, :, idx_lo % buffer_len]
-                        if delay_interp == "cubic":
-                            idx_p0 = max(idx_lo - 1, 0)
-                            idx_p3 = max(idx_hi + 1, 0)
-                            p0 = y_buf[:, :, idx_p0 % buffer_len]
-                            p1 = y_tau_lo
-                            p2 = y_tau_hi
-                            p3 = y_buf[:, :, idx_p3 % buffer_len]
-                            t = 1.0 - frac
-                            t2 = t * t
-                            t3 = t2 * t
-                            y_tau = 0.5 * (
-                                (2.0 * p1)
-                                + (-p0 + p2) * t
-                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
-                            )
-                        else:
-                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+                for stage_idx in (n, n + 1):
+                    if use_stream:
+                        y_n = y_buf[:, :, n % buffer_len]
+                        if delay_interp in ("linear", "cubic"):
+                            idx_hi = max(stage_idx - k0, 0)
+                            idx_lo = max(stage_idx - k0 - 1, 0)
+                            y_tau_hi = y_buf[:, :, idx_hi % buffer_len]
+                            y_tau_lo = y_buf[:, :, idx_lo % buffer_len]
+                            if delay_interp == "cubic":
+                                idx_p0 = max(idx_lo - 1, 0)
+                                idx_p3 = max(idx_hi + 1, 0)
+                                p0 = y_buf[:, :, idx_p0 % buffer_len]
+                                p1 = y_tau_lo
+                                p2 = y_tau_hi
+                                p3 = y_buf[:, :, idx_p3 % buffer_len]
+                                t = 1.0 - frac
+                                t2 = t * t
+                                t3 = t2 * t
+                                y_tau = 0.5 * (
+                                    (2.0 * p1)
+                                    + (-p0 + p2) * t
+                                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                                )
+                            else:
+                                y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
 
-                        idx_hi2 = max(n - k0_2, 0)
-                        idx_lo2 = max(n - k0_2 - 1, 0)
-                        y_2tau_hi = y_buf[:, :, idx_hi2 % buffer_len]
-                        y_2tau_lo = y_buf[:, :, idx_lo2 % buffer_len]
-                        if delay_interp == "cubic":
-                            idx_p0_2 = max(idx_lo2 - 1, 0)
-                            idx_p3_2 = max(idx_hi2 + 1, 0)
-                            p0 = y_buf[:, :, idx_p0_2 % buffer_len]
-                            p1 = y_2tau_lo
-                            p2 = y_2tau_hi
-                            p3 = y_buf[:, :, idx_p3_2 % buffer_len]
-                            t = 1.0 - frac2
-                            t2 = t * t
-                            t3 = t2 * t
-                            y_2tau = 0.5 * (
-                                (2.0 * p1)
-                                + (-p0 + p2) * t
-                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
-                            )
+                            idx_hi2 = max(stage_idx - k0_2, 0)
+                            idx_lo2 = max(stage_idx - k0_2 - 1, 0)
+                            y_2tau_hi = y_buf[:, :, idx_hi2 % buffer_len]
+                            y_2tau_lo = y_buf[:, :, idx_lo2 % buffer_len]
+                            if delay_interp == "cubic":
+                                idx_p0_2 = max(idx_lo2 - 1, 0)
+                                idx_p3_2 = max(idx_hi2 + 1, 0)
+                                p0 = y_buf[:, :, idx_p0_2 % buffer_len]
+                                p1 = y_2tau_lo
+                                p2 = y_2tau_hi
+                                p3 = y_buf[:, :, idx_p3_2 % buffer_len]
+                                t = 1.0 - frac2
+                                t2 = t * t
+                                t3 = t2 * t
+                                y_2tau = 0.5 * (
+                                    (2.0 * p1)
+                                    + (-p0 + p2) * t
+                                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                                )
+                            else:
+                                y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
                         else:
-                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
+                            idx_tau = idx_tau_arr[stage_idx]
+                            idx_2tau = idx_2tau_arr[stage_idx]
+                            y_tau = y_buf[:, :, max(idx_tau, 0) % buffer_len]
+                            y_2tau = y_buf[:, :, max(idx_2tau, 0) % buffer_len]
                     else:
-                        idx_tau = idx_tau_arr[n + 1]
-                        idx_2tau = idx_2tau_arr[n + 1]
-                        y_tau = y_buf[:, :, max(idx_tau, 0) % buffer_len]
-                        y_2tau = y_buf[:, :, max(idx_2tau, 0) % buffer_len]
-                else:
-                    y_n = y[:, :, n]
-                    if delay_interp in ("linear", "cubic"):
-                        idx_hi = max(n - k0, 0)
-                        idx_lo = max(n - k0 - 1, 0)
-                        y_tau_hi = y[:, :, idx_hi]
-                        y_tau_lo = y[:, :, idx_lo]
-                        if delay_interp == "cubic":
-                            idx_p0 = max(idx_lo - 1, 0)
-                            idx_p3 = max(idx_hi + 1, 0)
-                            p0 = y[:, :, idx_p0]
-                            p1 = y_tau_lo
-                            p2 = y_tau_hi
-                            p3 = y[:, :, idx_p3]
-                            t = 1.0 - frac
-                            t2 = t * t
-                            t3 = t2 * t
-                            y_tau = 0.5 * (
-                                (2.0 * p1)
-                                + (-p0 + p2) * t
-                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
-                            )
+                        y_n = y[:, :, n]
+                        if delay_interp in ("linear", "cubic"):
+                            idx_hi = max(stage_idx - k0, 0)
+                            idx_lo = max(stage_idx - k0 - 1, 0)
+                            y_tau_hi = y[:, :, idx_hi]
+                            y_tau_lo = y[:, :, idx_lo]
+                            if delay_interp == "cubic":
+                                idx_p0 = max(idx_lo - 1, 0)
+                                idx_p3 = max(idx_hi + 1, 0)
+                                p0 = y[:, :, idx_p0]
+                                p1 = y_tau_lo
+                                p2 = y_tau_hi
+                                p3 = y[:, :, idx_p3]
+                                t = 1.0 - frac
+                                t2 = t * t
+                                t3 = t2 * t
+                                y_tau = 0.5 * (
+                                    (2.0 * p1)
+                                    + (-p0 + p2) * t
+                                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                                )
+                            else:
+                                y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
+                            idx_hi2 = max(stage_idx - k0_2, 0)
+                            idx_lo2 = max(stage_idx - k0_2 - 1, 0)
+                            y_2tau_hi = y[:, :, idx_hi2]
+                            y_2tau_lo = y[:, :, idx_lo2]
+                            if delay_interp == "cubic":
+                                idx_p0_2 = max(idx_lo2 - 1, 0)
+                                idx_p3_2 = max(idx_hi2 + 1, 0)
+                                p0 = y[:, :, idx_p0_2]
+                                p1 = y_2tau_lo
+                                p2 = y_2tau_hi
+                                p3 = y[:, :, idx_p3_2]
+                                t = 1.0 - frac2
+                                t2 = t * t
+                                t3 = t2 * t
+                                y_2tau = 0.5 * (
+                                    (2.0 * p1)
+                                    + (-p0 + p2) * t
+                                    + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+                                    + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+                                )
+                            else:
+                                y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
                         else:
-                            y_tau = (1.0 - frac) * y_tau_hi + frac * y_tau_lo
-                        idx_hi2 = max(n - k0_2, 0)
-                        idx_lo2 = max(n - k0_2 - 1, 0)
-                        y_2tau_hi = y[:, :, idx_hi2]
-                        y_2tau_lo = y[:, :, idx_lo2]
-                        if delay_interp == "cubic":
-                            idx_p0_2 = max(idx_lo2 - 1, 0)
-                            idx_p3_2 = max(idx_hi2 + 1, 0)
-                            p0 = y[:, :, idx_p0_2]
-                            p1 = y_2tau_lo
-                            p2 = y_2tau_hi
-                            p3 = y[:, :, idx_p3_2]
-                            t = 1.0 - frac2
-                            t2 = t * t
-                            t3 = t2 * t
-                            y_2tau = 0.5 * (
-                                (2.0 * p1)
-                                + (-p0 + p2) * t
-                                + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
-                                + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
-                            )
-                        else:
-                            y_2tau = (1.0 - frac2) * y_2tau_hi + frac2 * y_2tau_lo
-                    else:
-                        y_tau = y[:, :, idx_tau_arr[n + 1]]
-                        y_2tau = y[:, :, idx_2tau_arr[n + 1]]
+                            y_tau = y[:, :, idx_tau_arr[stage_idx]]
+                            y_2tau = y[:, :, idx_2tau_arr[stage_idx]]
 
-                # RHS at current step
-                f_n = self.f_nd(
-                    y_n, y_tau, y_2tau, n, phi_p, nd
-                )[:, :3*N_lasers]
+                    if stage_idx == n:
+                        # RHS at current step
+                        f_n = self.f_nd(
+                            y_n, y_tau, y_2tau, n, phi_p, nd
+                        )[:, :3*N_lasers]
 
                 # initial guess (explicit Euler)
                 y_guess[:] = y_n
