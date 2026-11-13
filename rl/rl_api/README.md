@@ -12,6 +12,9 @@ scripts and checkpoints are separate. Bernoulli gate training is deferred.
 
 ## Start here
 
+**Great Lakes batch jobs:** see [cluster setup and submission](docs/great_lakes.md).
+The Slurm script uses account `arrays0` and the current root-encoder recipe.
+
 **Next experiment:** use `experiments/train_mirrored_root_encoder_1000.py`.
 It adds a binary root indicator to each laser's encoder features so the
 network knows which reference it is using. All other settings match the
