@@ -186,6 +186,7 @@ def test_inspector_inference_only_path(tmp_path, monkeypatch):
     tree.save_checkpoint(checkpoint, policy, optimizer, iteration=4, metrics={})
     monkeypatch.setattr(inspect, "INFERENCE_DEVICE", "cpu")
     monkeypatch.setattr(inspect, "FIGURE_DIRECTORY", tmp_path)
+    monkeypatch.setitem(inspect.PLOT_STYLE, "text.usetex", False)
     monkeypatch.setattr(plt, "show", lambda: None)
     result = inspect.main(checkpoint, n_lasers=5, run_validation=False)
     assert result["simulation"] is None
@@ -234,6 +235,7 @@ def test_inspector_uses_standard_four_panel_and_dynamics_plots(
 
     monkeypatch.setattr(inspect, "INFERENCE_DEVICE", "cpu")
     monkeypatch.setattr(inspect, "FIGURE_DIRECTORY", tmp_path)
+    monkeypatch.setitem(inspect.PLOT_STYLE, "text.usetex", False)
     monkeypatch.setattr(inspect, "simulate_with_vcsel", fake_simulation)
     monkeypatch.setattr(inspect, "calculate_phase_reward", fake_reward)
     monkeypatch.setattr(inspect, "plot_selected_design", fake_four_panel)
