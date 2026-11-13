@@ -127,7 +127,7 @@ def test_mirrored_sampling_scores_and_endpoint_use_delay_corrected_mean(tmp_path
     torch.testing.assert_close(ab, bb, rtol=0, atol=0)
     offset = delay_phase_offsets(features, new.config)[:, :, None]
     torch.testing.assert_close(b[:, :, 6:], a[:, :, 6:]+offset, rtol=0, atol=2e-6)
-    mean, std, bm, bs = gaussian_parameters(new, features, masks)
+    mean, std, bm, bs = gaussian_parameters(new, features, masks, mirrored=True)
     if printed == 1000:
         torch.testing.assert_close(b, mean, rtol=0, atol=0)
         assert torch.count_nonzero(score) == 0

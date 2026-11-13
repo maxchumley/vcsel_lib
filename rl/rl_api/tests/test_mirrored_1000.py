@@ -36,7 +36,7 @@ def features_and_masks(policy):
     return features, masks.repeat_interleave(8, dim=1)
 
 
-def gaussian_parameters(policy, features, masks):
+def gaussian_parameters(policy, features, masks, *, mirrored=False):
     batch, candidates, edges = masks.shape
     repeated = features[:, None].expand(-1, candidates, -1, -1).reshape(-1, 3, 4)
     mean, log_std, _, pooled = policy.parameters_for_edges(repeated,
@@ -47,7 +47,13 @@ def gaussian_parameters(policy, features, masks):
     extra[:, torch.arange(candidates) % 8 < 2] = np.pi*policy.config.exploration_std_scale
     std = torch.cat((std[..., :edges], (std[..., edges:]**2+extra**2).sqrt()), dim=-1)
     bm, bs = policy.budget_parameters(repeated, pooled_states=pooled)
-    return mean, std, bm.reshape(batch, candidates), bs.reshape(batch, candidates).exp()
+    parameters = mean, std, bm.reshape(batch, candidates), bs.reshape(batch, candidates).exp()
+    if mirrored and policy.config.exploration_std_scale != 0.:
+        # Both scores belong to the positive member's Gaussian, even if raw
+        # partner predictions differ by an ULP. The zero-SD endpoint uses raw means.
+        parameters = tuple(value[:, ::2].repeat_interleave(2, dim=1)
+                           for value in parameters)
+    return parameters
 
 
 def test_only_the_two_estimator_options_change_and_no_run_is_started(tmp_path):
@@ -82,8 +88,24 @@ def test_only_the_two_estimator_options_change_and_no_run_is_started(tmp_path):
 
 
 @pytest.mark.parametrize('printed', [1, 598, 999])
-def test_three_ordinary_pairs_one_wide_pair_scores_and_rng(tmp_path, printed):
+@pytest.mark.parametrize('partner_roundoff', [False, True])
+def test_three_ordinary_pairs_one_wide_pair_scores_and_rng(
+    tmp_path, monkeypatch, printed, partner_roundoff,
+):
     policy, config = ready_policy(tmp_path, printed)
+    if partner_roundoff:
+        edge_parameters = policy.parameters_for_edges
+
+        def rounded_edges(*args, **options):
+            mean, log_std, *other = edge_parameters(*args, **options)
+            mean = mean.clone()
+            # Force a one-ULP row difference even on BLAS backends with equal rows.
+            with torch.no_grad():
+                mean[1::2] = torch.nextafter(
+                    mean[1::2], torch.full_like(mean[1::2], torch.inf))
+            return mean, log_std, *other
+
+        monkeypatch.setattr(policy, 'parameters_for_edges', rounded_edges)
     features, masks = features_and_masks(policy)
     torch.manual_seed(42)
     independent = sample_annealed_candidates(policy, features, masks)
@@ -95,7 +117,7 @@ def test_three_ordinary_pairs_one_wide_pair_scores_and_rng(tmp_path, printed):
     # Shared positive samples are kept bit for bit, including at small SDs.
     torch.testing.assert_close(actions[:, ::2], independent[0][:, ::2], rtol=0, atol=0)
     torch.testing.assert_close(budget[:, ::2], independent[1][:, ::2], rtol=0, atol=0)
-    mean, std, bm, bs = gaussian_parameters(policy, features, masks)
+    mean, std, bm, bs = gaussian_parameters(policy, features, masks, mirrored=True)
     torch.testing.assert_close(actions[:, ::2]+actions[:, 1::2], 2*mean[:, ::2])
     torch.testing.assert_close(budget[:, ::2]+budget[:, 1::2], 2*bm[:, ::2])
     torch.testing.assert_close(std[:, ::2], std[:, 1::2], rtol=0, atol=0)
