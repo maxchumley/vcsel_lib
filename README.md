@@ -194,12 +194,18 @@ Examples live in `examples/`. A few useful entry points:
 
 ### Reinforcement-learning matrix design
 
-`rl/reinforcement_matrix_design.py` is a small, dependency-free REINFORCE example
+The current configure/train/propose/evaluate workflow is documented in the
+[RL API](rl/rl_api/README.md). Its experiment recipes, including mirrored
+sampling, root-based phase references and the root encoder input, are under
+`rl/rl_api/experiments/`. Training runs, checkpoints and diagnostics remain
+local and are excluded from source commits.
+
+`rl/archive/reinforcement_matrix_design.py` is a small, dependency-free REINFORCE example
 that learns static `kappa` and `phi_p` matrices from batched VCSEL rollouts. Each
 training rollout ramps `kappa` from zero using the same schedule as validation:
 
 ```bash
-python -m rl.reinforcement_matrix_design
+python -m rl.archive.reinforcement_matrix_design
 ```
 
 Edit `target_phases` and the reward weights near the top of the file to describe
@@ -220,12 +226,12 @@ output-power trajectories in the same format as
 
 ### Closed-loop neural coupling control
 
-`rl/neural_policy_matrix_design.py` uses replay-buffered TD3 for continuous
+`rl/archive/neural_policy_matrix_design.py` uses replay-buffered TD3 for continuous
 closed-loop control:
 
 ```bash
 python -m pip install -e '.[rl]'
-python -m rl.neural_policy_matrix_design
+python -m rl.archive.neural_policy_matrix_design
 ```
 
 ```text

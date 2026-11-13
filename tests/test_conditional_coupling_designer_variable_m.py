@@ -11,6 +11,13 @@ from rl import conditional_coupling_designer_variable_m as variable_m
 from rl import conditional_coupling_run_variable_m as variable_m_run
 
 
+def test_far_field_normalization_uses_final_slice_peak():
+    intensity = np.array([[2.0, 0.25], [0.5, 0.5]])
+    normalized = variable_m_run.normalize_far_field_to_final_slice(intensity)
+    np.testing.assert_allclose(normalized, [[4.0, 0.5], [1.0, 1.0]])
+    assert normalized[:, -1].max() == 1.0
+
+
 def small_config(**changes):
     config = variable_m.DesignerConfig(
         n_lasers=5,
@@ -604,11 +611,11 @@ def test_bounded_degree_conditioning_rejects_duplicate_size_features():
 
 
 def test_bounded_degree_stable_lr_runner_is_an_isolated_restart():
-    from rl import (
+    from rl.archive import (
         conditional_coupling_run_variable_m_gnn_pcgrad_bounded_degree
         as original_run,
     )
-    from rl import (
+    from rl.archive import (
         conditional_coupling_run_variable_m_gnn_pcgrad_bounded_degree_stable_lr
         as stable_run,
     )
@@ -1451,7 +1458,7 @@ def test_sparse_gnn_checkpoint_round_trip(tmp_path):
 def test_sparse_refinement_batch_combines_phase_and_resource_rewards(
     monkeypatch,
 ):
-    from rl import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
+    from rl.archive import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
 
     config = small_config(
         encoder_architecture="bigru",
@@ -1527,7 +1534,7 @@ def test_sparse_refinement_batch_combines_phase_and_resource_rewards(
 
 
 def test_phase_relative_topology_reward_keeps_phase_primary():
-    from rl import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
+    from rl.archive import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
 
     phase_reward = np.array([[1.0, 0.998, 0.990]])
     active_fraction = np.array([[1.0, 0.5, 0.0]])
@@ -1545,7 +1552,7 @@ def test_phase_relative_topology_reward_keeps_phase_primary():
 
 
 def test_sparse_gnn_multisize_pcgrad_evaluates_disabled_links(monkeypatch):
-    from rl import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
+    from rl.archive import refine_saved_coupling_model_variable_m_minimal_coupling as sparse
 
     config = small_config(
         encoder_architecture="gnn",

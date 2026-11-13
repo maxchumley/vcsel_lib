@@ -29,7 +29,8 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest -q
+          pytest -q tests
+          pytest -q rl/rl_api/tests
 
   lint:
     runs-on: ubuntu-latest

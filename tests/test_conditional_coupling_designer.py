@@ -11,7 +11,7 @@ import torch
 matplotlib.use("Agg")
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from rl import conditional_coupling_designer as conditional
+from rl.archive import conditional_coupling_designer as conditional
 
 
 def small_config(**changes):

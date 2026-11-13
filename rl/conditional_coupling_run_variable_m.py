@@ -55,6 +55,7 @@ from rl.paths import MODEL_DIR, RESULTS_DIR
 
 figure_directory = RESULTS_DIR
 
+
 #  1. Settings
 
 # Train one shared policy over M=2,...,9 from the first update.  This run
@@ -218,6 +219,24 @@ config = _apply_checkpoint_suffix(config, FILE_SUFFIX)
 
 
 #  2. Matrix and settled-phase summary
+
+def sample_edges_across_strengths(
+    edges: list | set,
+    limit: int,
+    strength,
+) -> list:
+    """Select deterministic rank-spaced edges from weakest through strongest."""
+    if limit < 1:
+        raise ValueError("edge display limit must be positive")
+    ordered = sorted(
+        edges,
+        key=lambda edge: (float(strength(edge)), int(edge[0]), int(edge[1])),
+    )
+    if len(ordered) <= limit:
+        return ordered
+    indices = np.rint(np.linspace(0, len(ordered) - 1, limit)).astype(int)
+    return [ordered[index] for index in indices]
+
 
 def _relative_coupling_backbone(
     kappa_per_ns: np.ndarray,
@@ -447,6 +466,7 @@ def plot_selected_design(
     topology_backbone_network: bool = False,
     topology_backbone_edge_limit_factor: float = 1.5,
     topology_max_display_edges: int | None = None,
+    topology_edge_selection: str = "strongest",
     topology_sparsity_mask: bool = False,
     topology_detuning_arc_layout: bool = False,
     topology_detuning_summary: bool = False,
@@ -465,8 +485,9 @@ def plot_selected_design(
     never changes the plotted matrices or the design used by simulation.
     ``topology_backbone_edge_limit_factor`` controls the approximate number
     of displayed directed links as a multiple of the array size.
-    ``topology_max_display_edges`` optionally caps only the network panel at
-    the strongest displayed coupling magnitudes. It does not prune the
+    ``topology_max_display_edges`` optionally caps only the network panel.
+    ``topology_edge_selection`` selects either the strongest edges (default)
+    or a deterministic spread from weakest to strongest. Neither changes the
     matrices or simulation design.
     ``topology_sparsity_mask`` shows every possible directed link: retained
     links in gray and zeroed links in red. It is intended for diagnosing the
@@ -991,6 +1012,8 @@ def plot_selected_design(
                 if coupling > 0.0:
                     graph.add_edge(source, receiver, weight=coupling)
 
+    if topology_edge_selection not in {"strongest", "strength_spread"}:
+        raise ValueError("topology_edge_selection must be strongest or strength_spread")
     if topology_backbone_network:
         # This branch changes only the network summary.  The physical design
         # matrices above remain untouched and are still passed to simulation.
@@ -1004,15 +1027,23 @@ def plot_selected_design(
             if topology_max_display_edges < 1:
                 raise ValueError("topology_max_display_edges must be positive")
             if len(topology_directions) > topology_max_display_edges:
-                topology_directions = set(
-                    sorted(
+                if topology_edge_selection == "strength_spread":
+                    selected_directions = sample_edges_across_strengths(
+                        topology_directions,
+                        topology_max_display_edges,
+                        lambda direction: float(
+                            kappa_per_ns[direction[1], direction[0]]
+                        ),
+                    )
+                else:
+                    selected_directions = sorted(
                         topology_directions,
                         key=lambda direction: float(
                             kappa_per_ns[direction[1], direction[0]]
                         ),
                         reverse=True,
                     )[:topology_max_display_edges]
-                )
+                topology_directions = set(selected_directions)
                 layout_graph = nx.Graph()
                 layout_graph.add_nodes_from(range(run_config.n_lasers))
                 for source, receiver in topology_directions:
@@ -1415,13 +1446,17 @@ def plot_selected_design(
                 )
             )
 
-        draw_detuning_arcs(
-            all_edges,
-            colors="0.48",
-            alpha=0.055,
-            width_offset=0.035,
-            width_scale=0.68,
-        )
+        if (
+            topology_edge_selection != "strength_spread"
+            or len(highlighted_edges) == len(all_edges)
+        ):
+            draw_detuning_arcs(
+                all_edges,
+                colors="0.48",
+                alpha=0.055,
+                width_offset=0.035,
+                width_scale=0.68,
+            )
         draw_detuning_arcs(
             highlighted_edges,
             colors=[
@@ -1680,9 +1715,13 @@ def plot_selected_design(
             detuning_geometry_caption = (
                 "row-to-semicircle curve = detuning order"
             )
+        selection_label = (
+            "strength-spread sample"
+            if topology_edge_selection == "strength_spread" else "strongest"
+        )
         network_caption = (
-            f"all {len(all_edges)} retained directed links; "
-            f"overlay: {len(highlighted_edges)} strongest"
+            f"{len(all_edges)} retained directed links; "
+            f"displayed: {len(highlighted_edges)} {selection_label}"
             + "\n"
             + detuning_geometry_caption
             + "\n"
@@ -1763,6 +1802,48 @@ def plot_selected_design(
 
 
 #  3. Detailed serial validation
+
+def normalize_far_field_to_final_slice(intensity_map: np.ndarray) -> np.ndarray:
+    """Scale a time-resolved far field so its final angular peak is one."""
+    final_peak = float(np.max(intensity_map[:, -1]))
+    if not np.isfinite(final_peak) or final_peak <= 0.0:
+        raise ValueError("Final far-field slice has no positive intensity")
+    return intensity_map / final_peak
+
+
+def phase_reward_trace(
+    time_seconds: np.ndarray,
+    target_phase_error_rad: np.ndarray,
+    run_config: DesignerConfig,
+) -> tuple[np.ndarray, int]:
+    """Instantaneous phase score whose scored-tail mean equals the phase reward.
+
+    The weakest laser is selected by its mean score over the complete settled
+    tail, matching ``calculate_phase_reward`` rather than taking a new minimum
+    at every time point.
+    """
+    errors = np.asarray(target_phase_error_rad, dtype=float)
+    if errors.ndim != 3 or errors.shape[1] != run_config.n_lasers:
+        raise ValueError("phase errors must have shape (cases, lasers, times)")
+    if errors.shape[2] != len(time_seconds):
+        raise ValueError("phase errors and time grid must have matching lengths")
+    ramp_end_seconds = (
+        run_config.coupling_ramp_start_delays
+        + run_config.coupling_ramp_rise_delays / 0.8
+    ) * run_config.delay_seconds
+    tail_start = max(
+        int((1.0 - run_config.reward_tail_fraction) * errors.shape[2]),
+        int(np.searchsorted(time_seconds, ramp_end_seconds)),
+    )
+    if tail_start >= errors.shape[2]:
+        raise ValueError("simulation is too short to contain a settled reward interval")
+    per_laser_score = 0.5 * (1.0 + np.cos(errors[:, 1:, :]))
+    worst_laser = np.argmin(np.mean(per_laser_score[:, :, tail_start:], axis=2), axis=1)
+    worst_trace = per_laser_score[np.arange(len(errors)), worst_laser]
+    weight = run_config.worst_laser_reward_weight
+    trace = (1.0 - weight) * np.mean(per_laser_score, axis=1) + weight * worst_trace
+    return trace, tail_start
+
 
 def simulate_and_plot_best_design(
     design: dict,
@@ -1960,11 +2041,16 @@ def simulate_and_plot_best_design(
     target_order_parameter_std = np.std(
         target_order_parameter_cases, axis=0
     )
+    phase_reward_time_cases, _ = phase_reward_trace(
+        time_seconds, target_phase_error, validation_config
+    )
+    phase_reward_time_mean = np.mean(phase_reward_time_cases, axis=0)
+    phase_reward_time_std = np.std(phase_reward_time_cases, axis=0)
     show_uncertainty = noise_iterations > 1
 
     frequency_axis_index = 0
     phase_axis_index = 1
-    order_parameter_axis_index = 2
+    phase_reward_axis_index = 2
     individual_power_axis_index = 3
     power_panel_count = 5 if separate_total_power_panel else 4
     panel_count = power_panel_count + int(far_field_panel)
@@ -2155,36 +2241,36 @@ def simulate_and_plot_best_design(
     axes[phase_axis_index].set_ylim(-1.1*np.pi, 1.1*np.pi)
     axes[phase_axis_index].set_yticks(PHASE_TICKS)
     axes[phase_axis_index].set_yticklabels(PHASE_TICK_LABELS)
-    axes[order_parameter_axis_index].plot(
+    axes[phase_reward_axis_index].plot(
         time_ns,
-        target_order_parameter_mean,
+        phase_reward_time_mean,
         color="tab:blue",
         linewidth=2.0,
-        label=r"$r_{\mathrm{target}}$",
+        label="_nolegend_",
     )
     if show_uncertainty:
-        axes[order_parameter_axis_index].fill_between(
+        axes[phase_reward_axis_index].fill_between(
             time_ns,
             np.maximum(
-                target_order_parameter_mean - target_order_parameter_std,
+                phase_reward_time_mean - phase_reward_time_std,
                 0.0,
             ),
             np.minimum(
-                target_order_parameter_mean + target_order_parameter_std,
+                phase_reward_time_mean + phase_reward_time_std,
                 1.0,
             ),
             color="tab:blue",
             alpha=0.20,
         )
-    axes[order_parameter_axis_index].axhline(
+    axes[phase_reward_axis_index].axhline(
         0.98,
         color="black",
         linestyle="--",
         linewidth=1.2,
-        label="0.98 threshold",
+        label="0.98 final threshold",
     )
-    axes[order_parameter_axis_index].set(
-        ylabel=r"$r_{\mathrm{target}}$",
+    axes[phase_reward_axis_index].set(
+        ylabel="phase reward",
         ylim=(0.0, 1.02),
         yticks=(0.0, 0.5, 1.0),
     )
@@ -2216,6 +2302,13 @@ def simulate_and_plot_best_design(
         else "output power (mW)"
     )
     axes[-1].set_xlabel("time (ns)")
+    if far_field_panel:
+        # The far-field axis occupies a narrower grid column than the panels
+        # above it. Give the power panel its own time ticks and label so its
+        # timestamps align visually with the upper time-series panels.
+        power_time_axis = axes[far_field_axis_index - 1]
+        power_time_axis.tick_params(axis="x", bottom=True, labelbottom=True)
+        power_time_axis.set_xlabel("time (ns)")
     if separate_total_power_panel or dual_axis_power_panel:
         total_power_axis.set_ylabel("total output power (mW)")
     if dual_axis_power_panel:
@@ -2256,8 +2349,8 @@ def simulate_and_plot_best_design(
         )
         # Match the display-only angular blur used by injection_steering:
         # convolve every time-resolved far-field slice, after the physical
-        # element envelope has been applied.  The global renormalization keeps
-        # the existing inferno color scale (0--1) unchanged.
+        # element envelope has been applied. Normalize after any blur so the
+        # plotted final-time slice, rather than an earlier transient, peaks at 1.
         if far_field_slice_convolution_fwhm_deg is not None:
             angular_step_deg = float(np.median(np.diff(theta_deg)))
             gaussian_sigma_deg = (
@@ -2288,9 +2381,7 @@ def simulate_and_plot_best_design(
                 0,
                 padded_map,
             )
-            blurred_maximum = float(np.max(intensity_map))
-            if blurred_maximum > 0.0:
-                intensity_map /= blurred_maximum
+        intensity_map = normalize_far_field_to_final_slice(intensity_map)
         far_field_axis = axes[far_field_axis_index]
         far_field_image = far_field_axis.pcolormesh(
             time_ns[far_field_time_indices],
@@ -2310,6 +2401,7 @@ def simulate_and_plot_best_design(
         far_field_colorbar = figure.colorbar(
             far_field_image,
             cax=far_field_colorbar_axis,
+            ticks=np.linspace(0.0, 1.0, 6),
         )
         far_field_colorbar.set_label("normalized intensity")
         final_intensity = intensity_map[:, -1].copy()
@@ -2380,7 +2472,7 @@ def simulate_and_plot_best_design(
         if (
             run_config.n_lasers <= 25
             or axis_index
-            in (order_parameter_axis_index, total_power_axis_index)
+            in (phase_reward_axis_index, total_power_axis_index)
         ):
             axis.legend(ncol=3, fontsize=legend_fontsize, loc="upper right")
     if dual_axis_power_panel:
@@ -2421,6 +2513,9 @@ def simulate_and_plot_best_design(
         "target_order_parameter_cases": target_order_parameter_cases,
         "target_order_parameter_mean": target_order_parameter_mean,
         "target_order_parameter_std": target_order_parameter_std,
+        "phase_reward_time_cases": phase_reward_time_cases,
+        "phase_reward_time_mean": phase_reward_time_mean,
+        "phase_reward_time_std": phase_reward_time_std,
         "laser_power_mean_mw": laser_power_mean,
         "laser_power_std_mw": laser_power_std,
         "total_power_mean_mw": total_power_mean,

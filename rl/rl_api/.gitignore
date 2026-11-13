@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+runs/
+diagnostics/*
+!diagnostics/__init__.py
+!diagnostics/verify_reference.py
+tests/_tmp*/
+tests/_cache*/

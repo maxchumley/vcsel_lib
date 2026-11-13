@@ -209,6 +209,8 @@ __marimo__/
 .DS_Store
 
 # Local Codex working files and previews
+/.codex/
+/.codex_work/
 /.codex_tmp/
 
 results/
@@ -220,10 +222,16 @@ bayesian_steering_output*/
 
 # Generated simulation artifacts
 /rl/artifacts/
+/rl/BACKUP/
 /continuous_adjoint_frames/
 /logs/
 /output/
 /tmp/
+
+# Trained models belong in local artifacts or releases, not source commits.
+*.pt
+*.pth
+*.ckpt
 
 # Local recovery snapshots. Promote intentionally preserved files into a
 # documented archive before committing them.

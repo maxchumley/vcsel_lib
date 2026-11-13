@@ -1,0 +1,32 @@
+{
+  "reference_name": "paired_current_training",
+  "source_files": {
+    "rl/inspect_saved_coupling_model_variable_m_bernoulli_sparse.py": "f3b9c281547097740924488cd8d0e93e56af44ac9ed211272a0fa202e40c6b25",
+    "rl/paths.py": "67a232928c5eab80c1517b9d182ef0694f4cc723427773e67ef64f6aca0a800b",
+    "rl/__init__.py": "854fa1f9f9502c60e6ff6a4a1861fcbf80de377b415452d97970d23742fb5e4b",
+    "rl/conditional_coupling_bernoulli_sparse.py": "2ffdd32e6b5706f31ebc08e0727a1fa97cfac9b866580752db48cfca2b533fdd",
+    "rl/conditional_coupling_run_variable_m_gnn_pcgrad.py": "4d36666812d0a9a8dcc57a686643f109d23a691a61fea94b3bfaf044d96212a6",
+    "rl/conditional_coupling_run_variable_m.py": "1860936d02510ca6e8384216bff774fb4dbf8531b7fdb0d545c39596227f568e",
+    "rl/inference_plots.py": "f2b368e54ca1ff79b17068c35f34869c76f4522da3dc5f7229120c7b4b00b63d",
+    "rl/conditional_coupling_run_variable_m_gnn_pcgrad_bernoulli_sparse.py": "a851e8ed2b0c8e4d82148684a119ba4c48dacda0f91a3b16cbedb8c1313f0a81",
+    "rl/conditional_coupling_designer_variable_m.py": "11e91203554e9f6f01cb464b8fff77800766c6018383a5cc26bc69050780acc3",
+    "vcsel_lib.py": "47294d98309afd349d29a436ebd5ef212649c083259425d4b90671d5f2f85b5d",
+    "rl/README.md": "d331827359ee60f867fd62687e8d274d434fab53a340afd72e3924fcdc74f3dd"
+  },
+  "reviewed_source_revisions": {
+    "vcsel_lib.py": [
+      {
+        "sha256": "346a55e7fe79b6bfb2a7cd15def6dbf746499f0854fef119e2c027d7b031faed",
+        "reason": "Use n+1 delayed histories for the second trapezoidal stage; original baseline hash retained above.",
+        "verification": "tests/test_integrator_delayed_stages.py and RL API regression suite",
+        "recorded_on": "2026-11-13"
+      }
+    ]
+  },
+  "allowed_configuration_differences": [
+    "best_checkpoint_file",
+    "current_checkpoint_file",
+    "final_checkpoint_file"
+  ],
+  "training_started": false
+}

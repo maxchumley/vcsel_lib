@@ -7,7 +7,7 @@ import sys
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
-from rl import conditional_coupling_sparse_tolerance as sparse
+from rl.archive import conditional_coupling_sparse_tolerance as sparse
 
 
 def small_config(**changes) -> sparse.SparseToleranceConfig:

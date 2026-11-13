@@ -3838,6 +3838,7 @@ def simulate_with_vcsel(
     progress: bool = False,
     smooth_frequencies: bool = False,
     detuning_distribution_ghz: np.ndarray | None = None,
+    phase_model: str | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Simulate candidate matrices from free-running initial conditions.
 
@@ -3867,6 +3868,8 @@ def simulate_with_vcsel(
         config,
         detuning_distribution_ghz=detuning_distribution_ghz,
     )
+    if phase_model is not None:
+        physical_parameters["phase_model"] = phase_model
 
     # These are the main vcsel_lib steps, kept together intentionally.
     vcsel_class = _load_vcsel_class()
@@ -4034,6 +4037,71 @@ def calculate_phase_reward(
         achieved_phases_rad,
         aligned_achieved_phases_rad,
         orientation,
+    )
+
+
+PHASE_RMS_METRIC_KEYS = (
+    "phase_rms_reward", "mean_phase_rms_error_deg", "worst_phase_rms_error_deg",
+    "phase_rms_success", "rms_orientation",
+)
+
+
+def calculate_phase_rms_metrics(
+    time_seconds: np.ndarray,
+    states: np.ndarray,
+    requested_phases_rad: np.ndarray,
+    config: DesignerConfig,
+) -> dict[str, np.ndarray]:
+    """Score wrapped phase RMS over the same settled tail as cosine reward.
+
+    The reference laser is excluded. One global orientation minimizes the
+    weighted mean/worst RMS; no per-laser or per-time conjugation is allowed.
+    Nonfinite tail states receive reward -1, infinite error, and no success.
+    """
+    targets = make_relative_to_laser_1(requested_phases_rad)
+    if targets.ndim == 1:
+        targets = targets[None, :]
+    if (states.ndim != 3 or targets.shape != (len(states), config.n_lasers)
+            or states.shape[1] != 3 * config.n_lasers):
+        raise ValueError("states and targets must match the configured laser count")
+    ramp_end = (config.coupling_ramp_start_delays
+                + config.coupling_ramp_rise_delays / 0.8) * config.delay_seconds
+    tail_start = max(int((1 - config.reward_tail_fraction) * states.shape[-1]),
+                     int(np.searchsorted(time_seconds, ramp_end)))
+    if tail_start >= states.shape[-1]:
+        raise ValueError("simulation is too short to contain a settled reward interval")
+    tail = states[:, :, tail_start:]
+    phases = tail[:, 2::3]
+    finite = np.all(np.isfinite(tail), axis=(1, 2))
+
+    def score(sign):
+        with np.errstate(invalid="ignore", over="ignore"):
+            error = np.angle(np.exp(1j * (
+                (phases - phases[:, :1]) - sign * targets[:, :, None])))
+            per_laser = np.sqrt(np.mean(error[:, 1:] ** 2, axis=-1))
+        mean, worst = per_laser.mean(axis=1), per_laser.max(axis=1)
+        weight = config.worst_laser_reward_weight
+        reward = 1 - ((1 - weight) * mean + weight * worst) / np.pi
+        return reward, mean, worst
+
+    direct = score(1.)
+    orientation = np.ones(len(targets))
+    if config.allow_global_phase_conjugate:
+        conjugate = score(-1.)
+        choose = conjugate[0] > direct[0]
+        reward, mean, worst = (np.where(choose, other, first)
+                               for first, other in zip(direct, conjugate))
+        orientation = np.where(choose, -1., 1.)
+    else:
+        reward, mean, worst = direct
+    mean = np.where(finite, np.rad2deg(mean), np.inf)
+    worst = np.where(finite, np.rad2deg(worst), np.inf)
+    return dict(
+        phase_rms_reward=np.where(finite, reward, -1.),
+        mean_phase_rms_error_deg=mean,
+        worst_phase_rms_error_deg=worst,
+        phase_rms_success=finite & (worst <= 3.),
+        rms_orientation=orientation,
     )
 
 
@@ -4510,7 +4578,7 @@ def simulate_target_chunk(
             candidates_per_target,
             config.n_lasers,
         )
-        return {
+        result = {
             "chunk_index": chunk_index,
             "start_index": start_index,
             "stop_index": stop_index,
@@ -4521,6 +4589,11 @@ def simulate_target_chunk(
             "aligned_achieved_phases_rad": reward[4].reshape(phase_shape),
             "orientation": reward[5].reshape(scalar_shape),
         }
+        if getattr(config, "phase_reward_mode", "cosine") == "wrapped_rms":
+            metrics = calculate_phase_rms_metrics(
+                time_seconds, states, repeated_targets, config)
+            result.update({key: value.reshape(scalar_shape) for key, value in metrics.items()})
+        return result
     except Exception as error:
         raise RuntimeError(
             f"VCSEL simulation failed for chunk {chunk_index}, "
@@ -4627,6 +4700,9 @@ def simulate_candidates_parallel(
         ),
         "orientation": np.empty(scalar_shape, dtype=float),
     }
+    if getattr(config, "phase_reward_mode", "cosine") == "wrapped_rms":
+        combined.update({key: np.empty(scalar_shape, dtype=(bool if key == "phase_rms_success" else float))
+                         for key in PHASE_RMS_METRIC_KEYS})
     target_coverage = np.zeros(target_count, dtype=int)
     for result in chunk_results:
         start_index = int(result["start_index"])
@@ -4952,18 +5028,29 @@ def combine_task_gradients_pcgrad(
     task_gradients: torch.Tensor,
     maximum_task_norm: float,
     rng: np.random.Generator,
+    *,
+    task_weights: torch.Tensor | list[float] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor | float]]:
     """Clip, conflict-project, and average flattened task gradients.
 
-    Rows correspond to tasks (one array size here). Each row is clipped
+    Rows correspond to tasks (for example, array sizes). Each row is clipped
     independently before PCGrad so one task cannot dominate merely because
     its raw gradient norm is much larger. PCGrad then removes only components
-    that oppose another task gradient; no array size receives a fixed weight.
+    that oppose another task gradient. By default all tasks have equal weight;
+    optional weights preserve the objective when a task is split into groups.
     """
     if task_gradients.ndim != 2 or task_gradients.shape[0] < 2:
         raise ValueError("task_gradients must have shape (tasks >= 2, values)")
     if maximum_task_norm <= 0.0:
         raise ValueError("maximum_task_norm must be positive")
+    if task_weights is not None:
+        task_weights = torch.as_tensor(
+            task_weights, device=task_gradients.device, dtype=task_gradients.dtype)
+        if (task_weights.shape != (task_gradients.shape[0],)
+                or not torch.isfinite(task_weights).all()
+                or not (task_weights > 0).all()):
+            raise ValueError("task_weights must contain one finite positive value per task")
+        task_weights = task_weights / task_weights.sum()
 
     raw_norms = torch.linalg.vector_norm(task_gradients, dim=1)
     clip_scales = torch.clamp(
@@ -5018,7 +5105,9 @@ def combine_task_gradients_pcgrad(
         ),
         "mean_gradient_cosine": float(pairwise_cosines.mean().cpu()),
     }
-    return projected.mean(dim=0), diagnostics
+    combined = (projected.mean(dim=0) if task_weights is None else
+                (projected * task_weights[:, None]).sum(dim=0))
+    return combined, diagnostics
 
 
 def run_multisize_training_batch(

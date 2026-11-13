@@ -1,6 +1,6 @@
 import numpy as np
 
-from rl import reinforcement_matrix_design as design
+from rl.archive import reinforcement_matrix_design as design
 
 
 def test_decode_actions_bounds_wraps_and_respects_topology():
