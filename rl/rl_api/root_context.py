@@ -54,5 +54,9 @@ def calibrate_budget_references(policy, config):
     The new root column starts at zero, preserving the predecessor's initial
     raw strengths and calibration values exactly without any extra RNG draws.
     """
-    conditioned = condition_on_roots(policy, np.zeros(config.budget_reference_calibration_targets, dtype=int))
+    if getattr(config, 'density_control', False):
+        from .density_control import DensityConditionedPolicy
+        conditioned = DensityConditionedPolicy(policy, np.ones(config.budget_reference_calibration_targets))
+    else:
+        conditioned = condition_on_roots(policy, np.zeros(config.budget_reference_calibration_targets, dtype=int))
     return engine.calibrate_budget_references(conditioned, config)

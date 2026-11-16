@@ -44,9 +44,24 @@ class MirroredExplorationConfig(AnnealedExplorationConfig):
 
 
 @dataclass
+class DensityControlledConfig(MirroredExplorationConfig):
+    """Reuse adjacency inputs for a scalar; select physical masks after sampling."""
+    density_control: bool = True
+
+
+@dataclass
+class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
+    """Four-laser reciprocal-value projection and the complete connected bank."""
+    exhaustive_symmetric_topologies: bool = True
+    symmetric_coupling_values: bool = True
+    in_phase_targets: bool = True
+
+
+@dataclass
 class RandomReachableTopology:
     """Opt-in sampler metadata; older checkpoint schemas remain unchanged."""
     topology_random_reachable: bool = True
+    topology_root_index: int | None = None
 
 
 @dataclass
@@ -202,6 +217,14 @@ def make_backend_config(settings: dict):
             ReachableAnnealedConfig: RootEncodedAnnealedConfig,
             ReachableMirroredConfig: RootEncodedMirroredConfig,
         }[config_class]
+    if converted.get('density_control', False):
+        if config_class is not MirroredExplorationConfig:
+            raise ValueError('Density control requires the mirrored exploration config')
+        config_class = DensityControlledConfig
+    if converted.get('exhaustive_symmetric_topologies', False):
+        if config_class is not MirroredExplorationConfig:
+            raise ValueError('Exhaustive symmetry requires the supplied-topology mirrored recipe')
+        config_class = ExhaustiveSymmetricConfig
     return config_class(**converted)
 
 
@@ -213,4 +236,5 @@ def exported_settings(config):
     This does not affect model weights or any current training calculation.
     """
     return {key: value for key, value in asdict(config).items()
-            if not key.startswith("de_teacher_")}
+            if not key.startswith("de_teacher_")
+            and not (key == 'topology_root_index' and value is None)}

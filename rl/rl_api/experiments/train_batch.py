@@ -12,7 +12,11 @@ def main(argv=None):
     parser.add_argument("experiment", nargs="?", default="train_mirrored_root_encoder_1000",
                         help="Training module under rl.rl_api.experiments")
     parser.add_argument("--output-directory", type=Path)
+    parser.add_argument("--initial-checkpoint", type=Path,
+                        help="Initialize learned weights/budget calibration; start a new optimizer and schedule")
     parser.add_argument("--workers", type=int, help="Override simulation workers only")
+    parser.add_argument('--pairs-per-job',type=int,help='Detuning contexts vectorized in each simulation job')
+    parser.add_argument('--actions-per-job',type=int,help='Candidate actions vectorized in each simulation job')
     parser.add_argument("--smoke-test", action="store_true",
                         help="Two-iteration launch check with compressed action annealing")
     parser.add_argument("--preview", action="store_true", help="Describe settings without training")
@@ -25,13 +29,16 @@ def main(argv=None):
     schedules = config.schedules
     if args.workers is not None:
         optimization = replace(optimization, workers=args.workers)
+    sampling_updates={key:value for key,value in dict(pairs_per_job=args.pairs_per_job,
+        actions_per_job=args.actions_per_job).items() if value is not None}
+    sampling=replace(config.sampling,**sampling_updates)
     if args.smoke_test:
         optimization = replace(optimization, iterations=2)
         if schedules.anneal_to_mean:
             schedules = replace(schedules, ordinary_start=1, ordinary_end=2,
                                 wide_start=1, wide_end=2)
     config = replace(config,
-                     optimization=optimization, schedules=schedules,
+                     optimization=optimization, schedules=schedules, sampling=sampling,
                      validation=replace(config.validation, notebook_display=False, plot_use_tex=False))
     allocated = os.environ.get("SLURM_CPUS_PER_TASK")
     workers = config.optimization.workers
@@ -55,6 +62,9 @@ def main(argv=None):
     if args.smoke_test:
         print("Smoke test only: two iterations; not a completed training run.", flush=True)
     experiment.describe()
+    initial_checkpoint = args.initial_checkpoint or getattr(recipe, 'INITIAL_CHECKPOINT', None)
+    if initial_checkpoint is not None:
+        print(f"Initialization checkpoint: {initial_checkpoint}", flush=True)
     if args.preview:
         return experiment
 
@@ -63,7 +73,7 @@ def main(argv=None):
     # Always start fresh in a new directory; never archive an existing run here.
     return experiment.train(live_plot=True,
                             verify_reference=getattr(recipe, "VERIFY_REFERENCE", True),
-                            restart=False)
+                            restart=False, initial_checkpoint=initial_checkpoint)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,7 @@ from rl.rl_api import Context, CouplingModel, Topology, PlotOptions
 
 
 # Checkpoint settings.
-RUN_DIRECTORY = API_DIRECTORY / "runs/reachable_rms_bins5_randbands5_phase_delay_residual_anneal1to1000_lr900_standard_lk_mirrored_1k"
+RUN_DIRECTORY = API_DIRECTORY / "runs/symmetric_density_fresh_rms_bins5_phase_delay_residual_anneal1to1000_lr900_standard_lk_mirrored_1k"
 CHECKPOINT_KIND = "current"       # current, best, or final.
 CHECKPOINT = None                  # Optional explicit .pt path instead of RUN_DIRECTORY/kind.
 INFERENCE_DEVICE = "auto"
@@ -38,11 +38,12 @@ MANUAL_TARGET_PHASES_PI = None     # None generates clusters; otherwise N_LASERS
 # For three lasers with relative phases [0, -1, 2] rad, use N_LASERS=3 and
 # MANUAL_TARGET_PHASES_PI = [0.0, -1.0 / np.pi, 2.0 / np.pi].
 DETUNING_MODE = "equal"          # equal, random, or manual.
-DETUNING_SPAN_GHZ = 1.0
-MANUAL_DETUNINGS_GHZ = np.array([1.5, -0.5, -1.5])
+DETUNING_SPAN_GHZ = 0.1
+MANUAL_DETUNINGS_GHZ = np.random.uniform(-DETUNING_SPAN_GHZ / 2, DETUNING_SPAN_GHZ / 2, N_LASERS)
 
 # Optional binary matrix or stack: SOURCE ROWS, RECEIVER COLUMNS, as before.
 TOPOLOGY_MATRIX_SOURCE_RECEIVER = None
+DENSITY_FRACTION = None          # None=ensemble across densities; 0=tree, 1=all-to-all.
 NUMBER_OF_CANDIDATES = 100
 SAMPLE_CONTINUOUS_ACTIONS = 0
 INFERENCE_RANDOM_SEED = None
@@ -193,7 +194,9 @@ def inspect(checkpoint=None, *, select=_CONFIG_SELECTION, count=None, show=None)
     continuous_mean = ENSEMBLE_TOPOLOGY_ONLY if make_ensemble else not SAMPLE_CONTINUOUS_ACTIONS
     topology = (None if TOPOLOGY_MATRIX_SOURCE_RECEIVER is None else
                 Topology.from_source_receiver(TOPOLOGY_MATRIX_SOURCE_RECEIVER))
-    designs = model.propose(context, topology=topology,
+    density_options = (dict(density_fraction=DENSITY_FRACTION)
+                       if getattr(model.backend_config, 'density_control', False) else {})
+    designs = model.propose(context, topology=topology, **density_options,
         count=NUMBER_OF_CANDIDATES if count is None else count,
         continuous_actions="mean" if continuous_mean else "sample", seed=INFERENCE_RANDOM_SEED)
     designs = apply_manual_budget(designs, MANUAL_BUDGET_PER_NS)

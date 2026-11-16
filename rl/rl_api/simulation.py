@@ -73,7 +73,7 @@ split_batch = core.split_simulation_batch
 initialize_worker = core._initialize_simulation_worker
 
 
-def simulate_phase_model_chunk(work_item):
+def simulate_phase_model_chunk(work_item, *, collect_locking=False):
     """Vectorized worker using the API's native VCSEL parameter pass-through."""
     chunk, start, stop, targets, kappa, phi, detuning, config = work_item
     shape = kappa.shape[:2]
@@ -93,6 +93,10 @@ def simulate_phase_model_chunk(work_item):
     if config.phase_reward_mode == "wrapped_rms":
         rms = core.calculate_phase_rms_metrics(output[0],output[1],repeated_targets,config)
         result.update({key:value.reshape(shape) for key,value in rms.items()})
+    if collect_locking:
+        from .phase_correction import measure_locking
+        measurements = measure_locking(output[0], output[1], config)
+        result.update({key:value.reshape(shape+value.shape[1:]) for key,value in measurements.items()})
     return result
 
 
@@ -101,6 +105,14 @@ def simulate_indexed_chunk(indexed_work):
     size, start, stop, work = indexed_work
     result = simulate_phase_model_chunk(work)
     result.update(size_batch_index=size,candidate_start_index=start,candidate_stop_index=stop)
+    return result
+
+
+def simulate_indexed_locking_chunk(indexed_work):
+    """Opt-in training worker; return locking metrics without retaining trajectories."""
+    size, start, stop, work = indexed_work
+    result = simulate_phase_model_chunk(work, collect_locking=True)
+    result.update(size_batch_index=size, candidate_start_index=start, candidate_stop_index=stop)
     return result
 
 

@@ -51,6 +51,9 @@ def apply_root_reference(phases, masks, detunings_ghz, root_indices, config):
 def decode_samples(actions, masks, config, *, budget_actions=None,
                    detunings_ghz=None, root_indices=None):
     """Existing physical decoder, followed only by the opt-in reference shift."""
+    if getattr(config, 'symmetric_coupling_values', False):
+        from .symmetric_topologies import reciprocal_actions
+        actions = reciprocal_actions(actions, masks, config.n_lasers)
     kappa, phases, counts, rho, shortfall = engine.decode_samples(
         actions, masks, config, budget_actions=budget_actions)
     phases = apply_root_reference(phases, masks, detunings_ghz, root_indices, config)

@@ -19,6 +19,7 @@ module purge
 module load python3.11-anaconda
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda activate "${VCSEL_CONDA_ENV:-vcsel}"
+VCSEL_PYTHON="${CONDA_PREFIX}/bin/python"
 
 # One trainer launches the existing multiprocessing pool on this one node.
 # Keep each process single-threaded rather than multiplying BLAS threads.
@@ -31,7 +32,11 @@ export MPLBACKEND=Agg
 export MPLCONFIGDIR="${SLURM_TMPDIR:-${TMPDIR:-/tmp}}/vcsel-mpl-${SLURM_JOB_ID}"
 mkdir -p "$MPLCONFIGDIR"
 
-python --version
+"$VCSEL_PYTHON" --version
 git rev-parse --short HEAD
-srun --ntasks=1 --cpus-per-task="$SLURM_CPUS_PER_TASK" \
-    python -u -m rl.rl_api.experiments.train_batch "$@"
+# Use the activated environment explicitly, and export its settings to each step.
+# Print the actual compute-node interpreter before trying to import the RL API.
+srun --export=ALL --ntasks=1 --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+    "$VCSEL_PYTHON" -u -c 'import sys; print("Batch Python:", sys.executable, flush=True); import torch; print("Batch PyTorch:", torch.__file__, flush=True)'
+srun --export=ALL --ntasks=1 --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+    "$VCSEL_PYTHON" -u -m rl.rl_api.experiments.train_batch "$@"

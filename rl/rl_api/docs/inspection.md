@@ -71,8 +71,11 @@ With validation and the ensemble enabled, the figures appear in this order:
    selected-design matrices. Arrays larger than ten lasers use six index
    labels per matrix axis, matching the single-case plot. A third panel uses
    the same phase circle: blue target points and tolerance arcs, orange
-   ensemble circular means, and an orange ring heatmap of aligned settled
-   phases across valid topologies and noise realizations (percent per 2° bin).
+   ensemble circular means, and orange min-to-max phase-range arcs across valid
+   topologies and noise realizations. Orange means and arcs sit at radius 1.08
+   to separate them from the blue target points and tolerance arcs at radius 1.
+   Ranges use wrapped offsets about each circular mean, so phases near ±π
+   remain a short arc across that boundary.
 4. **Topology ensemble:** the original trajectories and settled distributions,
    using all or mean_sd presentation.
 

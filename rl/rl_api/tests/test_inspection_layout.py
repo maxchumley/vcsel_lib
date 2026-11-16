@@ -68,25 +68,30 @@ def test_ensemble_averages_use_zeros_for_absent_strengths_and_active_circular_ph
         average_coupling_matrices(results, np.zeros(3, bool))
 
 
-def test_phase_ring_keeps_noise_distribution_wraps_and_uses_single_case_markers(tmp_path, fake_physics):
+def test_phase_ranges_keep_noise_wrap_correctly_and_offset_achieved_markers(tmp_path, fake_physics):
     from rl.rl_api.plotting.inspection import plot_ensemble_phase_distribution
     model = make_model(tmp_path)
     target = np.array([0., np.pi/2, -np.pi/2])
     results = model.propose(target_phases_rad=target,
         detunings_ghz=[-.5, 0., .5], count=3, seed=4).evaluate(noise_realizations=2)
     pair = np.deg2rad([[0., 179., -179.], [0., -179., 179.]])
-    # The invalid topology has phases at 90 degrees; it must not enter the ring.
+    # The invalid topology has phases at 90 degrees; it must not enter the ranges.
     results.aligned_achieved_phases = np.vstack((pair, pair, np.full((2, 3), np.pi/2)))
     figure, axis = plt.subplots()
-    ring = plot_ensemble_phase_distribution(axis, results, np.array([True, True, False]), 5.)
-    assert ring.get_array().sum() == pytest.approx(100.)
-    assert np.count_nonzero(ring.get_array()) == 3  # 0, +179 and -179 degrees.
-    np.testing.assert_allclose(np.sort(ring.get_array()[ring.get_array() > 0]), [100/3]*3)
-    markers = [artist for artist in axis.collections if artist is not ring]
+    plot_ensemble_phase_distribution(axis, results, np.array([True, True, False]), 5.)
+    markers = axis.collections
+    assert len(markers) == 2  # Only the target and achieved scatters; no histogram ring.
     np.testing.assert_allclose(markers[0].get_offsets(), np.c_[np.cos(target), np.sin(target)], atol=1e-12)
-    np.testing.assert_allclose(markers[1].get_offsets(), [[1., 0.], [-1., 0.], [-1., 0.]], atol=1e-12)
+    np.testing.assert_allclose(markers[1].get_offsets(), [[1.08, 0.], [-1.08, 0.], [-1.08, 0.]], atol=1e-12)
+    ranges = [line for line in axis.lines if line.get_color() == 'tab:orange']
+    assert len(ranges) == 3
+    for line in ranges[1:]:
+        x,y=line.get_data()
+        np.testing.assert_allclose(np.hypot(x,y),1.08,atol=1e-12)
+        angle=np.unwrap(np.arctan2(y,x))
+        assert np.rad2deg(np.ptp(angle)) == pytest.approx(2.)  # ±179 spans 2°, not 358°.
     assert {t.get_text() for t in axis.get_legend().get_texts()} == {
-        r'max $\pm 5^\circ$', 'target', 'ensemble mean'}
+        r'max $\pm 5^\circ$', 'target', 'ensemble range', 'ensemble mean'}
     plt.close(figure)
 
 

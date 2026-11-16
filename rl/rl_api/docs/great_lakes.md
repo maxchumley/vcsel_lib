@@ -12,6 +12,7 @@ In the VS Code SSH terminal, change into the cloned repository's root. Load the
 Python distribution and check whether a suitable environment already exists:
 
 ```bash
+module purge
 module load python3.11-anaconda
 source "$(conda info --base)/etc/profile.d/conda.sh"
 conda env list
@@ -111,6 +112,12 @@ sacct -j JOB_ID --format=JobID,State,Elapsed,AllocCPUS,MaxRSS,ExitCode
 
 Replace `JOB_ID` with the number printed by `sbatch`. Errors are in the matching
 `logs/rl-JOB_ID.err`. Stop a job with `scancel JOB_ID`.
+The output log prints `Batch Python` and `Batch PyTorch` from the compute node
+before training starts. The script launches `$CONDA_PREFIX/bin/python` by its
+full path and uses `srun --export=ALL` to retain the activated environment.
+If an import fails, compare those paths with
+`python -s -c "import sys, torch; print(sys.executable); print(torch.__file__)"`
+in the activated login-node environment before reinstalling packages.
 Open `current_training_progress.png` through VS Code to view progress; the text
 log records every iteration. Set `CHECKPOINT` in the existing inspect script
 to the saved `best.pt` or `final.pt` for inspection. `current_history.json` is

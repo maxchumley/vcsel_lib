@@ -1,5 +1,7 @@
 """Compatible model files and API-owned, atomically written run metadata."""
 from dataclasses import asdict, replace
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -59,15 +61,53 @@ def load(path, *, device="cpu"):
     return policy, config, info
 
 
-def write_run_manifest(path, *, name, public_config, backend_config):
+def initialize_from_checkpoint(policy, config, path):
+    """Copy weights and physical budget calibration, never optimizer/exploration state."""
+    path = Path(path).expanduser().resolve()
+    raw = path.read_bytes()
+    saved = torch.load(io.BytesIO(raw), map_location=config.device, weights_only=False)
+    if saved.get('format') != engine.CHECKPOINT_FORMAT:
+        raise ValueError('Initialization requires a compatible coupling-model checkpoint')
+    source = make_backend_config(saved['config'])
+    for key, default in (('phase_parameterization', 'absolute'), ('phase_model', 'chumley_2026'),
+                         ('budget_action_transform', 'log_budget'),
+                         ('strength_action_transform', 'uncapped_softplus'),
+                         ('normalize_incoming_coupling_by_degree', False),
+                         ('softplus_strength_scale_per_ns', 1.)):
+        if getattr(source, key, default) != getattr(config, key, default):
+            raise ValueError(f'Initialization checkpoint has a different {key}')
+    references = source.coupling_budget_reference_by_m
+    if not set(config.training_n_lasers).issubset(dict(references)):
+        raise ValueError('Initialization checkpoint must include budget calibration for every trained size')
+    policy.load_state_dict(saved['policy_state_dict'], strict=True)
+    config = replace(config, coupling_budget_reference_by_m=references)
+    policy.config = config
+    metadata = dict(checkpoint=str(path), sha256=hashlib.sha256(raw).hexdigest(),
+        source_iteration=saved['iteration'], source_held_out_reward=saved['held_out_reward'],
+        copied='policy weights and budget calibration',
+        reset='optimizer, sampler, reward scale, exploration schedule and history')
+    if getattr(config, 'density_control', False):
+        metadata['architecture_change'] = 'none; reuse adjacency-feature slots for uniform density'
+        metadata['new_parameters'] = 0
+    return config, metadata
+
+
+def write_run_manifest(path, *, name, public_config, backend_config, initialization=None):
     """Describe the exact recipe and output-only differences from its reference."""
-    write_json(path, dict(api_version=1, name=name, public_config=asdict(public_config),
+    manifest = dict(api_version=1, name=name, public_config=asdict(public_config),
         backend_config=exported_settings(backend_config), reference_source_status=reference_source_status(),
         checkpoint_format=engine.CHECKPOINT_FORMAT,
-        numerical_backend=("independent banded-topology batch and precision refinement; existing numerical kernels"
+        numerical_backend=("all connected symmetric masks and reciprocal physical actions; existing GNN and simulator"
+            if public_config.topology.backbone == 'all_connected_symmetric' else
+            "density input and strength-ranked symmetric masks; existing simulation/REINFORCE/PCGrad kernels"
+            if public_config.topology.mode == 'density' else
+            "independent banded-topology batch and precision refinement; existing numerical kernels"
             if (public_config.sampling.topology_sampling_mode in {"band_random", "band_fixed"}
                 or public_config.schedules.precision_start is not None) else
             "shared-mask batch; existing policy/simulation/PCGrad kernels"
             if public_config.sampling.reuse_masks_across_pairs else
             "existing topology-input implementation, unmodified"),
-        resume_supported=False))
+        resume_supported=False)
+    if initialization is not None:
+        manifest['initialization'] = initialization
+    write_json(path, manifest)

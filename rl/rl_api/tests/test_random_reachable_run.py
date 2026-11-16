@@ -40,6 +40,7 @@ def test_configuration_and_initial_weights_change_only_topology(tmp_path):
     assert old.pop('topology_star_backbone') is True
     assert new.pop('topology_star_backbone') is False
     assert new.pop('topology_random_reachable') is True
+    assert new.pop('topology_root_index') is None
     assert old == new
     states = []
     for public in (previous.CONFIG, run.CONFIG):
@@ -57,6 +58,224 @@ def test_configuration_and_initial_weights_change_only_topology(tmp_path):
     assert summary['worker_jobs'] == 35 and summary['pcgrad_tasks'] == 21
     assert summary['pcgrad_tasks_are_upper_bound']
     assert not Experiment('reachable-preview', config=run.CONFIG, output_directory=tmp_path/'preview').directory.exists()
+
+
+def test_fixed_laser1_growth_keeps_arbitrary_paths_optional_edges_and_reproducibility():
+    for size in (3, 6, 9):
+        options = dict(n_pairs=24, n_groups=5, n_lasers=size, device='cpu',
+                       root_index=0, return_roots=True)
+        masks, roots = sample_band_random_reachable_topologies(rng=np.random.default_rng(71), **options)
+        replay, replay_roots = sample_band_random_reachable_topologies(rng=np.random.default_rng(71), **options)
+        torch.testing.assert_close(masks, replay, rtol=0, atol=0)
+        np.testing.assert_array_equal(roots, replay_roots)
+        assert np.all(roots == 0) and torch.all(masks[:, -1] == 1)
+        receiver, source = core.directed_link_indices(size)
+        flat = masks[:, :4].reshape(-1, size*(size-1)).numpy().astype(bool)
+        assert any(not row[source == 0].all() for row in flat)
+        assert flat[:, receiver == 0].any()  # Feedback into laser 1 remains eligible.
+        assert all(reachable_from(row, 0, size) == set(range(size)) for row in flat)
+
+
+def test_fixed_root_configuration_rejects_an_absent_root():
+    from rl.rl_api import TopologyConfig
+    with pytest.raises(ValueError, match='nonnegative integer'):
+        TopologyConfig(backbone='random_reachable', root_index=-1)
+    with pytest.raises(ValueError, match='every trained array size'):
+        replace(run.CONFIG, topology=TopologyConfig(backbone='random_reachable', root_index=3))
+
+
+def test_fixed_bank_recipe_preserves_training_and_splits_validation_budget(tmp_path):
+    from rl.rl_api.experiments import train_mirrored_laser1_reachable_1000 as varying
+    from rl.rl_api.experiments import train_mirrored_laser1_fixed_topologies_1000 as fixed
+    a,b=asdict(varying.CONFIG),asdict(fixed.CONFIG)
+    assert a['sampling'].pop('fixed_topology_bank_seed') is None
+    assert b['sampling'].pop('fixed_topology_bank_seed') == 60007
+    assert a['validation'].pop('pairs_per_size') == 64
+    assert b['validation'].pop('pairs_per_size') == 32
+    assert a == b
+    old_backend,new_backend=asdict(varying.CONFIG.to_backend(tmp_path)),asdict(fixed.CONFIG.to_backend(tmp_path))
+    assert old_backend.pop('held_out_target_count') == 64
+    assert new_backend.pop('held_out_target_count') == 32
+    assert old_backend == new_backend
+    assert 2*len(fixed.CONFIG.sizes)*fixed.CONFIG.validation.pairs_per_size == 448
+    assert fixed.CONFIG.summary()['validation_cases_per_group'] == 224
+    assert fixed.CONFIG.summary()['validation_simulations_per_check'] == 448
+    assert fixed.INITIAL_CHECKPOINT == varying.INITIAL_CHECKPOINT
+    assert not fixed.CONFIG.phase_correction.enabled
+    assert fixed.CONFIG.summary()['distinct_training_topologies_total'] == 35
+    assert fixed.CONFIG.summary()['simulations_per_iteration'] == 1400
+    with pytest.raises(ValueError,match='nonnegative integer'):
+        replace(fixed.CONFIG.sampling,fixed_topology_bank_seed=-1)
+
+
+def test_fixed_bank_graphs_rng_and_validation_partitions(tmp_path):
+    from rl.rl_api.topology_bank import FixedTopologyBank
+    from rl.rl_api.experiments import train_mirrored_laser1_fixed_topologies_1000 as fixed
+    config=fixed.CONFIG.to_backend(tmp_path)
+    bank=FixedTopologyBank(config,60007)
+    assert bank.metadata() == FixedTopologyBank(config,60007).metadata()
+    for size in (3,5,9):
+        a,b=np.random.default_rng(91),np.random.default_rng(91)
+        masks=bank(5,5,size,a,'cpu',root_index=0)
+        sample_band_random_reachable_topologies(5,5,size,b,'cpu',root_index=0)
+        np.testing.assert_array_equal(a.random(10),b.random(10))
+        assert all(torch.equal(row,masks[0]) for row in masks)
+        again=bank(5,5,size,a,'cpu',root_index=0)
+        torch.testing.assert_close(masks,again,rtol=0,atol=0)
+        keys={row.tobytes() for row in masks[0].numpy()}
+        assert len(keys)==5
+        assert len(np.unique(engine.topology_density_band_ids(masks[0].sum(1).numpy(),size)))==3
+        assert all(reachable_from(row,0,size)==set(range(size)) for row in masks[0].numpy())
+        seen,roots=bank.validation_masks(size,64,seen=True,seed=17)
+        unseen,new_roots=bank.validation_masks(size,64,seen=False,seed=17)
+        assert np.all(roots==0) and np.all(new_roots==0)
+        assert all(row.tobytes() in keys for row in seen.numpy())
+        assert all(row.tobytes() not in keys for row in unseen.numpy())
+        replay,_=bank.validation_masks(size,64,seen=False,seed=17)
+        torch.testing.assert_close(unseen,replay,rtol=0,atol=0)
+
+
+def test_fixed_bank_training_records_seen_and_unseen_validation(tmp_path,monkeypatch,fake_physics):
+    from rl.rl_api.experiments import train_mirrored_laser1_fixed_topologies_1000 as fixed
+    from rl.rl_api.checkpoints import save
+    from rl.rl_api.root_context import calibrate_budget_references
+    from rl.rl_api.topology_bank import FixedTopologyBank
+    source_config=replace(previous.CONFIG,sizes=(3,4)).to_backend(tmp_path/'source')
+    source_policy=build_policy(source_config)
+    source_config=calibrate_budget_references(source_policy,source_config)
+    checkpoint=tmp_path/'source.pt'
+    save(checkpoint,source_policy,torch.optim.Adam(source_policy.parameters()),source_config,1000,.99)
+    public=replace(fixed.CONFIG,sizes=(3,4),
+        sampling=replace(fixed.CONFIG.sampling,pairs_per_size=1,pairs_per_job=1),
+        optimization=replace(fixed.CONFIG.optimization,iterations=2,workers=1),
+        schedules=replace(fixed.CONFIG.schedules,ordinary_end=2,wide_end=2),
+        validation=ValidationConfig(pairs_per_size=3,plot_use_tex=False))
+    recorded=[]
+    original=FixedTopologyBank.__call__
+    def capture(self,*args,**kwargs):
+        result=original(self,*args,**kwargs)
+        recorded.append((args[2],result.detach().clone()))
+        return result
+    monkeypatch.setattr(FixedTopologyBank,'__call__',capture)
+    groups=[]
+    original_evaluate=training.evaluate_bank
+    def capture_evaluation(policy,config,bank,iteration,pool,**options):
+        groups.append(options['topologies'])
+        return original_evaluate(policy,config,bank,iteration,pool,**options)
+    monkeypatch.setattr(training,'evaluate_bank',capture_evaluation)
+    result=Experiment('fixed-bank-test',config=public,output_directory=tmp_path/'run').train(
+        initial_checkpoint=checkpoint,live_plot=False,verify_reference=False)
+    assert len(recorded)==4 and len(groups)==4
+    for size in (3,4):
+        first=[m for n,m in recorded if n==size]
+        torch.testing.assert_close(first[0],first[1],rtol=0,atol=0)
+        for unseen,seen in zip(groups[::2],groups[1::2]):
+            known={row.tobytes() for row in first[0][0].numpy()}
+            assert all(row.tobytes() in known for row in seen[size][0].numpy())
+            assert all(row.tobytes() not in known for row in unseen[size][0].numpy())
+    for key in ['seen_topology_held_out_reward','seen_topology_held_out_phase_rms_success_fraction']:
+        assert len(result.history[key])==2
+    saved=torch.load(result.checkpoint('final'),weights_only=False)
+    assert saved['sampling_recipe']['mode']=='fixed_graph_bank'
+    metadata=saved['sampling_recipe']['fixed_topology_bank']
+    assert metadata==json.loads((result.directory/'fixed_topology_bank.json').read_text())
+    loaded=CouplingModel.load(result.checkpoint('final'),device='cpu')
+    assert loaded.metadata['sampling_recipe']['fixed_topology_bank']==metadata
+    assert not any(k.startswith('phase_correction') for k in result.history)
+    figure=result.plot(show=False)
+    assert len(figure.axes)==3
+    figure.canvas.draw()
+    import matplotlib.pyplot as plt
+    plt.close(figure)
+
+
+def test_warm_start_keeps_weights_calibration_and_phase_convention(tmp_path):
+    from rl.rl_api.checkpoints import initialize_from_checkpoint, save
+    from rl.rl_api.models import build_policy
+    from rl.rl_api.root_context import calibrate_budget_references
+    from rl.rl_api.experiments import train_mirrored_laser1_reachable_1000 as next_run
+    source_config = replace(previous.CONFIG, sizes=(3, 4)).to_backend(tmp_path/'source')
+    source_policy = build_policy(source_config)
+    source_config = calibrate_budget_references(source_policy, source_config)
+    source_policy.config = source_config
+    with torch.no_grad():
+        source_policy.edge_output.bias[1].add_(.3)
+    source_config = replace(source_config, exploration_std_scale=0.)
+    path = tmp_path/'source.pt'
+    save(path, source_policy, torch.optim.Adam(source_policy.parameters()), source_config, 1000, .99)
+    target_config = replace(next_run.CONFIG, sizes=(3, 4)).to_backend(tmp_path/'target')
+    target_policy = build_policy(target_config)
+    config, metadata = initialize_from_checkpoint(target_policy, target_config, path)
+    for name, value in source_policy.state_dict().items():
+        torch.testing.assert_close(target_policy.state_dict()[name], value, rtol=0, atol=0)
+    assert config.coupling_budget_reference_by_m == source_config.coupling_budget_reference_by_m
+    assert config.exploration_std_scale == 1. and config.topology_root_index == 0
+    assert metadata['source_iteration'] == 1000
+    source_model = CouplingModel(source_policy, source_config)
+    target_model = CouplingModel(target_policy, config)
+    context = Context([0., .4, -.7], [1., -.5, .3])
+    topology = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])
+    a = source_model.propose(context, topology=topology)
+    b = target_model.propose(context, topology=topology)
+    np.testing.assert_array_equal(a.coupling_strengths_per_ns, b.coupling_strengths_per_ns)
+    np.testing.assert_array_equal(a.coupling_phases_rad, b.coupling_phases_rad)
+    incompatible = replace(target_config, phase_parameterization='target_residual')
+    with pytest.raises(ValueError, match='phase_parameterization'):
+        initialize_from_checkpoint(build_policy(incompatible), incompatible, path)
+
+
+def test_fixed_root_warm_start_training_validation_and_loaded_inspection(tmp_path, monkeypatch, fake_physics):
+    from rl.rl_api import training_batch
+    from rl.rl_api.checkpoints import save
+    from rl.rl_api.models import build_policy
+    from rl.rl_api.root_context import calibrate_budget_references
+    from rl.rl_api.experiments import train_mirrored_laser1_reachable_1000 as next_run
+    import hashlib
+    source_config = replace(previous.CONFIG, sizes=(3, 4)).to_backend(tmp_path/'source')
+    source_policy = build_policy(source_config)
+    source_config = calibrate_budget_references(source_policy, source_config)
+    path = tmp_path/'source.pt'
+    save(path, source_policy, torch.optim.Adam(source_policy.parameters()), source_config, 1000, .99)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    public = replace(next_run.CONFIG, sizes=(3, 4),
+        sampling=replace(next_run.CONFIG.sampling, pairs_per_size=1, pairs_per_job=1),
+        optimization=replace(next_run.CONFIG.optimization, iterations=2, workers=1),
+        schedules=replace(next_run.CONFIG.schedules, ordinary_end=2, wide_end=2),
+        validation=ValidationConfig(pairs_per_size=3))
+    original_batch = training_batch.run_training_batch
+    seen = []
+    def check_start(policy, optimizer, config, *args, **kwargs):
+        if not seen:
+            assert not optimizer.state
+            assert config.coupling_budget_reference_by_m == source_config.coupling_budget_reference_by_m
+            for name, value in source_policy.state_dict().items():
+                torch.testing.assert_close(policy.state_dict()[name], value, rtol=0, atol=0)
+        seen.append(config.topology_root_index)
+        return original_batch(policy, optimizer, config, *args, **kwargs)
+    monkeypatch.setattr(training_batch, 'run_training_batch', check_start)
+    validation_options = []
+    original_sampler = sampling.sample_random_reachable_topologies
+    def record_sampler(*args, **kwargs):
+        validation_options.append(kwargs['root_index'])
+        return original_sampler(*args, **kwargs)
+    monkeypatch.setattr(sampling, 'sample_random_reachable_topologies', record_sampler)
+    result = Experiment('fixed-root-warm', config=public, output_directory=tmp_path/'new').train(
+        live_plot=False, verify_reference=False, initial_checkpoint=path)
+    assert seen == [0, 0] and validation_options == [0]*4
+    assert len(fake_physics) > 0
+    assert not any(k.startswith('phase_correction') for k in result.history)
+    manifest = json.loads((result.directory/'run.json').read_text())
+    assert manifest['initialization']['sha256'] == digest
+    saved = torch.load(result.checkpoint('final'), weights_only=False)
+    assert saved['sampling_recipe']['root_selection'] == 'fixed laser 1 in detuning order'
+    assert saved['sampling_recipe']['initialization']['sha256'] == digest
+    loaded = CouplingModel.load(result.checkpoint('final'), device='cpu')
+    assert loaded.backend_config.topology_root_index == 0
+    designs = loaded.propose(Context([0., .3, -.2], [1., -.5, .1]), count=20, seed=3)
+    assert validation_options[-1] == 0
+    for mask in designs.raw['gates'].astype(bool):
+        assert reachable_from(mask, 0, 3) == {0, 1, 2}
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
 
 
 def test_growth_keeps_cycles_unreached_edges_and_root_feedback_and_stops_at_reachability():

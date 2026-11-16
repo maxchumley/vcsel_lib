@@ -75,34 +75,22 @@ def average_coupling_matrices(results, valid_topologies):
 
 
 def plot_ensemble_phase_distribution(axis, results, valid_topologies, phase_error_deg):
-    """Single-case phase-circle convention with an ensemble-density ring.
+    """Target tolerance and per-laser ensemble ranges on adjacent phase circles.
 
-    Use the same aligned settled phases as the selected-case renderer. Retain
-    all noise realizations in the distribution, rather than collapsing a
-    multimodal distribution to one circular mean before binning.
+    Orange arcs span the full wrapped phase range about each circular mean,
+    using every valid topology and noise realization. A slight radial offset
+    separates achieved phases from targets without changing their angles.
     """
-    from matplotlib.collections import PatchCollection
-    from matplotlib.patches import Wedge
     from .._compat import core
 
     size = results.designs.context.n_lasers
     samples = np.asarray(results.aligned_achieved_phases).reshape(
         len(results.designs), results.noise_realizations, size)[valid_topologies]
-    wrapped = (samples + np.pi) % (2*np.pi) - np.pi
-    edges = np.linspace(-np.pi, np.pi, 181)  # Two-degree circular bins.
-    counts, _ = np.histogram(wrapped, bins=edges)
-    percentages = 100*counts/counts.sum()
-    wedges = [Wedge((0., 0.), 1.25, np.rad2deg(a), np.rad2deg(b), width=.16)
-              for a, b in zip(edges[:-1], edges[1:])]
-    ring = PatchCollection(wedges, cmap="Oranges", edgecolor="none", zorder=1)
-    ring.set_array(percentages)
-    ring.set_clim(0., max(float(percentages.max()), 1e-12))
-    axis.add_collection(ring)
-
     target = core.make_relative_to_laser_1(results.designs.context.target_phases_rad)
     circle = np.linspace(-np.pi, np.pi, 500)
-    for radius in (1.09, 1.25):
-        axis.plot(radius*np.cos(circle), radius*np.sin(circle), color=".85", linewidth=.5, zorder=1)
+    achieved_radius = 1.08
+    axis.plot(achieved_radius*np.cos(circle), achieved_radius*np.sin(circle),
+              color=".8", linewidth=.7, zorder=1)
     axis.plot(np.cos(circle), np.sin(circle), color=".55", linewidth=1.2, zorder=1)
     tolerance = np.deg2rad(phase_error_deg)
     for i, angle in enumerate(np.unique(np.round(target, decimals=12))):
@@ -115,17 +103,23 @@ def plot_ensemble_phase_distribution(axis, results, valid_topologies, phase_erro
     phasors = np.mean(np.exp(1j*samples), axis=(0, 1))
     defined = np.abs(phasors) > 1e-12
     achieved = np.angle(phasors[defined])
-    axis.scatter(np.cos(achieved), np.sin(achieved), s=45, color="tab:orange", marker="s",
+    for index, (laser, angle) in enumerate(zip(np.flatnonzero(defined), achieved)):
+        offsets = np.angle(np.exp(1j*(samples[..., laser]-angle)))
+        arc = angle + np.linspace(offsets.min(), offsets.max(), 101)
+        axis.plot(achieved_radius*np.cos(arc), achieved_radius*np.sin(arc),
+                  color="tab:orange", alpha=.3, linewidth=7., solid_capstyle="round",
+                  zorder=2, label="ensemble range" if index == 0 else None)
+    axis.scatter(achieved_radius*np.cos(achieved), achieved_radius*np.sin(achieved),
+                 s=45, color="tab:orange", marker="s",
                  label="ensemble mean", zorder=4)
     axis.axhline(0., color=".8", linewidth=.7, zorder=0)
     axis.axvline(0., color=".8", linewidth=.7, zorder=0)
-    axis.set(title="Settled phase comparison\nring = ensemble distribution",
+    axis.set(title="Settled phase comparison",
              xlabel=r"$\cos(\Delta\phi)$", ylabel=r"$\sin(\Delta\phi)$",
-             xlim=(-1.35, 1.35), ylim=(-1.35, 1.35), aspect="equal",
+             xlim=(-1.22, 1.22), ylim=(-1.22, 1.22), aspect="equal",
              xticks=[-1, 0, 1], yticks=[-1, 0, 1])
     axis.grid(alpha=.2)
     axis.legend(loc="center")
-    return ring
 
 
 def plot_ensemble_couplings(results, valid_topologies, phase_error_deg=3.):
@@ -133,7 +127,6 @@ def plot_ensemble_couplings(results, valid_topologies, phase_error_deg=3.):
     kappa, phi = average_coupling_matrices(results, valid_topologies)
     size = kappa.shape[0]
     figure, axes = plt.subplots(1, 3, figsize=(18, 5.5), constrained_layout=True)
-    figure.get_layout_engine().set(rect=(0., .07, 1., .93))
     kappa_cmap = plt.get_cmap("Blues").copy()
     phase_cmap = plt.get_cmap("twilight").copy()
     kappa_cmap.set_bad("black")
@@ -153,11 +146,8 @@ def plot_ensemble_couplings(results, valid_topologies, phase_error_deg=3.):
     for axis in axes[:2]:
         axis.set(xlabel="receiver", ylabel="source", xticks=ticks, yticks=ticks,
                  xticklabels=ticks+1, yticklabels=ticks+1)
-    ring = plot_ensemble_phase_distribution(axes[2], results, valid_topologies, phase_error_deg)
-    figure.colorbar(ring, ax=axes[2], label=r"Phase samples per $2^\circ$ bin ($\%$)")
+    plot_ensemble_phase_distribution(axes[2], results, valid_topologies, phase_error_deg)
     figure.suptitle(f"Ensemble coupling and settled phases ({np.count_nonzero(valid_topologies)}/{len(results.designs)} topologies)")
-    figure.text(.5, .02, "Strengths include absent links as zero; phase means use enabled links. The ring includes valid topologies and noise realizations.",
-                ha="center", fontsize="small")
     return figure
 
 

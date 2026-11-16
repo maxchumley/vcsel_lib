@@ -12,10 +12,53 @@ scripts and checkpoints are separate. Bernoulli gate training is deferred.
 
 ## Start here
 
+**Four-laser cluster experiment:** `experiments/train_four_laser_inphase_all_symmetric_1000.py`
+trains a fresh in-phase model on all 38 connected symmetric four-laser topologies,
+with both physical coupling matrices symmetric and 0–4 GHz detuning spans.
+The existing GNN architecture is unchanged. The dedicated Slurm wrapper requests
+32 CPUs and runs 31 simulation workers. See [setup and parallel batching](docs/four_laser_symmetric_run.md).
+
 **Great Lakes batch jobs:** see [cluster setup and submission](docs/great_lakes.md).
 The Slurm script uses account `arrays0` and the current root-encoder recipe.
 
-**Next experiment:** use `experiments/train_mirrored_root_encoder_1000.py`.
+**Next experiment:** use `experiments/train_mirrored_symmetric_density_1000.py`.
+It starts from fresh random weights and reuses the architecture's adjacency inputs
+for one uniform density value, and selects connected symmetric masks from the
+existing strength predictions. Directed strengths/phases remain asymmetric.
+The existing phase reward, heads, reference frequency, schedules and 1,400
+simulations per iteration are retained. See [the density-controlled setup](docs/symmetric_density_run.md).
+
+**Fixed-graph comparison:** use `experiments/train_mirrored_laser1_fixed_topologies_1000.py`.
+It keeps five fixed graphs per laser count (35 total) while drawing new targets
+and detunings. It uses the same star checkpoint and training settings as the varying
+topology comparison, with no strength prior or feedback teacher. Training stays
+at 1,400 simulations per iteration. Validation and plots separately report new
+targets on trained graphs and unseen graphs, with 32 cases per size per group
+(448 validation simulations total).
+See [the fixed topology bank setup](docs/fixed_topology_bank_run.md).
+
+**Varying-topology comparison:** `experiments/train_mirrored_laser1_reachable_1000.py`.
+It initializes from the successful delay/star checkpoint, keeps laser 1 as the
+frequency reference, and allows arbitrary paths from laser 1 instead of requiring
+an outward star. Optional links and root feedback remain eligible. There are no
+feedback-teaching updates or additional simulations. Run its single `#%%` cell.
+See [the fixed-root transfer setup](docs/laser1_reachable_from_star_run.md).
+
+**Mean-design phase-feedback comparison:** `experiments/train_mean_phase_feedback_1000.py`.
+It retains random roots and the existing architecture, but builds correction
+targets from post-RL mean designs. Its separate correction step updates only
+the existing phase-output row, preserving mean strengths and budgets exactly.
+Run its single `#%%` cell after restarting the kernel.
+See [the mean-design phase-only setup](docs/mean_phase_feedback_run.md).
+
+**Original phase-feedback comparison:** `experiments/train_phase_feedback_1000.py`.
+It keeps the root-encoder mirrored recipe and adds a circular teaching loss
+from measured, independently verified steady-phase corrections. Any laser
+can be the construction root, with random optional links and feedback.
+Run its single `#%%` cell to start fresh in its own folder.
+See [the phase-feedback setup](docs/phase_feedback_run.md).
+
+**Root-encoder baseline:** use `experiments/train_mirrored_root_encoder_1000.py`.
 It adds a binary root indicator to each laser's encoder features so the
 network knows which reference it is using. All other settings match the
 completed root-reference run, including the phase formula. Restart the

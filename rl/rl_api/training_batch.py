@@ -5,11 +5,12 @@ Policy, simulation workers, rewards, advantage scaling and PCGrad use the
 existing numerical routines. This path omits inactive historical features.
 """
 from dataclasses import replace
+from time import perf_counter
 import numpy as np
 import torch
 
 from ._compat import core, engine
-from .sampling import sample_shared_rooted_topologies
+from .sampling import sample_shared_rooted_topologies, reachable_root_options
 from .exploration import refinement_config, sample_annealed_candidates
 from .advantages import pair_excluded_advantages
 from .phase_reference import decode_samples, uses_root_reference
@@ -18,18 +19,24 @@ from .root_context import condition_on_roots
 
 def prepare_size(policy, config, rng, size, pair_count, iteration, mask_sampler):
     """Sample contexts/masks, then predict the configured noisy actions."""
+    if getattr(config, 'density_control', False):
+        from .density_control import prepare_density_size
+        return prepare_density_size(policy, config, rng, size, pair_count)
     local = replace(config, n_lasers=size)
     targets = core.sample_target_phases(pair_count, rng, size,
         config.structured_target_fraction, config.structured_target_jitter_rad)
+    if getattr(config, 'in_phase_targets', False):
+        targets = np.zeros_like(targets)
     detunings = core.sample_detuning_distributions(pair_count, rng, local, iteration=iteration)
     targets, detunings = core.sort_by_detuning(targets, detunings)
     features = engine.encode_context(targets, detunings, policy)
     root_options = dict(return_roots=True) if uses_root_reference(config) else {}
+    root_options.update(reachable_root_options(config))
     masks = mask_sampler(pair_count, config.pcgrad_topology_groups, size, rng, features.device,
         min_fraction=engine.topology_min_fraction_at(iteration, local),
         density_bias=config.training_topology_density_bias, fixed_star=config.topology_star_backbone,
         **root_options)
-    masks, roots = masks if root_options else (masks, None)
+    masks, roots = masks if root_options.get('return_roots', False) else (masks, None)
     gates = masks.repeat_interleave(config.actions_per_topology, dim=1)
     action_roots = None if roots is None else np.repeat(roots, config.actions_per_topology, axis=1)
     conditioned = condition_on_roots(policy, action_roots)
@@ -93,16 +100,28 @@ def collect_rewards(item, config):
     return rms['phase_rms_reward'], metrics
 
 
-def pcgrad_update(policy, optimizer, config, rng, prepared, advantages):
+def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase_correction=None):
     """Group gradients by physical band or mask rank; combine with PCGrad."""
     losses, weights, labels, context_counts = [], [], [], []
+    correction_values = []
     for item, advantage_np in zip(prepared,advantages):
         advantage = torch.as_tensor(advantage_np,
             dtype=item['features'].dtype,device=item['features'].device)
         candidate_losses = -(item['log_prob']*advantage)
+        teachers, correction_losses = [], None
+        if phase_correction is not None and phase_correction.enabled:
+            from .phase_correction import teacher_losses
+            teachers, correction_losses = teacher_losses(policy, item)
+            if correction_losses is not None:
+                correction_values.extend(correction_losses.detach().cpu().tolist())
         # Match the reference's boolean selection and mean reduction order.
         if config.pcgrad_task_grouping == "array_size_topology_density":
-            band_ids = engine.topology_density_band_ids(item['counts'], item['n_lasers'])
+            if (getattr(config, 'density_control', False)
+                    or getattr(config, 'exhaustive_symmetric_topologies', False)):
+                from .density_control import density_band_ids
+                band_ids = density_band_ids(item['counts'], item['n_lasers'])
+            else:
+                band_ids = engine.topology_density_band_ids(item['counts'], item['n_lasers'])
             band_names = engine.DENSITY_BANDS
         else:
             band_ids = np.broadcast_to(np.repeat(np.arange(config.pcgrad_topology_groups),
@@ -114,7 +133,13 @@ def pcgrad_update(policy, optimizer, config, rng, prepared, advantages):
             if not np.any(selected):
                 continue
             selected_tensor = torch.as_tensor(selected,device=candidate_losses.device)
-            losses.append(candidate_losses[selected_tensor].mean()+candidate_losses.new_zeros(()))
+            loss = candidate_losses[selected_tensor].mean()+candidate_losses.new_zeros(())
+            if correction_losses is not None:
+                teacher_indices = [i for i, teacher in enumerate(teachers)
+                    if selected[teacher['row'], teacher['column']]]
+                if teacher_indices:
+                    loss = loss+phase_correction.weight*correction_losses[teacher_indices].mean()
+            losses.append(loss)
             weights.append(float(selected.mean())/len(prepared))
             labels.append(f"M{item['n_lasers']}:{name}")
             context_counts.append(int(np.count_nonzero(selected.any(axis=1))))
@@ -145,13 +170,17 @@ def pcgrad_update(policy, optimizer, config, rng, prepared, advantages):
     with torch.no_grad():
         policy.log_std_kappa.clamp_(policy.minimum_log_std,policy.maximum_log_std)
         policy.log_std_phi.clamp_(policy.minimum_log_std,policy.maximum_log_std)
-    return dict(gradient_norm=float(norm.detach().cpu()), pcgrad_task_count=len(losses),
+    result = dict(gradient_norm=float(norm.detach().cpu()), pcgrad_task_count=len(losses),
         pcgrad_task_labels=labels,pcgrad_task_context_counts=context_counts,**diagnostics)
+    if phase_correction is not None and phase_correction.enabled:
+        result['phase_correction_loss'] = float(np.mean(correction_values)) if correction_values else 0.
+    return result
 
 
 def run_training_batch(policy, optimizer, config, rng, iteration, *,
                        simulation_pool=None, reward_scale_state=None,
-                       mask_sampler=sample_shared_rooted_topologies, schedules=None):
+                       mask_sampler=sample_shared_rooted_topologies, schedules=None,
+                       phase_correction=None):
     """One supplied-topology batch; explicit samplers also support parity tests."""
     if (not config.topology_input_mode or config.objective_mode!='phase_only'
             or config.phase_reward_mode!='wrapped_rms'
@@ -172,8 +201,16 @@ def run_training_batch(policy, optimizer, config, rng, iteration, *,
     if hasattr(config, "phase_model"):
         from .simulation import simulate_indexed_chunk
         worker = simulate_indexed_chunk
+    correction_enabled = phase_correction is not None and phase_correction.enabled
+    mean_phase_only = correction_enabled and phase_correction.mode == 'mean_phase_only'
+    joint_correction = correction_enabled and not mean_phase_only
+    if joint_correction:
+        from .simulation import simulate_indexed_locking_chunk
+        worker = simulate_indexed_locking_chunk
+    simulation_start=perf_counter()
     results = (list(simulation_pool.imap_unordered(worker,work)) if simulation_pool is not None
                else [worker(job) for job in work])
+    simulation_seconds=perf_counter()-simulation_start
     for result in results:
         prepared[int(result['size_batch_index'])]['results'].append(result)
     rewards, size_metrics, budgets = [], {}, []
@@ -182,15 +219,36 @@ def run_training_batch(policy, optimizer, config, rng, iteration, *,
         rewards.append(reward)
         size_metrics[item['n_lasers']] = metrics
         budgets.append((item['kappa'].sum(axis=(-2,-1))/item['n_lasers']).ravel())
+    correction_metrics = {}
+    if joint_correction:
+        from .phase_correction import collect_measurements, prepare_teachers, verify_teachers
+        for item in prepared:
+            collect_measurements(item)
+        # Preserve the baseline's exact-mean final evaluation, with no teacher
+        # rollouts or optimizer update at zero exploration.
+        teacher_work, correction_metrics = prepare_teachers(prepared, phase_correction,
+            verify=getattr(config, 'exploration_std_scale', 1.) != 0.)
+        teacher_results = (list(simulation_pool.imap_unordered(worker, teacher_work))
+            if simulation_pool is not None and teacher_work else [worker(job) for job in teacher_work])
+        verify_teachers(prepared, teacher_results, phase_correction, correction_metrics)
+        correction_metrics['phase_correction_loss'] = 0.
     advantage_function = (pair_excluded_advantages
         if getattr(config, 'reward_baseline', 'topology_mean') == 'pair_excluded'
         else engine._topology_advantages)
     advantages = advantage_function(rewards,config,reward_scale_state)
-    diagnostics = pcgrad_update(policy,optimizer,config,rng,prepared,advantages)
+    options = dict(phase_correction=phase_correction) if joint_correction else {}
+    update_start=perf_counter()
+    diagnostics = pcgrad_update(policy,optimizer,config,rng,prepared,advantages,**options)
+    if getattr(config,'exhaustive_symmetric_topologies',False):
+        diagnostics.update(simulation_seconds=simulation_seconds,update_seconds=perf_counter()-update_start)
+    if mean_phase_only:
+        from .mean_phase_correction import run_mean_phase_correction
+        correction_metrics = run_mean_phase_correction(policy, prepared, phase_correction,
+            learning_rate=optimizer.param_groups[0]['lr'], simulation_pool=simulation_pool)
     average = {key:float(np.mean([metrics[key] for metrics in size_metrics.values()]))
                for key in next(iter(size_metrics.values()))}
     percentiles = np.percentile(np.concatenate(budgets),[10,50,90])
     return dict(**average, sampled_budget_p10_per_laser=float(percentiles[0]),
         sampled_budget_median_per_laser=float(percentiles[1]),
         sampled_budget_p90_per_laser=float(percentiles[2]),
-        size_metrics=size_metrics,**diagnostics)
+        size_metrics=size_metrics,**(correction_metrics | diagnostics))

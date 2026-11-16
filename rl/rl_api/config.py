@@ -28,10 +28,13 @@ class ModelConfig:
     initial_budget_per_laser: float = .5
     phase_parameterization: str = "absolute"
     encode_root: bool = False
+    symmetric_coupling_values: bool = False
 
     def __post_init__(self):
         if not isinstance(self.encode_root, bool):
             raise ValueError("encode_root must be True or False")
+        if not isinstance(self.symmetric_coupling_values, bool):
+            raise ValueError('symmetric_coupling_values must be True or False')
         if self.encode_root and self.phase_parameterization != 'target_root_delay_residual':
             raise ValueError("Root encoding currently requires target_root_delay_residual")
         if self.phase_parameterization not in {"absolute", "target_residual", "target_delay_residual",
@@ -49,19 +52,23 @@ def _default_phys():
 
 @dataclass(frozen=True)
 class TopologyConfig:
-    """Provided masks now; learned Bernoulli gates are a reserved extension."""
+    """Provided masks or strength-ranked, connected symmetric density control."""
     mode: str = "provided"
     backbone: str = "rooted_star"
     minimum_extra_link_fraction: float = 0.0
     density_bias: float = 1.0
+    root_index: int | None = None  # Zero-based detuning order; None samples any root.
 
     def __post_init__(self):
-        if self.mode != "provided":
+        if self.mode not in {"provided", "density"}:
             raise NotImplementedError(
-                "This API version reproduces supplied-topology training. "
-                "Learned Bernoulli gates are planned but are not enabled.")
-        if self.backbone not in {"rooted_star", "random_reachable"}:
-            raise ValueError("backbone must be rooted_star or random_reachable")
+                "Topology mode must be provided or density; Bernoulli gates are not enabled.")
+        if self.backbone not in {"rooted_star", "random_reachable", "all_connected_symmetric"}:
+            raise ValueError("backbone must be rooted_star, random_reachable or all_connected_symmetric")
+        if self.root_index is not None:
+            if (type(self.root_index) is not int or self.root_index < 0
+                    or self.backbone != "random_reachable"):
+                raise ValueError("root_index requires random_reachable and a nonnegative integer")
 
 
 @dataclass(frozen=True)
@@ -78,6 +85,8 @@ class SamplingConfig:
     reuse_masks_across_pairs: bool = False
     topology_sampling_mode: str = "paired_contexts"
     action_sampling: str = "independent"  # mirrored pairs opposite latent perturbations.
+    fixed_topology_bank_seed: int | None = None  # Reuse five masks per size for the whole run.
+    target_mode: str = 'random'
     # paired_contexts: spread one pool across pairs; per_target: span the full
     # density range separately for every pair, with independent optional edges.
 
@@ -101,6 +110,11 @@ class SamplingConfig:
             raise ValueError("topology_sampling_mode must be paired_contexts, per_target, band_random or band_fixed")
         if self.action_sampling not in {"independent", "mirrored"}:
             raise ValueError("action_sampling must be independent or mirrored")
+        if self.target_mode not in {'random', 'in_phase'}:
+            raise ValueError('target_mode must be random or in_phase')
+        if self.fixed_topology_bank_seed is not None and (
+                type(self.fixed_topology_bank_seed) is not int or self.fixed_topology_bank_seed < 0):
+            raise ValueError("fixed_topology_bank_seed must be a nonnegative integer or None")
 
 
 @dataclass(frozen=True)
@@ -212,6 +226,28 @@ class RewardConfig:
 
 
 @dataclass(frozen=True)
+class PhaseCorrectionConfig:
+    """Opt-in supervision from independently verified steady-phase corrections."""
+    weight: float = 0.0
+    frequency_tolerance_mhz: float = 1.0
+    phase_jitter_tolerance_deg: float = 1.0
+    mode: str = 'sampled_joint'
+
+    @property
+    def enabled(self):
+        return self.weight > 0.
+
+    def __post_init__(self):
+        if self.mode not in {'sampled_joint', 'mean_phase_only'}:
+            raise ValueError('Phase-correction mode must be sampled_joint or mean_phase_only')
+        if not math.isfinite(self.weight) or self.weight < 0.:
+            raise ValueError("Phase-correction weight must be finite and nonnegative")
+        for name in ('frequency_tolerance_mhz', 'phase_jitter_tolerance_deg'):
+            if not math.isfinite(getattr(self, name)) or getattr(self, name) <= 0.:
+                raise ValueError(f"{name} must be positive and finite")
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Current recipe with separate, documented user-facing sections."""
     sizes: tuple[int, ...] = tuple(range(3, 10))
@@ -227,6 +263,7 @@ class TrainingConfig:
     schedules: ScheduleConfig = field(default_factory=ScheduleConfig)
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
+    phase_correction: PhaseCorrectionConfig = field(default_factory=PhaseCorrectionConfig)
 
     def __post_init__(self):
         object.__setattr__(self, "sizes", tuple(self.sizes))
@@ -239,6 +276,8 @@ class TrainingConfig:
         if (not self.sizes or len(set(self.sizes)) != len(self.sizes)
                 or any(not isinstance(m, int) or m < 2 for m in self.sizes)):
             raise ValueError("sizes must contain distinct integers >=2")
+        if self.topology.root_index is not None and self.topology.root_index >= min(self.sizes):
+            raise ValueError("root_index must exist in every trained array size")
         if self.schedules.wide_phase_actions > self.sampling.actions_per_topology:
             raise ValueError("wide_phase_actions cannot exceed actions_per_topology")
         if self.sampling.action_sampling == "mirrored":
@@ -273,6 +312,40 @@ class TrainingConfig:
             if (self.sampling.topology_sampling_mode != 'band_random'
                     or self.sampling.reuse_masks_across_pairs):
                 raise ValueError("Random reachable training currently uses independent band_random masks")
+        if self.sampling.fixed_topology_bank_seed is not None:
+            if (self.topology.backbone != 'random_reachable'
+                    or self.sampling.topology_sampling_mode != 'band_random'
+                    or self.sampling.topologies_per_pair != 5
+                    or self.sampling.reuse_masks_across_pairs):
+                raise ValueError("Fixed topology banks require five random_reachable band_random masks")
+        exhaustive = self.topology.backbone == 'all_connected_symmetric'
+        if exhaustive:
+            if (self.sizes != (4,) or self.topology.mode != 'provided'
+                    or self.sampling.topologies_per_pair != 38
+                    or self.sampling.topology_sampling_mode != 'per_target'
+                    or self.sampling.action_sampling != 'mirrored'
+                    or self.sampling.target_mode != 'in_phase'
+                    or not self.model.symmetric_coupling_values
+                    or self.model.phase_parameterization != 'target_delay_residual'
+                    or self.model.encode_root or self.sampling.reuse_masks_across_pairs
+                    or self.sampling.fixed_topology_bank_seed is not None
+                    or self.optimization.pcgrad_grouping != 'density_bands'
+                    or self.phase_correction.enabled):
+                raise ValueError('Exhaustive symmetric training requires four lasers, 38 supplied masks, '
+                                 'in-phase targets, symmetric values and mirrored per_target density-band learning')
+        elif self.model.symmetric_coupling_values or self.sampling.target_mode != 'random':
+            raise ValueError('Symmetric values and in-phase sampling currently use all_connected_symmetric')
+        if self.topology.mode == 'density':
+            if (self.model.encode_root
+                    or self.model.phase_parameterization != 'target_delay_residual'
+                    or self.topology.backbone != 'rooted_star'
+                    or self.topology.root_index is not None
+                    or self.sampling.topology_sampling_mode != 'band_random'
+                    or self.sampling.fixed_topology_bank_seed is not None
+                    or self.sampling.action_sampling != 'mirrored'
+                    or self.phase_correction.enabled):
+                raise ValueError('Density control requires the mirrored target_delay_residual recipe, '
+                                 'band_random density requests, and no root encoding, graph bank or teacher')
         if (self.model.phase_parameterization == 'target_root_delay_residual'
                 and self.topology.backbone != 'random_reachable'):
             raise ValueError("Root delay references require random_reachable topology sampling")
@@ -370,8 +443,15 @@ class TrainingConfig:
             settings['phase_parameterization'] = m.phase_parameterization
         if m.encode_root:
             settings['encode_root'] = True
+        if self.topology.mode == 'density':
+            settings.update(density_control=True, topology_star_backbone=False)
+        if self.topology.backbone == 'all_connected_symmetric':
+            settings.update(exhaustive_symmetric_topologies=True, symmetric_coupling_values=True,
+                            in_phase_targets=True, topology_star_backbone=False)
         if self.topology.backbone == 'random_reachable':
             settings['topology_random_reachable'] = True
+            if self.topology.root_index is not None:
+                settings['topology_root_index'] = self.topology.root_index
         if a.anneal_to_mean:
             # The API batch applies one SD multiplier instead of the legacy bound schedules.
             settings.update(phase_parameterization=m.phase_parameterization,
@@ -434,6 +514,53 @@ class TrainingConfig:
         if self.topology.backbone == 'random_reachable':
             summary.update(topology_backbone='random_reachable', root_selection='uniform per topology',
                            pcgrad_tasks_are_upper_bound=True)
+            if self.topology.root_index is not None:
+                summary['root_selection'] = f'fixed laser {self.topology.root_index+1} in detuning order'
+        if s.fixed_topology_bank_seed is not None:
+            summary.update(topology_bank_seed=s.fixed_topology_bank_seed,
+                distinct_training_topologies_per_size=s.topologies_per_pair,
+                distinct_training_topologies_total=len(self.sizes)*s.topologies_per_pair,
+                mask_reuse='same five per size across all target pairs and iterations',
+                pcgrad_tasks_are_upper_bound=False,
+                validation_groups='new targets on trained graphs; new targets on unseen graphs',
+                validation_cases_per_group=len(self.sizes)*self.validation.pairs_per_size,
+                validation_simulations_per_check=2*len(self.sizes)*self.validation.pairs_per_size)
         if self.model.encode_root:
             summary.update(root_encoder_input='one binary root flag per laser', node_input_features=5)
+        if self.topology.mode == 'density':
+            summary.update(topology_sampling='tree + three stratified density requests + all-to-all',
+                topology_backbone='learned strength-ranked spanning tree; strongest remaining pairs',
+                node_input_features=4, new_parameters=0,
+                topology_input='density fraction only; computational messages remain all-to-all',
+                density_features='reuse the two adjacency slots per pair with uniform retained-pair density',
+                pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
+                symmetric_masks=True, symmetric_strengths=False, symmetric_phases=False,
+                mask_reuse='selected separately from each sampled strength matrix',
+                sampled_masks_per_size=s.pairs_per_size*candidates,
+                target_detuning_contexts_total=len(self.sizes)*s.pairs_per_size,
+                density_requests_per_pair=s.topologies_per_pair,
+                pcgrad_tasks_are_upper_bound=True,
+                validation_simulations_per_check=len(self.sizes)*self.validation.pairs_per_size)
+        if self.topology.backbone == 'all_connected_symmetric':
+            summary.update(topology_sampling='all 38 connected labeled symmetric masks every iteration',
+                topology_backbone='all_connected_symmetric', target_mode='in_phase',
+                symmetric_masks=True, symmetric_strengths=True, symmetric_phases=True,
+                node_input_features=4, new_parameters=0, pcgrad_tasks=3,
+                topology_pair_counts={'3':16, '4':15, '5':6, '6':1},
+                validation_simulations_per_check=38*self.validation.pairs_per_size,
+                mask_reuse='same complete bank for every detuning context',
+                independent_detuning_contexts=s.pairs_per_size)
+        if self.phase_correction.enabled:
+            summary.update(phase_correction_weight=self.phase_correction.weight,
+                phase_correction_mode=self.phase_correction.mode,
+                correction_frequency_tolerance_mhz=self.phase_correction.frequency_tolerance_mhz,
+                correction_phase_jitter_tolerance_deg=self.phase_correction.phase_jitter_tolerance_deg,
+                correction_verification_simulations_max=(len(self.sizes)*s.pairs_per_size*s.topologies_per_pair),
+                correction_selection='best locked action per context/topology; fresh verification before teaching')
+            if self.phase_correction.mode == 'mean_phase_only':
+                means = len(self.sizes)*s.pairs_per_size*s.topologies_per_pair
+                summary.update(correction_selection='post-RL mean design per context/topology',
+                    correction_mean_simulations_max=means,
+                    simulations_per_iteration_max=len(self.sizes)*s.pairs_per_size*candidates+2*means,
+                    correction_update='separate phase-output-row gradient step; shared layers unchanged')
         return summary

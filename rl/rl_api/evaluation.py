@@ -152,7 +152,8 @@ def evaluate_designs(designs, *, duration_ns=None, noise_amplitude=None,
 
 
 def evaluate_phase_model_policy(policy, targets, detunings, config, *,
-                                seed=0, simulation_pool=None):
+                                seed=0, simulation_pool=None, topology_masks=None,
+                                root_indices=None):
     """Keep the held-out procedure while passing the native phase convention.
 
     The historical evaluator's workers omit phase_model. Sampling, mean
@@ -161,6 +162,13 @@ def evaluate_phase_model_policy(policy, targets, detunings, config, *,
     targets, detunings = core.sort_by_detuning(targets, detunings)
     features = engine.encode_context(targets, detunings, policy)
     policy.eval()
+    if getattr(config, 'density_control', False):
+        if topology_masks is not None or root_indices is not None:
+            raise ValueError('Density validation selects its own masks from the predicted strengths')
+        from .density_control import validation_actions
+        with torch.inference_mode():
+            decoded = validation_actions(policy, features, config, seed)
+        return summarize_phase_validation(targets, detunings, *decoded, config, simulation_pool)
     with torch.inference_mode(), torch.random.fork_rng(devices=[]):
         torch.manual_seed(seed)
         mask_sampler = engine.sample_stratified_rooted_topologies
@@ -168,12 +176,25 @@ def evaluate_phase_model_policy(policy, targets, detunings, config, *,
             from .sampling import sample_random_reachable_topologies
             mask_sampler = sample_random_reachable_topologies
         root_options = dict(return_roots=True) if uses_root_reference(config) else {}
-        masks = mask_sampler(
-            1, len(targets), config.n_lasers, np.random.default_rng(seed),
-            features.device, min_fraction=config.training_topology_min_fraction,
-            fixed_star=config.topology_star_backbone, **root_options,
-        )
-        masks, roots = masks if root_options else (masks, None)
+        from .sampling import reachable_root_options
+        root_options.update(reachable_root_options(config))
+        if topology_masks is None:
+            masks = mask_sampler(
+                1, len(targets), config.n_lasers, np.random.default_rng(seed),
+                features.device, min_fraction=config.training_topology_min_fraction,
+                fixed_star=config.topology_star_backbone, **root_options,
+            )
+            masks, roots = masks if root_options.get('return_roots', False) else (masks, None)
+        else:
+            masks = torch.as_tensor(topology_masks, dtype=features.dtype, device=features.device)
+            expected = (len(targets), config.n_lasers*(config.n_lasers-1))
+            if masks.shape != expected:
+                raise ValueError(f'Validation topology masks must have shape {expected}')
+            if not torch.all((masks == 0) | (masks == 1)):
+                raise ValueError('Validation topology masks must be binary')
+            roots = None if root_indices is None else np.asarray(root_indices)
+            if uses_root_reference(config) and (roots is None or roots.shape != (len(targets),)):
+                raise ValueError('Root-reference validation requires one retained root per mask')
         masks = masks.reshape(len(targets), 1, config.n_lasers * (config.n_lasers - 1))
         roots = None if roots is None else roots.reshape(len(targets), 1)
         actions, budget_actions, _ = engine.sample_topology_conditioned_candidates(
@@ -181,10 +202,22 @@ def evaluate_phase_model_policy(policy, targets, detunings, config, *,
     kappa, phi, counts, rho, shortfall = decode_samples(
         actions, masks, config, budget_actions=budget_actions,
         detunings_ghz=detunings, root_indices=roots)
+    return summarize_phase_validation(targets, detunings, kappa, phi, counts, rho, shortfall,
+                                      config, simulation_pool)
+
+
+def summarize_phase_validation(targets, detunings, kappa, phi, counts, rho, shortfall,
+                               config, simulation_pool):
+    """Common physical metrics for supplied and density-selected topologies."""
     simulation = simulate_phase_model_candidates(targets, kappa, phi, config,
         detunings=detunings, simulation_pool=simulation_pool)
     phase = simulation["phase_reward"]
-    band_ids = engine.topology_density_band_ids(counts[:, 0], config.n_lasers)
+    if (getattr(config, 'density_control', False)
+            or getattr(config, 'exhaustive_symmetric_topologies', False)):
+        from .density_control import density_band_ids
+        band_ids = density_band_ids(counts[:, 0], config.n_lasers)
+    else:
+        band_ids = engine.topology_density_band_ids(counts[:, 0], config.n_lasers)
 
     def by_density(values):
         return {label: float(values[band_ids == index].mean())
@@ -198,6 +231,12 @@ def evaluate_phase_model_policy(policy, targets, detunings, config, *,
             worst_phase_rms_error_deg=float(simulation["worst_phase_rms_error_deg"].mean()),
             phase_rms_success_fraction=float(simulation["phase_rms_success"].mean()),
             rms_reward_by_density=by_density(simulation["phase_rms_reward"]))
+    if getattr(config, 'density_control', False):
+        for label, links in [('tree', 2*(config.n_lasers-1)),
+                             ('ata', config.n_lasers*(config.n_lasers-1))]:
+            selected = counts[:, 0] == links
+            rms_metrics[label+'_reward'] = float(simulation['phase_rms_reward'][selected].mean())
+            rms_metrics[label+'_success_fraction'] = float(simulation['phase_rms_success'][selected].mean())
     return dict(phase_reward=float(phase.mean()),
         training_reward=float(simulation["phase_rms_reward"].mean())
             if rms_metrics else float(phase.mean()),

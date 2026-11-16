@@ -89,11 +89,12 @@ class Experiment:
         return reference_source_status()
 
     def train(self, *, iterations=None, workers=None, live_plot=True, verify_reference=True,
-              restart=False):
+              restart=False, initial_checkpoint=None):
         """Start fresh; restart=True archives existing results before starting over.
 
-        This initializes new weights and optimizer state. It does not resume
-        a checkpoint. Optional iteration/worker overrides leave schedules fixed.
+        initial_checkpoint copies learned weights and budget calibration into
+        the new recipe. Optimizer, sampler, schedules and history start fresh;
+        this does not resume a run. Overrides leave schedules fixed.
         """
         from .training import train
         updates = {k: v for k, v in dict(iterations=iterations, workers=workers).items() if v is not None}
@@ -102,11 +103,16 @@ class Experiment:
             config = replace(self.config, optimization=replace(self.config.optimization, **updates))
             chosen = Experiment(self.name, config=config, output_directory=self.directory)
         return train(chosen, live_plot=live_plot, verify_reference=verify_reference,
-                     restart=restart)
+                     restart=restart, initial_checkpoint=initial_checkpoint)
 
 
 class CouplingModel:
-    """One variable-size policy; proposing designs does not simulate them."""
+    """One variable-size policy; proposing designs does not simulate them.
+
+    Density-controlled checkpoints accept density_fraction in [0,1] instead of
+    a topology. Zero requests a symmetric tree; one requests all-to-all.
+    None samples an ensemble of density requests spanning that range.
+    """
     def __init__(self, policy, config, *, metadata=None, output_directory=None):
         if not config.topology_input_mode:
             raise NotImplementedError("This release supports topology-input models only")
@@ -131,13 +137,17 @@ class CouplingModel:
         return cls(policy.eval(), config, metadata=metadata, output_directory=directory)
 
     def propose(self, context=None, *, target_phases_rad=None, detunings_ghz=None,
-                topology=None, count=100, continuous_actions="mean", seed=None):
+                topology=None, density_fraction=None, count=100, continuous_actions="mean", seed=None):
         """Sample rooted masks or use a supplied Topology, then predict couplings.
 
         Plain topology arrays use [receiver,source]. For the old inspector's
         opposite convention, pass Topology.from_source_receiver(matrix).
         Inferred outputs are sorted by detuning with targets/masks permuted
         together. Topology-input inference matches the existing inspector.
+        Density-controlled checkpoints instead select connected reciprocal
+        pairs from their own predicted strengths at the requested density.
+        density_fraction=None spreads candidate densities from tree to ATA;
+        seed controls the randomized fractions and candidate order.
         Root-reference models retain each automatic graph's sampled root.
         For manual masks, use the lowest-detuned laser that reaches all nodes.
         """
@@ -153,6 +163,29 @@ class CouplingModel:
             raise ValueError("continuous_actions must be mean or sample")
         config = replace(self.backend_config, n_lasers=context.n_lasers, n_jobs=1,
                          jupyter_mode=False, noise_amplitude=0.0)
+        if getattr(config, 'density_control', False):
+            if topology is not None:
+                raise ValueError('Density-controlled models select their own topology; '
+                                 'pass density_fraction or None for a density ensemble')
+            from .density_control import infer_density_designs
+            raw = infer_density_designs(self.policy, context, config, density_fraction, count,
+                                       continuous_actions == 'mean', seed)
+            ordered = Context(raw['target_phases_rad'], raw['detuning_distribution_ghz'])
+            return DesignBatch(ordered, raw, config, self.output_directory)
+        if density_fraction is not None:
+            raise ValueError('density_fraction requires a density-controlled checkpoint')
+        if getattr(config, 'exhaustive_symmetric_topologies', False):
+            supplied = None
+            if topology is not None:
+                mask = topology if isinstance(topology, Topology) else Topology.from_receiver_source(topology)
+                supplied = mask.receiver_source
+                if supplied.ndim == 3:
+                    count = len(supplied)
+            from .symmetric_topologies import infer_symmetric_designs
+            raw = infer_symmetric_designs(self.policy, context, config, supplied, count,
+                                          continuous_actions == 'mean', seed)
+            ordered = Context(raw['target_phases_rad'], raw['detuning_distribution_ghz'])
+            return DesignBatch(ordered, raw, config, self.output_directory)
         supplied = None
         roots = None
         if topology is not None:
@@ -161,14 +194,15 @@ class CouplingModel:
                 count = len(mask.receiver_source)
             supplied = mask.as_source_receiver()
         elif getattr(config, 'topology_random_reachable', False):
-            from .sampling import sample_random_reachable_topologies
+            from .sampling import sample_random_reachable_topologies, reachable_root_options
             from ._compat import core
             root_options = dict(return_roots=True) if uses_root_reference(config) else {}
+            root_options.update(reachable_root_options(config))
             masks = sample_random_reachable_topologies(1, count, context.n_lasers,
                 np.random.default_rng(seed), 'cpu',
                 min_fraction=config.training_topology_min_fraction,
                 density_bias=config.training_topology_density_bias, **root_options)
-            masks, roots = masks if root_options else (masks, None)
+            masks, roots = masks if root_options.get('return_roots', False) else (masks, None)
             receivers, sources = core.directed_link_indices(context.n_lasers)
             matrices = np.zeros((count, context.n_lasers, context.n_lasers), dtype=bool)
             matrices[:, sources, receivers] = masks[0].numpy()

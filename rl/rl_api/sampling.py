@@ -15,7 +15,13 @@ class PairedContexts:
     root_indices: np.ndarray | None = None
 
 
-def random_reachable_mask(n_lasers, rng, minimum_links=0):
+def reachable_root_options(config):
+    """Only pass the new option when explicitly selected; old RNG draws stay intact."""
+    root = getattr(config, 'topology_root_index', None)
+    return {} if root is None else dict(root_index=root)
+
+
+def random_reachable_mask(n_lasers, rng, minimum_links=0, *, root_index=None):
     """Choose a root, add arbitrary random directed edges until it reaches all nodes.
 
     Continue along the same random edge order for any requested extra links.
@@ -25,7 +31,9 @@ def random_reachable_mask(n_lasers, rng, minimum_links=0):
     receivers, sources = core.directed_link_indices(n_lasers)
     if n_lasers < 2 or not 0 <= minimum_links <= len(receivers):
         raise ValueError("Reachable sampling needs M>=2 and a valid minimum link count")
-    root = int(rng.integers(n_lasers))
+    if root_index is not None and (type(root_index) is not int or not 0 <= root_index < n_lasers):
+        raise ValueError("root_index must name a laser in this array")
+    root = int(rng.integers(n_lasers)) if root_index is None else root_index
     order = rng.permutation(len(receivers))
     mask = np.zeros(len(receivers), dtype=bool)
     reachable = np.zeros(n_lasers, dtype=bool)
@@ -45,7 +53,7 @@ def random_reachable_mask(n_lasers, rng, minimum_links=0):
 
 def sample_random_reachable_topologies(n_pairs, n_groups, n_lasers, rng, device, *,
                                        min_fraction=0., density_bias=1., fixed_star=False,
-                                       return_roots=False):
+                                       return_roots=False, root_index=None):
     """Reachability-grown graphs with stratified requested counts for inspection/validation.
 
     Reachability takes priority over the requested count: a random prefix may
@@ -70,14 +78,15 @@ def sample_random_reachable_topologies(n_pairs, n_groups, n_lasers, rng, device,
     roots = np.empty((n_pairs, n_groups), dtype=int)
     for pair in range(n_pairs):
         for group in range(n_groups):
-            masks[pair, group], roots[pair, group] = random_reachable_mask(n_lasers, rng, int(counts[pair, group]))
+            masks[pair, group], roots[pair, group] = random_reachable_mask(
+                n_lasers, rng, int(counts[pair, group]), root_index=root_index)
     result = torch.as_tensor(masks, device=device, dtype=torch.float32)
     return (result, roots) if return_roots else result
 
 
 def sample_band_random_reachable_topologies(n_pairs, n_groups, n_lasers, rng, device, *,
                                             min_fraction=0., density_bias=1., fixed_star=False,
-                                            return_roots=False):
+                                            return_roots=False, root_index=None):
     """Five density slots: first reachable graph, random band extras, all-to-all.
 
     Use the previous run's requested sparse/middle/dense counts, but keep
@@ -97,7 +106,8 @@ def sample_band_random_reachable_topologies(n_pairs, n_groups, n_lasers, rng, de
         for group in range(n_groups):
             requested = (n_lasers-1 if group == 0 else edges if group == 4 else
                          n_lasers-1+int(rng.choice(levels[bands == group-1])))
-            masks[pair, group], roots[pair, group] = random_reachable_mask(n_lasers, rng, requested)
+            masks[pair, group], roots[pair, group] = random_reachable_mask(
+                n_lasers, rng, requested, root_index=root_index)
     result = torch.as_tensor(masks, device=device, dtype=torch.float32)
     return (result, roots) if return_roots else result
 
@@ -217,10 +227,11 @@ def sample_pairs(config, rng, *, n_lasers, iteration=0, device="cpu",
         sampler = engine.sample_paired_rooted_topologies
     from .phase_reference import uses_root_reference
     root_options = dict(return_roots=True) if uses_root_reference(config) else {}
+    root_options.update(reachable_root_options(config))
     masks = sampler(count, config.pcgrad_topology_groups,
         n_lasers, rng, torch.device(device),
         min_fraction=engine.topology_min_fraction_at(iteration, local),
         density_bias=config.training_topology_density_bias,
         fixed_star=config.topology_star_backbone, **root_options)
-    masks, roots = masks if root_options else (masks, None)
+    masks, roots = masks if root_options.get('return_roots', False) else (masks, None)
     return PairedContexts(target, detuning, masks, roots)

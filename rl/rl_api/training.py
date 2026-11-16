@@ -12,6 +12,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import multiprocessing as mp
 from pathlib import Path
+from time import perf_counter
 import numpy as np
 import torch
 
@@ -38,12 +39,29 @@ HISTORY_KEYS = (
 )
 
 
-def make_history(config):
+def make_history(config, *, phase_correction=None, fixed_topology_bank=False):
     """Keep the current RMS run's active metrics, excluding unused placeholders."""
     history = {key: [] for key in HISTORY_KEYS}
+    if phase_correction is not None and phase_correction.enabled:
+        from .phase_correction import HISTORY_KEYS as correction_keys
+        history.update({key: [] for key in correction_keys})
+        if phase_correction.mode == 'mean_phase_only':
+            from .mean_phase_correction import HISTORY_KEYS as mean_keys
+            history.update({key: [] for key in mean_keys})
     for key in ("held_out_by_m", "held_out_rms_error_by_m", "held_out_rms_success_by_m"):
         history[key] = {size: [] for size in config.training_n_lasers}
     history["held_out_by_density"] = {band: [] for band in engine.DENSITY_BANDS}
+    if getattr(config, 'density_control', False):
+        for label in ('tree', 'ata'):
+            for metric in ('reward', 'success_fraction'):
+                history['held_out_'+label+'_'+metric] = []
+    if getattr(config,'exhaustive_symmetric_topologies',False):
+        history.update({name:[] for name in ('simulation_seconds','update_seconds','validation_seconds')})
+    if fixed_topology_bank:
+        for name in ('reward', 'phase_rms_success_fraction', 'worst_phase_rms_error_deg'):
+            history['seen_topology_held_out_'+name] = []
+        for name in ('rms_reward_by_m', 'rms_success_by_m'):
+            history['seen_topology_held_out_'+name] = {size: [] for size in config.training_n_lasers}
     return history
 
 
@@ -55,6 +73,8 @@ def make_validation_bank(config):
         targets = core.sample_target_phases(config.held_out_target_count,
             np.random.default_rng(config.random_seed + 10000 + size), size,
             config.structured_target_fraction, config.structured_target_jitter_rad)
+        if getattr(config, 'in_phase_targets', False):
+            targets = np.zeros_like(targets)
         detunings = core.sample_detuning_distributions(config.held_out_target_count,
             np.random.default_rng(config.random_seed + 20000 + size), local,
             iteration=config.detuning_curriculum_iterations)
@@ -62,21 +82,32 @@ def make_validation_bank(config):
     return bank
 
 
-def evaluate_bank(policy, config, bank, iteration, pool):
+def evaluate_bank(policy, config, bank, iteration, pool, *, topologies=None):
     """Evaluate each size, preserving the reference's ordering and fixed seeds."""
     results = {}
     span = core.detuning_curriculum_half_span_at(iteration, config)
     for size in config.training_n_lasers:
         targets, detunings = bank[size]
+        exhaustive_masks = None
+        if getattr(config, 'exhaustive_symmetric_topologies', False):
+            from .symmetric_topologies import connected_symmetric_masks
+            masks = connected_symmetric_masks(size)
+            exhaustive_masks = np.tile(masks, (len(targets), 1))
+            targets = np.repeat(targets, len(masks), axis=0)
+            detunings = np.repeat(detunings, len(masks), axis=0)
         if config.validation_follows_detuning_curriculum:
             detunings = detunings * span / (0.5 * config.detuning_span_ghz)
         evaluator = engine.evaluate_policy
-        if hasattr(config, "phase_model"):
+        if hasattr(config, "phase_model") or topologies is not None:
             from .evaluation import evaluate_phase_model_policy
             evaluator = evaluate_phase_model_policy
+        options = (dict(topology_masks=topologies[size][0], root_indices=topologies[size][1])
+                   if topologies is not None else {})
+        if exhaustive_masks is not None:
+            options = dict(topology_masks=exhaustive_masks)
         results[size] = evaluator(policy, targets, detunings,
             replace(config, n_lasers=size), seed=config.random_seed + 30000 + size,
-            simulation_pool=pool)
+            simulation_pool=pool, **options)
     return results
 
 
@@ -91,10 +122,21 @@ def set_learning_rate(optimizer, config, iteration, *, decay_end=None):
             group["lr"] = rate
 
 
-def record_history(history, metrics, validation, config):
+def record_history(history, metrics, validation, config, *, seen_validation=None):
     """Append training metrics and the latest validation, including held values."""
     for key in HISTORY_KEYS:
         if not key.startswith("held_out_"):
+            history[key].append(metrics[key])
+    if getattr(config,'exhaustive_symmetric_topologies',False):
+        for name in ('simulation_seconds','update_seconds','validation_seconds'):
+            history[name].append(metrics[name])
+    from .phase_correction import HISTORY_KEYS as correction_keys
+    for key in correction_keys:
+        if key in history:
+            history[key].append(metrics[key])
+    from .mean_phase_correction import HISTORY_KEYS as mean_keys
+    for key in mean_keys:
+        if key in history:
             history[key].append(metrics[key])
     names = {
         "held_out_reward": "training_reward", "held_out_rooted_fraction": "rooted_fraction",
@@ -115,6 +157,20 @@ def record_history(history, metrics, validation, config):
         values = [validation[size]["phase_reward_by_density"][band] for size in config.training_n_lasers]
         finite = [value for value in values if np.isfinite(value)]
         history["held_out_by_density"][band].append(float(np.mean(finite)) if finite else float("nan"))
+    if 'seen_topology_held_out_reward' in history:
+        for name, measured in [('reward', 'training_reward'),
+                               ('phase_rms_success_fraction', 'phase_rms_success_fraction'),
+                               ('worst_phase_rms_error_deg', 'worst_phase_rms_error_deg')]:
+            history['seen_topology_held_out_'+name].append(
+                float(np.mean([result[measured] for result in seen_validation.values()])))
+        for size, result in seen_validation.items():
+            history['seen_topology_held_out_rms_reward_by_m'][size].append(result['training_reward'])
+            history['seen_topology_held_out_rms_success_by_m'][size].append(result['phase_rms_success_fraction'])
+    if getattr(config, 'density_control', False):
+        for label in ('tree', 'ata'):
+            for metric in ('reward', 'success_fraction'):
+                history['held_out_'+label+'_'+metric].append(
+                    float(np.mean([result[label+'_'+metric] for result in validation.values()])))
 
 
 def save_progress(history, config, directory, *, write_history, live_plot,
@@ -144,6 +200,28 @@ def save_progress(history, config, directory, *, write_history, live_plot,
 
 def print_progress(iteration, config, metrics, history):
     """Readable labels distinguish the learning reward from cosine monitoring."""
+    correction = (f" phase-teachers={metrics['phase_correction_accepted']}/"
+                  f"{metrics['phase_correction_attempted']} "
+                  f"locked={metrics['phase_correction_locked_fraction']:.1%} "
+                  f"correction-loss={metrics['phase_correction_loss']:.3g}"
+                  if 'phase_correction_accepted' in metrics else '')
+    if 'phase_correction_loss_before' in metrics:
+        correction = (f" phase-teachers={metrics['phase_correction_accepted']}/"
+            f"{metrics['phase_correction_attempted']} "
+            f"mean-locked={metrics['phase_correction_locked_fraction']:.1%} "
+            f"correction-loss={metrics['phase_correction_loss_before']:.6g}"
+            f"->{metrics['phase_correction_loss']:.6g} "
+            f"strength-change={metrics['phase_correction_strength_change_max']:.1g}")
+    if 'seen_topology_held_out_reward' in history:
+        correction += (f" seen-RMS={history['seen_topology_held_out_reward'][-1]:.3f}"
+                       f" seen-3deg={history['seen_topology_held_out_phase_rms_success_fraction'][-1]:.1%}")
+    if 'held_out_tree_success_fraction' in history:
+        correction += (f" tree-3deg={history['held_out_tree_success_fraction'][-1]:.1%}"
+                       f" ATA-3deg={history['held_out_ata_success_fraction'][-1]:.1%}")
+    if 'simulation_seconds' in metrics:
+        correction += (f" sim={metrics['simulation_seconds']:.1f}s"
+                       f" update={metrics['update_seconds']:.2f}s"
+                       f" validation={metrics['validation_seconds']:.1f}s")
     print(f"{iteration+1}/{config.training_iterations} "
           f"RMS={metrics['training_reward']:.3f} cosine={metrics['phase_reward']:.3f} "
           f"held-out-RMS={history['held_out_reward'][-1]:.3f} "
@@ -152,7 +230,7 @@ def print_progress(iteration, config, metrics, history):
           f"rho={metrics['retained_link_fraction']:.3f} "
           f"budget/M={metrics['sampled_budget_median_per_laser']:.3g} ns^-1 "
           f"PCGrad-tasks={metrics['pcgrad_task_count']} "
-          f"conflicts={metrics['negative_gradient_pair_fraction']:.3f}", flush=True)
+          f"conflicts={metrics['negative_gradient_pair_fraction']:.3f}"+correction, flush=True)
 
 
 @dataclass
@@ -194,7 +272,8 @@ def prepare_run_directory(directory, *, restart=False):
     directory.mkdir(parents=True, exist_ok=True)
 
 
-def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
+def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
+          initial_checkpoint=None):
     """Start fresh; an explicit restart archives the existing attempt first.
 
     No resume behavior is implied by loading a model. Exact restart/resume
@@ -215,8 +294,15 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
     band_sampling = sampling_mode in {"band_random", "band_fixed"}
     precision_enabled = experiment.config.schedules.precision_start is not None
     anneal_to_mean = experiment.config.schedules.anneal_to_mean
+    phase_correction = experiment.config.phase_correction
+    topology_bank = None
     batch_options = {}
-    if reuse_masks:
+    if getattr(config, 'exhaustive_symmetric_topologies', False):
+        from .training_batch import run_training_batch
+        from .symmetric_topologies import sample_all_symmetric_topologies
+        batch_options = dict(mask_sampler=sample_all_symmetric_topologies,
+                             schedules=experiment.config.schedules)
+    elif reuse_masks:
         from .training_batch import run_training_batch
     elif band_sampling:
         from .training_batch import run_training_batch
@@ -226,9 +312,14 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
                    if getattr(config, 'topology_random_reachable', False) else
                    sample_fixed_count_topologies if sampling_mode == "band_fixed" else
                    sample_band_random_topologies)
+        if experiment.config.sampling.fixed_topology_bank_seed is not None:
+            from .topology_bank import FixedTopologyBank
+            topology_bank = FixedTopologyBank(config, experiment.config.sampling.fixed_topology_bank_seed)
+            sampler = topology_bank
         batch_options = dict(mask_sampler=sampler,
                              schedules=experiment.config.schedules)
-    elif hasattr(config, "phase_model") or precision_enabled or experiment.config.schedules.anneal_to_mean:
+    elif (hasattr(config, "phase_model") or precision_enabled
+          or experiment.config.schedules.anneal_to_mean or phase_correction.enabled):
         from .training_batch import run_training_batch
         sampler = (engine.sample_paired_rooted_topologies if config.topology_sampling_mode == "paired_contexts"
                    else engine.sample_stratified_rooted_topologies)
@@ -237,6 +328,8 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
             batch_options['schedules'] = experiment.config.schedules
     else:
         run_training_batch = engine.run_training_batch
+    if phase_correction.enabled:
+        batch_options['phase_correction'] = phase_correction
     sampling_recipe = (dict(mode='shared_across_pairs', masks_per_size=config.pcgrad_topology_groups,
         pairs_per_size=config.targets_per_batch//len(config.training_n_lasers),
         exact_star=True, other_masks='one per excess-density band, sampled each iteration')
@@ -262,6 +355,8 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
                 intermediate='uniform requested count per physical band; add edges until chosen root reaches all lasers',
                 optional_links='uniform random remaining directed pairs, including root feedback',
                 density_note='Reachability can raise actual counts above requested bands; PCGrad groups by actual count')
+            if getattr(config, 'topology_root_index', None) is not None:
+                sampling_recipe['root_selection'] = f'fixed laser {config.topology_root_index+1} in detuning order'
     if experiment.config.sampling.action_sampling == "mirrored":
         sampling_recipe = dict(sampling_recipe or {},
             action_sampling="mirrored", reward_baseline="pair_excluded",
@@ -275,24 +370,86 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
             root_reference_scope='one retained construction root per topology, shared by its actions')
     if getattr(config, 'encode_root', False):
         sampling_recipe = dict(sampling_recipe or {}, encoder_root_feature='1 at sampled root, 0 elsewhere')
-    prepare_run_directory(directory, restart=restart)
+    if topology_bank is not None:
+        sampling_recipe.update(mode='fixed_graph_bank',
+            fixed_topology_bank=topology_bank.metadata(),
+            validation_groups='same held-out contexts on trained graphs and on graphs excluded from the bank',
+            primary_held_out_metrics='unseen topology group; best.pt still selected by its RMS reward')
+    if phase_correction.enabled:
+        sampling_recipe = dict(sampling_recipe or {}, phase_correction=asdict(phase_correction),
+            phase_correction_selection='one best locked action per context/topology',
+            phase_correction_verification='fresh history, same strengths/mask, locked and improved RMS',
+            phase_correction_scope='training only; validation and inference use decoder predictions')
+        if phase_correction.mode == 'mean_phase_only':
+            sampling_recipe.update(
+                phase_correction_selection='post-RL deterministic mean design per context/topology',
+                phase_correction_verification='same mean strengths, fresh history, locked, improved RMS and 3deg success',
+                phase_correction_update='separate phase-output-row SGD after RL; frozen shared layers; same LR schedule',
+                phase_correction_acceptance='retain the phase-only step only when fixed teacher loss decreases')
+    if getattr(config, 'density_control', False):
+        sampling_recipe = dict(sampling_recipe or {}, mode='density_controlled',
+            sampler='density endpoints plus independent uniform fractions in each third',
+            endpoints='connected symmetric tree and all-to-all',
+            intermediate='one density fraction per third of [0,1]',
+            topology_input='one density scalar; existing adjacency features uniformly K/(M*(M-1)/2)',
+            selection='maximum sum-of-directed-strengths spanning tree, then highest remaining pairs',
+            pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
+            phase_delay_reference='lowest mean-centered detuning (laser 1), unchanged from star run',
+            baseline_scope='other mirrored action pairs in the same target/detuning/density context',
+            reinforce_score='original all-to-all Gaussian actions, including removed strengths',
+            physical_budget='unchanged predicted total, redistributed proportionally over selected directions',
+            validation='fixed new target/detuning contexts with balanced density requests',
+            objective='unchanged wrapped-RMS phase accuracy; no sparsity or budget penalty')
+    if getattr(config, 'exhaustive_symmetric_topologies', False):
+        from .symmetric_topologies import topology_metadata
+        sampling_recipe = dict(sampling_recipe or {}, mode='all_connected_symmetric',
+            topology_bank=topology_metadata(), target_mode='in_phase',
+            sampler='complete fixed bank on every detuning context',
+            symmetric_values='average reciprocal latent strengths and unwrapped phases before decoding',
+            reinforce_score='original independent directed Gaussian samples before projection',
+            phase_delay_reference='lowest mean-centered detuning, unchanged laser-1 reference',
+            validation='every held-out detuning context on all 38 topologies')
     rng = core.set_random_seed(config.random_seed)
     policy = build_policy(config)
-    from .root_context import calibrate_budget_references
-    config = calibrate_budget_references(policy, config)
+    initialization = None
+    if initial_checkpoint is not None:
+        if Path(initial_checkpoint).expanduser().resolve().is_relative_to(directory):
+            raise ValueError('Initialization checkpoint must be outside the new output directory')
+        from .checkpoints import initialize_from_checkpoint
+        config, initialization = initialize_from_checkpoint(policy, config, initial_checkpoint)
+        sampling_recipe = dict(sampling_recipe or {}, initialization=initialization)
+        print(f"Initializing from: {initialization['checkpoint']} (iteration {initialization['source_iteration']})",
+              flush=True)
+    else:
+        from .root_context import calibrate_budget_references
+        config = calibrate_budget_references(policy, config)
     policy.config = config
+    prepare_run_directory(directory, restart=restart)
+    if topology_bank is not None:
+        write_json(directory/'fixed_topology_bank.json', topology_bank.metadata())
+    if getattr(config, 'exhaustive_symmetric_topologies', False):
+        write_json(directory/'symmetric_topology_bank.json', sampling_recipe['topology_bank'])
     optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate)
     reward_scale_state = {}
-    history = make_history(config)
+    history = make_history(config, phase_correction=phase_correction,
+                           fixed_topology_bank=topology_bank is not None)
     bank = make_validation_bank(config)
+    seen_topologies = unseen_topologies = None
+    if topology_bank is not None:
+        seen_topologies = {size: topology_bank.validation_masks(size, len(pair[0]), seen=True,
+            seed=config.random_seed+30000+size) for size, pair in bank.items()}
+        unseen_topologies = {size: topology_bank.validation_masks(size, len(pair[0]), seen=False,
+            seed=config.random_seed+30000+size) for size, pair in bank.items()}
     write_run_manifest(directory / "run.json", name=experiment.name,
-                       public_config=experiment.config, backend_config=config)
+                       public_config=experiment.config, backend_config=config,
+                       initialization=initialization)
     validation = {}
+    seen_validation = {}
     best = -np.inf
     pool = None
     if config.n_jobs > 1:
         pool = mp.get_context("spawn").Pool(
-            processes=min(config.n_jobs, config.targets_per_batch),
+            processes=config.n_jobs,
             initializer=core._initialize_simulation_worker)
     try:
         for iteration in range(config.training_iterations):
@@ -307,14 +464,24 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False):
             current_config = policy.config if band_sampling or precision_enabled or anneal_to_mean else config
             validate_now = (iteration == 0 or (iteration+1) % config.validation_interval == 0
                             or iteration+1 == config.training_iterations)
+            if getattr(config,'exhaustive_symmetric_topologies',False):
+                metrics['validation_seconds']=0.
+            validation_start=perf_counter()
             if validate_now:
-                validation = evaluate_bank(policy, config, bank, iteration, pool)
+                options = dict(topologies=unseen_topologies) if topology_bank is not None else {}
+                validation = evaluate_bank(policy, config, bank, iteration, pool, **options)
+                if topology_bank is not None:
+                    seen_validation = evaluate_bank(policy, config, bank, iteration, pool,
+                                                    topologies=seen_topologies)
                 quality = float(np.mean([value["training_reward"] for value in validation.values()]))
                 if quality > best:
                     best = quality
                     save(config.best_checkpoint_file, policy, optimizer, current_config, iteration+1, quality,
                          sampling_recipe=sampling_recipe, exploration_state=state)
-            record_history(history, metrics, validation, config)
+            if getattr(config,'exhaustive_symmetric_topologies',False) and validate_now:
+                metrics['validation_seconds']=perf_counter()-validation_start
+            options = dict(seen_validation=seen_validation) if topology_bank is not None else {}
+            record_history(history, metrics, validation, config, **options)
             save(config.current_checkpoint_file, policy, optimizer, current_config, iteration+1,
                  history["held_out_reward"][-1], sampling_recipe=sampling_recipe, exploration_state=state)
             plot_now = live_plot and (iteration == 0 or (iteration+1) % config.plot_update_interval == 0
