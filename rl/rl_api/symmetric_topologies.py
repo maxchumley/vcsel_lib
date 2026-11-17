@@ -63,6 +63,37 @@ def reciprocal_actions(actions, masks, size):
     return .5*(actions+actions[..., both])
 
 
+def reciprocal_normal_log_prob(actions, mean, std, masks, size):
+    """Score the executed pair averages, once per active reciprocal pair.
+
+    If independent a,b are normal, (a+b)/2 is normal with mean (mu_a+mu_b)/2
+    and variance (sigma_a**2+sigma_b**2)/4. Marginalizing the discarded
+    difference preserves the expected REINFORCE gradient and removes its
+    nuisance noise. Sampling/RNG draws and the physical decoder are unchanged.
+    """
+    receiver, source = core.directed_link_indices(size)
+    edge_count = len(receiver)
+    if (actions.shape != mean.shape or actions.shape != std.shape
+            or actions.shape[:-1] != masks.shape[:-1]
+            or actions.shape[-1] != 2*edge_count or masks.shape[-1] != edge_count):
+        raise ValueError('Shared-pair scoring needs matching directed action parameters and masks')
+    indices = np.full((size, size), -1, dtype=int)
+    indices[receiver, source] = np.arange(edge_count)
+    reverse = torch.as_tensor(indices[source, receiver], device=actions.device)
+    if not torch.equal(masks, masks[..., reverse]):
+        raise ValueError('Shared-pair scoring requires symmetric topology masks')
+    first = torch.as_tensor(np.flatnonzero(receiver < source), device=actions.device)
+    second = reverse[first]
+    first_actions = torch.cat((first, first+edge_count))
+    second_actions = torch.cat((second, second+edge_count))
+    paired_mean = .5*(mean[..., first_actions]+mean[..., second_actions])
+    paired_std = .5*torch.sqrt(std[..., first_actions].square()+std[..., second_actions].square())
+    values = .5*(actions[..., first_actions]+actions[..., second_actions])
+    normal = torch.distributions.Normal(paired_mean, paired_std)
+    active = torch.cat((masks[..., first], masks[..., first]), dim=-1)
+    return (normal.log_prob(values.detach())*active).sum(dim=-1)
+
+
 def infer_symmetric_designs(policy, context, config, topology, count, continuous_mean, seed):
     """Predict on the complete bank or explicit symmetric masks, using the training decoder."""
     from .phase_reference import decode_samples

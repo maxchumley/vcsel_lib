@@ -4,14 +4,14 @@ from pathlib import Path
 from shutil import copyfile
 
 
-def save_training_progress(figure, directory, dpi):
+def save_training_progress(figure, directory, dpi, filename='current_training_progress.png'):
     """Save the run's PNG and a live-viewer copy one folder above it.
 
     Replace complete files atomically so a viewer never reads half a PNG.
     Render once, then copy those same image bytes to the parent directory.
     """
     directory = Path(directory)
-    image = directory / "current_training_progress.png"
+    image = directory / filename
     temporary = image.with_suffix(".png.tmp")
     figure.savefig(temporary, format="png", dpi=dpi)
     temporary.replace(image)

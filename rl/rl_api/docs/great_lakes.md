@@ -129,6 +129,140 @@ simply requeueing. `restart=True` starts again from iteration 1 and archives the
 old attempt. Choose the full job's time limit using the timing job, and keep
 important results on durable storage if using temporary `/scratch` space.
 
+## Mirror the plot into the Mac's live image viewer
+
+The existing Cloudflare viewer serves folders on the Mac. Its temporary public
+URL can change without affecting synchronization: mirror the cluster PNG into
+a watched local folder, and keep the viewer/tunnel running normally.
+
+Run a one-file transfer check in a **Mac terminal**, not in the SSH terminal:
+
+```bash
+cd ~/Documents/GitHub/vcsel_lib
+python3 scripts/sync_great_lakes_plot.py --once
+```
+
+Authenticate to Great Lakes normally when prompted. For continuous updates:
+
+```bash
+python3 scripts/sync_great_lakes_plot.py
+```
+
+This opens one private persistent SSH connection, checks for a changed PNG
+every 10 seconds, and copies only `current_training_progress.png` with rsync.
+SSH authentication is reused across checks; connection failure stops the sync
+instead of repeatedly prompting. Ctrl+C stops only this sync connection.
+Training and the viewer remain running. No remote files, packages or Slurm
+settings are changed. These commands do not restart the training job.
+
+The default remote source is the four-laser run's stable parent-folder image:
+
+```text
+~/vcsel_lib/rl/rl_api/runs/great_lakes/<four-laser RUN_NAME>/current_training_progress.png
+```
+
+Use `--job-id JOBID` to select one exact job instead, or `--run RUN_NAME` and
+`--repository REMOTE_PATH` for another output location. `--dry-run` shows the
+paths without connecting. The normal SSH host/configuration is used; `--host`
+can override it. No passwords are stored in this helper.
+
+The default local mirror folder is separate from the local run's plot:
+
+```text
+rl/rl_api/runs/great_lakes_live/four_laser_symmetric/
+```
+
+The existing viewer can watch it through this `sources.txt` entry:
+
+```text
+Great Lakes Four-Laser RL:1:/Users/mchumley/Documents/GitHub/vcsel_lib/rl/rl_api/runs/great_lakes_live/four_laser_symmetric
+```
+
+The viewer reloads its sources while polling, so this entry does not require
+a new public tunnel. Choose **Great Lakes Four-Laser RL** in the source menu.
+The Mac must remain running/connected to serve and refresh this local mirror.
+The training PNG itself is written every ten iterations, roughly six minutes
+at the current measured iteration time; syncing more often does not create
+new training frames. Generated images stay ignored by Git.
+
+U-M documents SSH-based file transfers in its
+[file-transfer guide](https://documentation.its.umich.edu/node/5092).
+
+## Three matched four-laser symmetric tests
+
+All three start from the same fresh seed-7 weights. Every iteration uses the
+same five detuning contexts, all 38 symmetric topologies, eight mirrored actions,
+1,520 simulations, in-phase targets, 0-4 GHz spans and the original 1,000-iteration
+schedules. Both physical coupling matrices stay exactly symmetric. The network,
+reward, integrator, ramp, validation bank and batch sizes are unchanged.
+
+| Test / Slurm name | Gaussian action score | Phase baseline | Progress PNG |
+|---|---|---|---|
+| A / `four_A_pairs` | Shared reciprocal pair | Laser 1 detuning | `four_A_pairscore_progress.png` |
+| B / `four_B_meanref` | Original independent directed actions | Zero mean detuning | `four_B_meanref_progress.png` |
+| C / `four_C_both` | Shared reciprocal pair | Zero mean detuning | `four_C_both_progress.png` |
+
+Shared-pair scoring marginalizes the directional difference discarded by the
+physical averaging step. It keeps the original sampled actions, RNG draws,
+physical matrices and budget samples unchanged at equal policy weights; only
+the REINFORCE score changes. The sum of both directed variances is included in
+the pair's Gaussian variance, including wide-phase exploration. The mean-reference
+variants use the existing `target_residual` parameterization: no laser-1 delay
+offset is added. Their detunings remain mean-centered; the LK equations are
+unchanged, and the locking frequency is not constrained.
+
+After these code changes are available in the Great Lakes checkout, submit
+from **Great Lakes**:
+
+```bash
+cd ~/vcsel_lib
+bash scripts/submit_four_laser_symmetric_tests.sh --dry-run
+bash scripts/submit_four_laser_symmetric_tests.sh
+```
+
+The launcher submits three independent jobs, each requesting one node, 32 CPUs
+(one trainer and 31 workers), 64 GB and 48 hours under `arrays0`. Three concurrent
+jobs therefore request 96 CPUs and 192 GB in total; Slurm starts each when its
+allocation is available. There are no dependencies between the jobs. To launch
+all three as two-iteration smoke tests instead:
+
+```bash
+bash scripts/submit_four_laser_symmetric_tests.sh --smoke-test
+```
+
+Each has a descriptive Slurm name as well as its mandatory numeric job ID.
+Use this format so `squeue` does not truncate the names:
+
+```bash
+squeue -u "$USER" -o "%.18i %.24j %.9T %.10M %.20R"
+```
+
+Logs use `logs/<job-name>-<job-ID>.out` and `.err`. Checkpoints/history remain
+isolated under `rl/rl_api/runs/great_lakes/<RUN_NAME>/<job-ID>/`. The three run
+names are `four_sym_A_pairscore_laser1_1k`, `four_sym_B_directed_meanref_1k`, and
+`four_sym_C_pairscore_meanref_1k`. Their uniquely named PNGs are saved inside
+each job directory and atomically copied to its run's parent folder.
+
+On the **Mac**, replace the one-image sync command with:
+
+```bash
+python3 scripts/sync_great_lakes_plot.py --symmetric-tests
+```
+
+It copies all three uniquely named images into the existing watched folder,
+`rl/rl_api/runs/great_lakes_live/four_laser_symmetric/`, through one authenticated
+SSH connection, checking every ten seconds. A queued job's missing PNG does not
+prevent the other two from syncing. Use the existing **Great Lakes Four-Laser
+RL** viewer source; the site/tunnel does not need restarting. Images update at
+iteration 1, every ten iterations and the final iteration. A single variant
+can also be mirrored with `--run RUN_NAME --filename PROGRESS_FILENAME`.
+
+The editable variant modules are
+`experiments/train_four_laser_symmetric_pairscore_1000.py`,
+`experiments/train_four_laser_symmetric_meanref_1000.py`, and
+`experiments/train_four_laser_symmetric_pairscore_meanref_1000.py`. They share
+the original recipe through `experiments/four_laser_symmetric_comparison.py`.
+
 References: [U-M Python/PyTorch environment setup](https://documentation.its.umich.edu/arc-software/pytorch/installation),
 [Slurm user guide](https://documentation.its.umich.edu/arc-hpc/slurm-user-guide),
 and [Great Lakes partition and storage policies](https://documentation.its.umich.edu/arc-hpc/greatlakes/policies).

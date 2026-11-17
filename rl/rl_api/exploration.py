@@ -87,7 +87,11 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False):
     actions = normal.sample()
     if mirrored:
         actions = mirror_pairs(actions, mean)
-    log_prob = (normal.log_prob(actions)*torch.cat((masks, masks), dim=-1)).sum(dim=-1)
+    if getattr(policy.config, 'symmetric_action_score', 'directed') == 'shared_pair':
+        from .symmetric_topologies import reciprocal_normal_log_prob
+        log_prob = reciprocal_normal_log_prob(actions, mean, std, masks, features.shape[1])
+    else:
+        log_prob = (normal.log_prob(actions)*torch.cat((masks, masks), dim=-1)).sum(dim=-1)
     budget_std = budget_log_std.reshape(batch, candidates).exp()
     if mirrored:
         budget_mean = shared_pair_parameters(budget_mean)

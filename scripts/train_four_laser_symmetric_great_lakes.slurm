@@ -15,5 +15,8 @@
 set -euo pipefail
 cd "$SLURM_SUBMIT_DIR"
 VCSEL_SIM_WORKERS=$(( SLURM_CPUS_PER_TASK > 1 ? SLURM_CPUS_PER_TASK - 1 : 1 ))
+# The comparison launcher selects another matched four-laser recipe through
+# this environment variable; ordinary submissions keep the original recipe.
+VCSEL_TRAINING_MODULE="${VCSEL_TRAINING_MODULE:-train_four_laser_inphase_all_symmetric_1000}"
 exec bash scripts/train_rl_great_lakes.slurm \
-    train_four_laser_inphase_all_symmetric_1000 --workers "$VCSEL_SIM_WORKERS" "$@"
+    "$VCSEL_TRAINING_MODULE" --workers "$VCSEL_SIM_WORKERS" "$@"

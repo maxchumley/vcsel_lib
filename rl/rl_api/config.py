@@ -87,6 +87,7 @@ class SamplingConfig:
     action_sampling: str = "independent"  # mirrored pairs opposite latent perturbations.
     fixed_topology_bank_seed: int | None = None  # Reuse five masks per size for the whole run.
     target_mode: str = 'random'
+    symmetric_action_score: str = 'directed'
     # paired_contexts: spread one pool across pairs; per_target: span the full
     # density range separately for every pair, with independent optional edges.
 
@@ -112,6 +113,8 @@ class SamplingConfig:
             raise ValueError("action_sampling must be independent or mirrored")
         if self.target_mode not in {'random', 'in_phase'}:
             raise ValueError('target_mode must be random or in_phase')
+        if self.symmetric_action_score not in {'directed', 'shared_pair'}:
+            raise ValueError('symmetric_action_score must be directed or shared_pair')
         if self.fixed_topology_bank_seed is not None and (
                 type(self.fixed_topology_bank_seed) is not int or self.fixed_topology_bank_seed < 0):
             raise ValueError("fixed_topology_bank_seed must be a nonnegative integer or None")
@@ -215,6 +218,13 @@ class ValidationConfig:
     notebook_display: bool = True
     plot_dpi: int = 300
     plot_use_tex: bool = False
+    progress_filename: str = 'current_training_progress.png'
+
+    def __post_init__(self):
+        name = self.progress_filename
+        if (not isinstance(name, str) or not name or Path(name).name != name
+                or not name.endswith('.png') or '\\' in name):
+            raise ValueError('progress_filename must be a PNG filename without a directory')
 
 
 @dataclass(frozen=True)
@@ -326,7 +336,7 @@ class TrainingConfig:
                     or self.sampling.action_sampling != 'mirrored'
                     or self.sampling.target_mode != 'in_phase'
                     or not self.model.symmetric_coupling_values
-                    or self.model.phase_parameterization != 'target_delay_residual'
+                    or self.model.phase_parameterization not in {'target_delay_residual', 'target_residual'}
                     or self.model.encode_root or self.sampling.reuse_masks_across_pairs
                     or self.sampling.fixed_topology_bank_seed is not None
                     or self.optimization.pcgrad_grouping != 'density_bands'
@@ -335,6 +345,8 @@ class TrainingConfig:
                                  'in-phase targets, symmetric values and mirrored per_target density-band learning')
         elif self.model.symmetric_coupling_values or self.sampling.target_mode != 'random':
             raise ValueError('Symmetric values and in-phase sampling currently use all_connected_symmetric')
+        if self.sampling.symmetric_action_score != 'directed' and not exhaustive:
+            raise ValueError('Shared-pair scoring requires all_connected_symmetric training')
         if self.topology.mode == 'density':
             if (self.model.encode_root
                     or self.model.phase_parameterization != 'target_delay_residual'
@@ -447,7 +459,8 @@ class TrainingConfig:
             settings.update(density_control=True, topology_star_backbone=False)
         if self.topology.backbone == 'all_connected_symmetric':
             settings.update(exhaustive_symmetric_topologies=True, symmetric_coupling_values=True,
-                            in_phase_targets=True, topology_star_backbone=False)
+                            in_phase_targets=True, topology_star_backbone=False,
+                            symmetric_action_score=s.symmetric_action_score)
         if self.topology.backbone == 'random_reachable':
             settings['topology_random_reachable'] = True
             if self.topology.root_index is not None:
@@ -545,6 +558,7 @@ class TrainingConfig:
             summary.update(topology_sampling='all 38 connected labeled symmetric masks every iteration',
                 topology_backbone='all_connected_symmetric', target_mode='in_phase',
                 symmetric_masks=True, symmetric_strengths=True, symmetric_phases=True,
+                symmetric_action_score=s.symmetric_action_score,
                 node_input_features=4, new_parameters=0, pcgrad_tasks=3,
                 topology_pair_counts={'3':16, '4':15, '5':6, '6':1},
                 validation_simulations_per_check=38*self.validation.pairs_per_size,

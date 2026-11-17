@@ -189,7 +189,7 @@ def save_progress(history, config, directory, *, write_history, live_plot,
         settings = plot_settings or ValidationConfig()
         with training_figure(history, config, settings) as figure:
             try:
-                save_training_progress(figure, directory, settings.plot_dpi)
+                save_training_progress(figure, directory, settings.plot_dpi, settings.progress_filename)
                 if config.jupyter_mode:
                     from IPython.display import clear_output, display
                     clear_output(wait=True)
@@ -406,8 +406,12 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
             topology_bank=topology_metadata(), target_mode='in_phase',
             sampler='complete fixed bank on every detuning context',
             symmetric_values='average reciprocal latent strengths and unwrapped phases before decoding',
-            reinforce_score='original independent directed Gaussian samples before projection',
-            phase_delay_reference='lowest mean-centered detuning, unchanged laser-1 reference',
+            reinforce_score=('Gaussian marginal of each executed reciprocal pair average'
+                if config.symmetric_action_score == 'shared_pair' else
+                'original independent directed Gaussian samples before projection'),
+            phase_delay_reference=('zero mean detuning; target offsets plus learned residual'
+                if config.phase_parameterization == 'target_residual' else
+                'lowest mean-centered detuning, unchanged laser-1 reference'),
             validation='every held-out detuning context on all 38 topologies')
     rng = core.set_random_seed(config.random_seed)
     policy = build_policy(config)

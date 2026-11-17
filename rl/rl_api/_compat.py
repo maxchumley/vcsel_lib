@@ -55,6 +55,7 @@ class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
     exhaustive_symmetric_topologies: bool = True
     symmetric_coupling_values: bool = True
     in_phase_targets: bool = True
+    symmetric_action_score: str = "directed"
 
 
 @dataclass
