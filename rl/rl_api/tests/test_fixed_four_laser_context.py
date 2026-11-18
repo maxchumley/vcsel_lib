@@ -14,6 +14,7 @@ from rl.rl_api._compat import core
 from rl.rl_api.experiments import train_fixed_four_laser_context as run
 from rl.rl_api.models import build_policy
 from rl.rl_api.training_batch import pcgrad_update
+import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -41,6 +42,27 @@ def test_spans_share_fresh_weights_and_fix_only_context_and_mask(tmp_path):
             np.testing.assert_array_equal(item['gates'][0, 0].numpy(), run.TOPOLOGY[receiver, source])
         # Strengths and budgets are explored, not frozen physical inputs.
         assert np.ptp(item['kappa'].sum((-1, -2))) > 0
+
+
+def test_higher_initial_budget_is_the_only_training_setting_change(tmp_path):
+    for span, expected_budget in ((1,4.), (2,6.), (3,9.), (4,12.)):
+        high, high_schedule = run.make_config(span, tmp_path/str(span))
+        low, low_schedule = run.make_config(span, tmp_path/str(span), initial_budget_per_laser=.5)
+        assert replace(high, log_budget_initial_per_laser=.5) == low
+        assert high_schedule == low_schedule
+        assert high.log_budget_initial_per_laser == expected_budget
+        models = []
+        for config in (low,high):
+            torch.manual_seed(7)
+            policy = build_policy(config)
+            models.append(run.fixed_batch(policy, config, span, mean=True))
+        np.testing.assert_allclose(models[1]['kappa'], models[0]['kappa']*(expected_budget/.5), rtol=2e-6)
+        np.testing.assert_array_equal(models[1]['phi'], models[0]['phi'])
+        options = run.options(['--span-ghz',str(span),'--initial-budget-per-laser','.5'])
+        assert options.initial_budget_per_laser == .5
+    for invalid in (0., -1., float('nan'), float('inf')):
+        with pytest.raises(ValueError, match='positive and finite'):
+            run.make_config(4, tmp_path, initial_budget_per_laser=invalid)
 
 
 def test_one_task_uses_clipped_gradient_without_pcgrad_projection(tmp_path):
@@ -82,6 +104,7 @@ def test_training_updates_strength_phase_budget_and_roundtrips(tmp_path, fake_ph
         assert not torch.equal(initial.policy.edge_output.weight[row], final.policy.edge_output.weight[row])
     manifest = json.loads((directory/'run.json').read_text())
     assert manifest['initial_checkpoint'] is None and not manifest['teacher_labels']
+    assert manifest['initial_budget_per_laser'] == 12. and manifest['budget_remains_learnable']
     assert not manifest['architecture_change']
     assert [row['optimizer_update'] for row in history] == [True, True, False]
     payload = torch.load(directory/'final.pt', weights_only=False)
@@ -113,3 +136,4 @@ def test_four_named_jobs_match_viewer_paths_without_checkpoint_inputs(tmp_path):
         assert path.parent.name == run.run_name(span)
         assert path.name == f'four_fixed_{span}ghz_progress.png'
     subprocess.run(['bash','-n',str(launcher),str(ROOT/'scripts/train_fixed_four_laser_great_lakes.slurm')],check=True)
+    assert '#SBATCH --time=08:00:00' in (ROOT/'scripts/train_fixed_four_laser_great_lakes.slurm').read_text()

@@ -1,5 +1,6 @@
 #!/bin/bash
-# Four independent fresh models; 4 CPUs, 16G and 4h per job.
+# Four independent fresh models; 4 CPUs, 16G and 8h per job.
+# Initial learnable budgets/M for spans 1/2/3/4 GHz are 4/6/9/12 ns^-1.
 set -euo pipefail
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 iterations=1000
@@ -15,6 +16,7 @@ while (($#)); do
         -h|--help)
             echo "Usage: bash scripts/submit_fixed_four_laser_tests.sh [--smoke-test] [--dry-run] [--iterations N]"
             echo 'Submits fresh 1, 2, 3 and 4 GHz fixed-context models learning strengths, phases and budget.'
+            echo 'Initial budgets/M: 4, 6, 9 and 12 ns^-1. Full jobs request 8 hours.'
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac

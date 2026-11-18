@@ -34,22 +34,28 @@ from .four_laser_symmetric_comparison import comparison_config
 TOPOLOGY = np.ones((4, 4), dtype=bool)
 np.fill_diagonal(TOPOLOGY, False)
 TOPOLOGY[1, 2] = TOPOLOGY[2, 1] = False
+INITIAL_BUDGET_PER_LASER = {1: 4., 2: 6., 3: 9., 4: 12.}  # ns^-1; remains learnable.
 
 
 def run_name(span):
     return f'four_fixed_fresh_{span}ghz'
 
 
-def make_config(span, directory, *, iterations=1000, workers=1, seed=7):
+def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
+                initial_budget_per_laser=None):
     if span not in (1, 2, 3, 4):
         raise ValueError('Choose a fixed span of 1, 2, 3 or 4 GHz')
     if iterations < 2 or workers < 1:
         raise ValueError('Need at least two iterations and one worker')
+    budget = INITIAL_BUDGET_PER_LASER[span] if initial_budget_per_laser is None else initial_budget_per_laser
+    if not np.isfinite(budget) or budget <= 0:
+        raise ValueError('Initial budget per laser must be positive and finite')
     public = comparison_config(shared_pair_score=True, mean_reference=False,
         progress_filename=f'four_fixed_{span}ghz_progress.png')
     schedules = replace(public.schedules, ordinary_end=iterations, wide_end=iterations,
         learning_rate_decay_start=max(1, int(.9*iterations)), learning_rate_decay_end=iterations)
     public = replace(public, seed=seed, schedules=schedules,
+        model=replace(public.model, initial_budget_per_laser=float(budget)),
         optimization=replace(public.optimization, iterations=iterations, workers=workers))
     # Retain the reciprocal-value checkpoint schema. The explicit sampler
     # below supplies one context/mask instead of invoking the exhaustive bank.
@@ -150,6 +156,8 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--span-ghz', type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument('--iterations', type=int, default=1000)
+    parser.add_argument('--initial-budget-per-laser', type=float,
+        help='Initial learnable budget/M in ns^-1; defaults for spans 1/2/3/4 are 4/6/9/12')
     parser.add_argument('--workers', type=int,
         default=max(1, int(os.environ.get('SLURM_CPUS_PER_TASK', '2'))-1))
     parser.add_argument('--seed', type=int, default=7)
@@ -162,6 +170,9 @@ def options(argv=None):
         args.iterations = 2
     if args.iterations < 2 or min(args.workers, args.plot_every) < 1 or args.seed < 0:
         parser.error('Need at least two iterations, positive workers/plot interval, and nonnegative seed')
+    if args.initial_budget_per_laser is not None and (
+            not np.isfinite(args.initial_budget_per_laser) or args.initial_budget_per_laser <= 0):
+        parser.error('--initial-budget-per-laser must be positive and finite')
     allocated = os.environ.get('SLURM_CPUS_PER_TASK')
     if allocated and args.workers + int(args.workers > 1) > int(allocated):
         parser.error('Simulation workers plus the trainer exceed allocated CPUs')
@@ -174,7 +185,7 @@ def main(argv=None):
     span = args.span_ghz
     directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span)/os.environ.get('SLURM_JOB_ID', 'local')
     config, schedules = make_config(span, directory, iterations=args.iterations,
-                                   workers=args.workers, seed=args.seed)
+        workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser)
     rng = core.set_random_seed(args.seed)
     policy = build_policy(config)
     config = calibrate_budget_references(policy, config)
@@ -182,7 +193,10 @@ def main(argv=None):
     fingerprint = hashlib.sha256(b''.join(value.detach().cpu().numpy().tobytes()
         for value in policy.state_dict().values())).hexdigest()
     recipe = dict(mode='fixed_context_fresh_joint', name=run_name(span),
+        experiment_revision='higher_initial_budget',
         initialization='random weights; fresh optimizer and budget calibration', initial_checkpoint=None,
+        initial_budget_per_laser=config.log_budget_initial_per_laser,
+        budget_remains_learnable=True,
         initial_state_sha256=fingerprint, seed=args.seed, iterations=args.iterations,
         detunings_ghz=np.linspace(-span/2, span/2, 4).tolist(), span_ghz=span,
         target_phases_rad=[0.]*4, topology_receiver_source=TOPOLOGY.astype(int).tolist(), reciprocal_pairs=5,

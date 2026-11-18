@@ -3,12 +3,12 @@
 Four independent jobs train from random seed-7 weights at **1, 2, 3 and 4 GHz**
 peak-to-peak detuning spans. Each run uses equally spaced frequencies:
 
-| Span | Detunings, GHz | Job name | Progress image |
-|---|---|---|---|
-| 1 GHz | -0.5, -1/6, +1/6, +0.5 | four_fixed_1GHz | four_fixed_1ghz_progress.png |
-| 2 GHz | -1, -1/3, +1/3, +1 | four_fixed_2GHz | four_fixed_2ghz_progress.png |
-| 3 GHz | -1.5, -0.5, +0.5, +1.5 | four_fixed_3GHz | four_fixed_3ghz_progress.png |
-| 4 GHz | -2, -2/3, +2/3, +2 | four_fixed_4GHz | four_fixed_4ghz_progress.png |
+| Span | Detunings, GHz | Initial budget/M, ns^-1 | Job name | Progress image |
+|---|---|---:|---|---|
+| 1 GHz | -0.5, -1/6, +1/6, +0.5 | 4 | four_fixed_1GHz | four_fixed_1ghz_progress.png |
+| 2 GHz | -1, -1/3, +1/3, +1 | 6 | four_fixed_2GHz | four_fixed_2ghz_progress.png |
+| 3 GHz | -1.5, -0.5, +0.5, +1.5 | 9 | four_fixed_3GHz | four_fixed_3ghz_progress.png |
+| 4 GHz | -2, -2/3, +2/3, +2 | 12 | four_fixed_4GHz | four_fixed_4ghz_progress.png |
 
 All four use in-phase targets and the same **five-pair topology**: all reciprocal
 pairs except lasers 2--3. Both physical coupling matrices remain symmetric.
@@ -16,6 +16,14 @@ The entire original GNN, strengths, phases and total budget are learned. Nothing
 is initialized from an earlier checkpoint, and no corrected phase labels or
 optimized designs are supplied. The initial weights are identical across spans
 to make the span comparison controlled; the models train independently.
+
+The next test changes only the initial learnable budget from the earlier
+0.5 ns^-1 per laser to the values above. This is a starting offset, with no
+budget floor or penalty added. Strength allocation, coupling phases, budget
+and all shared weights remain trainable. The manifest records the nominal
+initial budget; the initial physical prediction can differ slightly because
+the random budget head also contributes. For an explicit low-budget control,
+the Python runner accepts `--initial-budget-per-laser 0.5`.
 
 ## What is unchanged
 
@@ -41,6 +49,7 @@ After these code changes have been committed, pushed and pulled on the cluster:
 
 ```bash
 cd ~/vcsel_lib
+git pull --ff-only origin updates
 bash scripts/submit_fixed_four_laser_tests.sh --smoke-test
 ```
 
@@ -52,7 +61,9 @@ bash scripts/submit_fixed_four_laser_tests.sh
 watch -n 2 "squeue -u $USER -o '%.18i %.24j %.9T %.10M %.20R'"
 ```
 
-Each job requests account `arrays0`, one node, four CPUs, 16 GB, and four hours.
+Each job requests account `arrays0`, one node, four CPUs, 16 GB, and eight hours.
+The earlier compute-node timings were about 20 seconds per iteration, or
+roughly 5.5 hours for 1,000 iterations; eight hours provides scheduling headroom.
 Three simulation workers share each allocation. Jobs have no dependencies;
 Slurm may run them concurrently when resources are available. Each iteration
 simulates eight sampled designs and one deterministic mean design, rather than
@@ -84,3 +95,5 @@ This copies all four uniquely named images every ten seconds into the existing
 image has two panes: sampled/mean RMS rewards, and mean-design phase error with
 the 3-degree target. Images update every ten iterations, plus the first and last.
 The existing viewer and Cloudflare tunnel do not need to restart.
+The same live-sync command and image names are retained. New Slurm job IDs
+create new run directories; earlier canceled-job checkpoints remain in theirs.
