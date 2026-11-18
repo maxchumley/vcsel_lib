@@ -35,6 +35,7 @@ TOPOLOGY = np.ones((4, 4), dtype=bool)
 np.fill_diagonal(TOPOLOGY, False)
 TOPOLOGY[1, 2] = TOPOLOGY[2, 1] = False
 INITIAL_BUDGET_PER_LASER = {1: 4., 2: 6., 3: 9., 4: 12.}  # ns^-1; remains learnable.
+DEFAULT_ACTIONS_PER_ITERATION = 128
 
 
 def run_name(span):
@@ -42,25 +43,31 @@ def run_name(span):
 
 
 def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
-                initial_budget_per_laser=None):
+                initial_budget_per_laser=None,
+                actions_per_iteration=DEFAULT_ACTIONS_PER_ITERATION):
     if span not in (1, 2, 3, 4):
         raise ValueError('Choose a fixed span of 1, 2, 3 or 4 GHz')
     if iterations < 2 or workers < 1:
         raise ValueError('Need at least two iterations and one worker')
+    if type(actions_per_iteration) is not int or actions_per_iteration < 8 or actions_per_iteration % 8:
+        raise ValueError('Actions per iteration must be a positive multiple of eight')
     budget = INITIAL_BUDGET_PER_LASER[span] if initial_budget_per_laser is None else initial_budget_per_laser
     if not np.isfinite(budget) or budget <= 0:
         raise ValueError('Initial budget per laser must be positive and finite')
     public = comparison_config(shared_pair_score=True, mean_reference=False,
         progress_filename=f'four_fixed_{span}ghz_progress.png')
     schedules = replace(public.schedules, ordinary_end=iterations, wide_end=iterations,
+        wide_phase_actions=actions_per_iteration//4,
         learning_rate_decay_start=max(1, int(.9*iterations)), learning_rate_decay_end=iterations)
     public = replace(public, seed=seed, schedules=schedules,
+        sampling=replace(public.sampling, actions_per_topology=actions_per_iteration),
         model=replace(public.model, initial_budget_per_laser=float(budget)),
         optimization=replace(public.optimization, iterations=iterations, workers=workers))
     # Retain the reciprocal-value checkpoint schema. The explicit sampler
     # below supplies one context/mask instead of invoking the exhaustive bank.
     config = replace(public.to_backend(directory), targets_per_batch=1,
-        pcgrad_topology_groups=1, candidates_per_target=8, actions_per_topology=8,
+        pcgrad_topology_groups=1, candidates_per_target=actions_per_iteration,
+        actions_per_topology=actions_per_iteration,
         targets_per_worker_task=1, candidates_per_worker_task=1,
         detuning_span_ghz=float(span), jupyter_mode=False)
     return config, schedules
@@ -93,10 +100,10 @@ def evaluate_batch(item, mean, config, pool):
     kappa = np.concatenate((item['kappa'], mean['kappa']), axis=1)
     phi = np.concatenate((item['phi'], mean['phi']), axis=1)
     total = kappa.shape[1]
-    chunk = max(1, (total+config.n_jobs-1)//config.n_jobs)
-    jobs = [(0, start, min(start+chunk, total),
-             (0, 0, 1, item['targets'], kappa[:,start:start+chunk], phi[:,start:start+chunk],
-              item['detunings'], config)) for start in range(0, total, chunk)]
+    boundaries = np.linspace(0, total, min(config.n_jobs, total)+1, dtype=int)
+    jobs = [(0, start, stop,
+             (0, 0, 1, item['targets'], kappa[:,start:stop], phi[:,start:stop],
+              item['detunings'], config)) for start, stop in zip(boundaries[:-1], boundaries[1:])]
     results = (pool.imap_unordered(simulate_indexed_locking_chunk, jobs) if pool is not None
                else map(simulate_indexed_locking_chunk, jobs))
     combined = {}
@@ -130,7 +137,7 @@ def mean_record(item, measured):
     return row, design
 
 
-def progress_plot(history, directory, span):
+def progress_plot(history, directory, span, actions_per_iteration):
     import matplotlib.pyplot as plt
     with plt.rc_context({'font.family': 'serif', 'font.serif': ['cmr10'],
                          'mathtext.fontset': 'cm', 'axes.formatter.use_mathtext': True}):
@@ -147,7 +154,8 @@ def progress_plot(history, directory, span):
         axes[1].legend()
         for axis in axes:
             axis.grid(alpha=.2)
-        figure.suptitle(f'Fresh four-laser model: fixed {span} GHz span')
+        figure.suptitle(f'Fresh four-laser model: fixed {span} GHz span, '
+                       f'{actions_per_iteration//2} mirrored directions')
         save_training_progress(figure, directory, 200, filename=f'four_fixed_{span}ghz_progress.png')
         plt.close(figure)
 
@@ -156,6 +164,8 @@ def options(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--span-ghz', type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument('--iterations', type=int, default=1000)
+    parser.add_argument('--actions-per-iteration', type=int, default=DEFAULT_ACTIONS_PER_ITERATION,
+        help='Sampled designs, excluding the central prediction; a multiple of eight (default: 128)')
     parser.add_argument('--initial-budget-per-laser', type=float,
         help='Initial learnable budget/M in ns^-1; defaults for spans 1/2/3/4 are 4/6/9/12')
     parser.add_argument('--workers', type=int,
@@ -170,6 +180,8 @@ def options(argv=None):
         args.iterations = 2
     if args.iterations < 2 or min(args.workers, args.plot_every) < 1 or args.seed < 0:
         parser.error('Need at least two iterations, positive workers/plot interval, and nonnegative seed')
+    if args.actions_per_iteration < 8 or args.actions_per_iteration % 8:
+        parser.error('--actions-per-iteration must be a positive multiple of eight')
     if args.initial_budget_per_laser is not None and (
             not np.isfinite(args.initial_budget_per_laser) or args.initial_budget_per_laser <= 0):
         parser.error('--initial-budget-per-laser must be positive and finite')
@@ -185,7 +197,8 @@ def main(argv=None):
     span = args.span_ghz
     directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span)/os.environ.get('SLURM_JOB_ID', 'local')
     config, schedules = make_config(span, directory, iterations=args.iterations,
-        workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser)
+        workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser,
+        actions_per_iteration=args.actions_per_iteration)
     rng = core.set_random_seed(args.seed)
     policy = build_policy(config)
     config = calibrate_budget_references(policy, config)
@@ -193,7 +206,7 @@ def main(argv=None):
     fingerprint = hashlib.sha256(b''.join(value.detach().cpu().numpy().tobytes()
         for value in policy.state_dict().values())).hexdigest()
     recipe = dict(mode='fixed_context_fresh_joint', name=run_name(span),
-        experiment_revision='higher_initial_budget',
+        experiment_revision='exploration_batch_size',
         initialization='random weights; fresh optimizer and budget calibration', initial_checkpoint=None,
         initial_budget_per_laser=config.log_budget_initial_per_laser,
         budget_remains_learnable=True,
@@ -202,7 +215,12 @@ def main(argv=None):
         target_phases_rad=[0.]*4, topology_receiver_source=TOPOLOGY.astype(int).tolist(), reciprocal_pairs=5,
         trainable='all original network parameters; strengths, phases and total budget',
         symmetric_strengths=True, symmetric_phases=True, teacher_labels=False, architecture_change=False,
-        actions_per_iteration=8, action_sampling='mirrored; three ordinary pairs and one wide pair',
+        actions_per_iteration=args.actions_per_iteration,
+        independent_exploration_directions=args.actions_per_iteration//2,
+        ordinary_mirrored_pairs=3*args.actions_per_iteration//8,
+        wide_mirrored_pairs=args.actions_per_iteration//8,
+        simulations_per_iteration=args.actions_per_iteration+1,
+        action_sampling='mirrored; 75 percent ordinary pairs and 25 percent wide pairs',
         schedules='original full-run anneal to mean; learning-rate decay in final 10 percent',
         measurements='sampled actions and mean measured together before each update; checkpoints match measured means',
         phase_reference='laser 1 (lowest detuning), original target-delay residual',
@@ -255,7 +273,7 @@ def main(argv=None):
                      best, sampling_recipe=recipe, exploration_state=state)
                 write_json(directory/'best_design.json', design)
             if iteration == 0 or (iteration+1) % args.plot_every == 0 or iteration+1 == args.iterations:
-                progress_plot(history, directory, span)
+                progress_plot(history, directory, span, args.actions_per_iteration)
             advantages = pair_excluded_advantages([reward], current, reward_scale)
             diagnostics = pcgrad_update(policy, optimizer, current, rng, [item], advantages)
             row['gradient_norm'] = diagnostics['gradient_norm']
