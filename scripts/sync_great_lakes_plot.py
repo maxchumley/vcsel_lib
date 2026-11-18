@@ -23,6 +23,9 @@ SYMMETRIC_TEST_PLOTS = (
     ('four_sym_B_directed_meanref_1k', 'four_B_meanref_progress.png'),
     ('four_sym_C_pairscore_meanref_1k', 'four_C_both_progress.png'),
 )
+FIXED_CONTEXT_TEST_PLOTS = tuple(
+    (f'four_fixed_fresh_{span}ghz', f'four_fixed_{span}ghz_progress.png')
+    for span in (1, 2, 3, 4))
 
 
 def options(argv=None):
@@ -35,6 +38,8 @@ def options(argv=None):
     selection.add_argument('--run', default=DEFAULT_RUN, help='Training RUN_NAME')
     selection.add_argument('--symmetric-tests', action='store_true',
                            help='Mirror all three named four-laser comparison PNGs in one SSH session')
+    selection.add_argument('--fixed-context-tests', action='store_true',
+                           help='Mirror the four fresh fixed-context 1/2/3/4 GHz training PNGs')
     parser.add_argument('--job-id', help='Optional exact Slurm job instead of the run-level live image')
     parser.add_argument('--filename', default='current_training_progress.png',
                         help='Progress PNG filename for a single --run')
@@ -51,8 +56,8 @@ def options(argv=None):
         parser.error('--job-id must be a Slurm job number')
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.-]*\.png', args.filename):
         parser.error('--filename must be a PNG filename without a directory')
-    if args.symmetric_tests and (args.job_id or args.filename != 'current_training_progress.png'):
-        parser.error('--symmetric-tests selects its own three run-level images; omit --job-id/--filename')
+    if (args.symmetric_tests or args.fixed_context_tests) and (args.job_id or args.filename != 'current_training_progress.png'):
+        parser.error('Test suites select their own run-level images; omit --job-id/--filename')
     if not 1. <= args.interval <= 3600.:
         parser.error('--interval must lie between 1 and 3600 seconds')
     return args
@@ -66,9 +71,10 @@ def remote_plot(args):
 
 
 def remote_plots(args):
-    if args.symmetric_tests:
+    if args.symmetric_tests or args.fixed_context_tests:
         root = PurePosixPath(args.repository)/'rl/rl_api/runs/great_lakes'
-        return [root/run/filename for run, filename in SYMMETRIC_TEST_PLOTS]
+        plots = FIXED_CONTEXT_TEST_PLOTS if args.fixed_context_tests else SYMMETRIC_TEST_PLOTS
+        return [root/run/filename for run, filename in plots]
     return [remote_plot(args)]
 
 

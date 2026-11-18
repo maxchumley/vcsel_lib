@@ -158,8 +158,18 @@ def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase
                                          retain_graph=index<len(losses)-1)
         gradients.append(torch.cat([torch.zeros_like(p).reshape(-1) if g is None
             else g.detach().reshape(-1) for p,g in zip(parameters,derivatives)]))
-    combined, diagnostics = core.combine_task_gradients_pcgrad(
-        torch.stack(gradients),config.per_size_gradient_clip,rng,task_weights=weights)
+    if len(gradients) == 1:
+        # A fixed single context has no other task to conflict-project against.
+        # Preserve per-task clipping before the usual global clip and Adam step.
+        raw_norm = torch.linalg.vector_norm(gradients[0])
+        scale = (config.per_size_gradient_clip/raw_norm.clamp_min(1e-15)).clamp(max=1.)
+        combined = gradients[0]*scale
+        diagnostics = dict(raw_task_norms=raw_norm[None],
+            clipped_task_norms=torch.linalg.vector_norm(combined)[None],
+            negative_gradient_pair_fraction=float('nan'), mean_gradient_cosine=float('nan'))
+    else:
+        combined, diagnostics = core.combine_task_gradients_pcgrad(
+            torch.stack(gradients),config.per_size_gradient_clip,rng,task_weights=weights)
     cursor = 0
     for parameter in parameters:
         count = parameter.numel()
