@@ -87,6 +87,37 @@ def test_larger_batch_preserves_settings_and_explores_64_mirrored_directions(tmp
             run.make_config(4, tmp_path, actions_per_iteration=invalid)
 
 
+def test_asymmetric_mode_executes_directed_values_without_changing_recipe(tmp_path, monkeypatch):
+    symmetric, symmetric_schedule = run.make_config(4, tmp_path)
+    asymmetric, asymmetric_schedule = run.make_config(4, tmp_path, asymmetric=True)
+    assert replace(asymmetric, symmetric_coupling_values=True, symmetric_action_score='shared_pair') == symmetric
+    assert asymmetric_schedule == symmetric_schedule
+    models = []
+    for config in (symmetric, asymmetric):
+        torch.manual_seed(7)
+        models.append(build_policy(config))
+    for key, value in models[0].state_dict().items():
+        torch.testing.assert_close(value, models[1].state_dict()[key], rtol=0, atol=0)
+    draws = {}
+    original = run.sample_annealed_candidates
+    def sample(*args, **kwargs):
+        actions, budget, score = original(*args, **kwargs)
+        draws.update(actions=actions, budget=budget)
+        return actions, budget, score
+    monkeypatch.setattr(run, 'sample_annealed_candidates', sample)
+    item = run.fixed_batch(models[1], asymmetric, 4)
+    expected = run.engine.decode_samples(draws['actions'], item['gates'], asymmetric,
+                                         budget_actions=draws['budget'])
+    for key, value in zip(('kappa','phi','counts','rho','shortfall'), expected):
+        np.testing.assert_array_equal(item[key], value)
+    for key in ('kappa','phi'):
+        assert not np.allclose(item[key], item[key].swapaxes(-1,-2))
+    symmetric_mean = run.fixed_batch(models[0], symmetric, 4, mean=True)
+    asymmetric_mean = run.fixed_batch(models[1], asymmetric, 4, mean=True)
+    np.testing.assert_array_equal(symmetric_mean['gates'], asymmetric_mean['gates'])
+    np.testing.assert_allclose(symmetric_mean['kappa'].sum(), asymmetric_mean['kappa'].sum(), rtol=1e-6)
+
+
 def test_large_batch_uses_all_workers_and_restores_unordered_results(tmp_path, fake_physics):
     config, _ = run.make_config(4, tmp_path, workers=31)
     torch.manual_seed(7)
@@ -132,12 +163,13 @@ def test_one_task_uses_clipped_gradient_without_pcgrad_projection(tmp_path):
     assert abs(result['gradient_norm']-.5) < 1e-6
 
 
-def test_training_updates_strength_phase_budget_and_roundtrips(tmp_path, fake_physics, monkeypatch):
+@pytest.mark.parametrize('asymmetric', [False, True])
+def test_training_updates_strength_phase_budget_and_roundtrips(tmp_path, fake_physics, monkeypatch, asymmetric):
     figures = []
-    monkeypatch.setattr(run, 'progress_plot', lambda h,d,s,a: figures.append((len(h), s, a)))
+    monkeypatch.setattr(run, 'progress_plot', lambda h,d,s,a,u: figures.append((len(h), s, a, u)))
     directory = tmp_path/'fresh'
     model, history = run.main(['--span-ghz','4','--iterations','3','--workers','1',
-                               '--output-directory',str(directory)])
+                               '--output-directory',str(directory)]+(['--asymmetric'] if asymmetric else []))
     initial = CouplingModel.load(directory/'initial.pt', device='cpu')
     final = CouplingModel.load(directory/'final.pt', device='cpu')
     for key in ['node_encoder.0.weight', 'edge_output.weight', 'budget_head.2.weight']:
@@ -150,6 +182,11 @@ def test_training_updates_strength_phase_budget_and_roundtrips(tmp_path, fake_ph
     assert manifest['actions_per_iteration'] == 128 and manifest['simulations_per_iteration'] == 129
     assert manifest['independent_exploration_directions'] == 64
     assert manifest['ordinary_mirrored_pairs'] == 48 and manifest['wide_mirrored_pairs'] == 16
+    assert manifest['symmetric_strengths'] == manifest['symmetric_phases'] == (not asymmetric)
+    assert manifest['name'] == run.run_name(4, asymmetric)
+    assert manifest['progress_filename'] == run.progress_filename(4, asymmetric)
+    assert final.backend_config.symmetric_coupling_values == (not asymmetric)
+    assert final.backend_config.symmetric_action_score == ('directed' if asymmetric else 'shared_pair')
     assert not manifest['architecture_change']
     assert [row['optimizer_update'] for row in history] == [True, True, False]
     payload = torch.load(directory/'final.pt', weights_only=False)
@@ -160,7 +197,7 @@ def test_training_updates_strength_phase_budget_and_roundtrips(tmp_path, fake_ph
     np.testing.assert_allclose(design.coupling_strengths_per_ns[0], saved['kappa_per_ns'], rtol=1e-6, atol=1e-7)
     np.testing.assert_allclose(design.coupling_phases_rad[0], saved['phi_p_rad'], rtol=0, atol=2e-6)
     assert sum(len(kappa) for kappa,_,_ in fake_physics) == 3*129
-    assert figures[-1] == (3,4,128)
+    assert figures[-1] == (3,4,128,asymmetric)
 
 
 def test_four_named_jobs_match_viewer_paths_without_checkpoint_inputs(tmp_path):
@@ -189,3 +226,17 @@ def test_four_named_jobs_match_viewer_paths_without_checkpoint_inputs(tmp_path):
     control = subprocess.run(['bash',str(launcher),'--dry-run','--actions-per-iteration','8'],
                              capture_output=True,text=True,check=True)
     assert '--job-name=four_dirs4_4GHz' in control.stdout
+    result = subprocess.run(['bash',str(launcher),'--dry-run','--asymmetric','--smoke-test'],
+                            capture_output=True,text=True,check=True)
+    asymmetric_commands = [shlex.split(line) for line in result.stdout.splitlines() if line.startswith('sbatch ')]
+    all_paths = sync.remote_plots(sync.options(['--fixed-context-tests','--include-asymmetric']))
+    assert all_paths[:4] == paths
+    assert len(all_paths) == len({path.name for path in all_paths}) == 8
+    for span, command, path in zip((1,2,3,4), asymmetric_commands, all_paths[4:]):
+        assert f'--job-name=four_dirs64_{span}GHz_asym' in command
+        assert '--asymmetric' in command and command[-1] == '--smoke-test'
+        assert path.parent.name == run.run_name(span, asymmetric=True)
+        assert path.name == run.progress_filename(span, asymmetric=True)
+        assert path.name.endswith('_asym.png')
+    with pytest.raises(SystemExit):
+        sync.options(['--include-asymmetric'])

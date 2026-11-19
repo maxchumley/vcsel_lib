@@ -8,10 +8,12 @@ iterations=1000
 actions=128
 dry_run=false
 smoke_test=false
+asymmetric=false
 while (($#)); do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
         --smoke-test) smoke_test=true; shift ;;
+        --asymmetric) asymmetric=true; shift ;;
         --iterations)
             if (($# < 2)); then echo '--iterations needs a value' >&2; exit 2; fi
             iterations="$2"; shift 2 ;;
@@ -19,10 +21,11 @@ while (($#)); do
             if (($# < 2)); then echo '--actions-per-iteration needs a value' >&2; exit 2; fi
             actions="$2"; shift 2 ;;
         -h|--help)
-            echo "Usage: bash scripts/submit_fixed_four_laser_tests.sh [--smoke-test] [--dry-run] [--iterations N] [--actions-per-iteration N]"
+            echo "Usage: bash scripts/submit_fixed_four_laser_tests.sh [--asymmetric] [--smoke-test] [--dry-run] [--iterations N] [--actions-per-iteration N]"
             echo 'Submits fresh 1, 2, 3 and 4 GHz fixed-context models learning strengths, phases and budget.'
             echo 'Defaults: 128 sampled designs (64 mirrored directions), 32 CPUs, 64G and 48 hours per job.'
             echo 'Initial budgets/M: 4, 6, 9 and 12 ns^-1. Smoke tests retain the 48-hour request.'
+            echo '--asymmetric releases strength/phase symmetry and adds _asym to job, run and plot names.'
             exit 0 ;;
         *) echo "Unknown option: $1" >&2; exit 2 ;;
     esac
@@ -35,9 +38,11 @@ if ! "$dry_run"; then
 fi
 for span in 1 2 3 4; do
     name="four_dirs$(( actions / 2 ))_${span}GHz"
+    if "$asymmetric"; then name+="_asym"; fi
     command=(sbatch --parsable --job-name="$name")
     command+=(scripts/train_fixed_four_laser_great_lakes.slurm --span-ghz "$span" --iterations "$iterations"
         --actions-per-iteration "$actions")
+    if "$asymmetric"; then command+=(--asymmetric); fi
     if "$smoke_test"; then command+=(--smoke-test); fi
     if "$dry_run"; then
         printf '%q ' "${command[@]}"; printf '\n'
@@ -47,4 +52,8 @@ for span in 1 2 3 4; do
     fi
 done
 echo 'Monitor: squeue -u "$USER" -o "%.18i %.24j %.9T %.10M %.20R"'
-echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py --fixed-context-tests'
+if "$asymmetric"; then
+    echo 'Mac plot sync (both suites): python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric'
+else
+    echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py --fixed-context-tests'
+fi

@@ -1,4 +1,4 @@
-"""Train a fresh model on one fixed symmetric four-laser context.
+"""Train a fresh model on one fixed four-laser context.
 
 The existing architecture, Gaussian sampler, decoder, simulator, RMS reward,
 pair-excluded baseline and PCGrad update are reused. Only the context and
@@ -38,13 +38,17 @@ INITIAL_BUDGET_PER_LASER = {1: 4., 2: 6., 3: 9., 4: 12.}  # ns^-1; remains learn
 DEFAULT_ACTIONS_PER_ITERATION = 128
 
 
-def run_name(span):
-    return f'four_fixed_fresh_{span}ghz'
+def run_name(span, asymmetric=False):
+    return f'four_fixed_fresh_{span}ghz' + ('_asym' if asymmetric else '')
+
+
+def progress_filename(span, asymmetric=False):
+    return f'four_fixed_{span}ghz_progress' + ('_asym' if asymmetric else '') + '.png'
 
 
 def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
                 initial_budget_per_laser=None,
-                actions_per_iteration=DEFAULT_ACTIONS_PER_ITERATION):
+                actions_per_iteration=DEFAULT_ACTIONS_PER_ITERATION, asymmetric=False):
     if span not in (1, 2, 3, 4):
         raise ValueError('Choose a fixed span of 1, 2, 3 or 4 GHz')
     if iterations < 2 or workers < 1:
@@ -55,7 +59,7 @@ def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
     if not np.isfinite(budget) or budget <= 0:
         raise ValueError('Initial budget per laser must be positive and finite')
     public = comparison_config(shared_pair_score=True, mean_reference=False,
-        progress_filename=f'four_fixed_{span}ghz_progress.png')
+        progress_filename=progress_filename(span, asymmetric))
     schedules = replace(public.schedules, ordinary_end=iterations, wide_end=iterations,
         wide_phase_actions=actions_per_iteration//4,
         learning_rate_decay_start=max(1, int(.9*iterations)), learning_rate_decay_end=iterations)
@@ -63,13 +67,17 @@ def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
         sampling=replace(public.sampling, actions_per_topology=actions_per_iteration),
         model=replace(public.model, initial_budget_per_laser=float(budget)),
         optimization=replace(public.optimization, iterations=iterations, workers=workers))
-    # Retain the reciprocal-value checkpoint schema. The explicit sampler
+    # Retain the existing checkpoint schema. The explicit sampler
     # below supplies one context/mask instead of invoking the exhaustive bank.
     config = replace(public.to_backend(directory), targets_per_batch=1,
         pcgrad_topology_groups=1, candidates_per_target=actions_per_iteration,
         actions_per_topology=actions_per_iteration,
         targets_per_worker_task=1, candidates_per_worker_task=1,
         detuning_span_ghz=float(span), jupyter_mode=False)
+    if asymmetric:
+        # Every directed action is now executed, so score it independently
+        # instead of scoring the reciprocal averages that symmetry discards.
+        config = replace(config, symmetric_coupling_values=False, symmetric_action_score='directed')
     return config, schedules
 
 
@@ -87,8 +95,9 @@ def fixed_batch(policy, config, span, *, mean=False):
     else:
         actions, budget, score = sample_annealed_candidates(policy, features, gates, mirrored=True)
     kappa, phi, counts, rho, shortfall = decode_samples(actions, gates, config, budget_actions=budget)
-    np.testing.assert_array_equal(kappa, kappa.swapaxes(-1, -2))
-    np.testing.assert_array_equal(phi, phi.swapaxes(-1, -2))
+    if config.symmetric_coupling_values:
+        np.testing.assert_array_equal(kappa, kappa.swapaxes(-1, -2))
+        np.testing.assert_array_equal(phi, phi.swapaxes(-1, -2))
     return dict(n_lasers=4, config=config, targets=targets, detunings=detunings,
         features=features, gates=gates, log_prob=score, kappa=kappa, phi=phi,
         counts=counts, rho=rho, shortfall=shortfall, reach=np.ones(counts.shape),
@@ -137,7 +146,7 @@ def mean_record(item, measured):
     return row, design
 
 
-def progress_plot(history, directory, span, actions_per_iteration):
+def progress_plot(history, directory, span, actions_per_iteration, asymmetric=False):
     import matplotlib.pyplot as plt
     with plt.rc_context({'font.family': 'serif', 'font.serif': ['cmr10'],
                          'mathtext.fontset': 'cm', 'axes.formatter.use_mathtext': True}):
@@ -155,8 +164,9 @@ def progress_plot(history, directory, span, actions_per_iteration):
         for axis in axes:
             axis.grid(alpha=.2)
         figure.suptitle(f'Fresh four-laser model: fixed {span} GHz span, '
-                       f'{actions_per_iteration//2} mirrored directions')
-        save_training_progress(figure, directory, 200, filename=f'four_fixed_{span}ghz_progress.png')
+                       f'{actions_per_iteration//2} mirrored directions'
+                       + (' (asymmetric)' if asymmetric else ''))
+        save_training_progress(figure, directory, 200, filename=progress_filename(span, asymmetric))
         plt.close(figure)
 
 
@@ -166,6 +176,8 @@ def options(argv=None):
     parser.add_argument('--iterations', type=int, default=1000)
     parser.add_argument('--actions-per-iteration', type=int, default=DEFAULT_ACTIONS_PER_ITERATION,
         help='Sampled designs, excluding the central prediction; a multiple of eight (default: 128)')
+    parser.add_argument('--asymmetric', action='store_true',
+        help='Allow independent strengths and phases in each direction; suffix runs and figures with _asym')
     parser.add_argument('--initial-budget-per-laser', type=float,
         help='Initial learnable budget/M in ns^-1; defaults for spans 1/2/3/4 are 4/6/9/12')
     parser.add_argument('--workers', type=int,
@@ -195,17 +207,17 @@ def main(argv=None):
     args = options(argv)
     torch.set_num_threads(1)
     span = args.span_ghz
-    directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span)/os.environ.get('SLURM_JOB_ID', 'local')
+    directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span, args.asymmetric)/os.environ.get('SLURM_JOB_ID', 'local')
     config, schedules = make_config(span, directory, iterations=args.iterations,
         workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser,
-        actions_per_iteration=args.actions_per_iteration)
+        actions_per_iteration=args.actions_per_iteration, asymmetric=args.asymmetric)
     rng = core.set_random_seed(args.seed)
     policy = build_policy(config)
     config = calibrate_budget_references(policy, config)
     policy.config = config
     fingerprint = hashlib.sha256(b''.join(value.detach().cpu().numpy().tobytes()
         for value in policy.state_dict().values())).hexdigest()
-    recipe = dict(mode='fixed_context_fresh_joint', name=run_name(span),
+    recipe = dict(mode='fixed_context_fresh_joint', name=run_name(span, args.asymmetric),
         experiment_revision='exploration_batch_size',
         initialization='random weights; fresh optimizer and budget calibration', initial_checkpoint=None,
         initial_budget_per_laser=config.log_budget_initial_per_laser,
@@ -214,7 +226,8 @@ def main(argv=None):
         detunings_ghz=np.linspace(-span/2, span/2, 4).tolist(), span_ghz=span,
         target_phases_rad=[0.]*4, topology_receiver_source=TOPOLOGY.astype(int).tolist(), reciprocal_pairs=5,
         trainable='all original network parameters; strengths, phases and total budget',
-        symmetric_strengths=True, symmetric_phases=True, teacher_labels=False, architecture_change=False,
+        symmetric_strengths=not args.asymmetric, symmetric_phases=not args.asymmetric,
+        teacher_labels=False, architecture_change=False,
         actions_per_iteration=args.actions_per_iteration,
         independent_exploration_directions=args.actions_per_iteration//2,
         ordinary_mirrored_pairs=3*args.actions_per_iteration//8,
@@ -224,7 +237,8 @@ def main(argv=None):
         schedules='original full-run anneal to mean; learning-rate decay in final 10 percent',
         measurements='sampled actions and mean measured together before each update; checkpoints match measured means',
         phase_reference='laser 1 (lowest detuning), original target-delay residual',
-        score='reciprocal-pair Gaussian marginal',
+        score='directed Gaussian' if args.asymmetric else 'reciprocal-pair Gaussian marginal',
+        progress_filename=progress_filename(span, args.asymmetric),
         metric_scope='same fixed context; no held-out or generalization claim',
         output_directory=str(directory), backend_config=exported_settings(config))
     import json
@@ -273,7 +287,7 @@ def main(argv=None):
                      best, sampling_recipe=recipe, exploration_state=state)
                 write_json(directory/'best_design.json', design)
             if iteration == 0 or (iteration+1) % args.plot_every == 0 or iteration+1 == args.iterations:
-                progress_plot(history, directory, span, args.actions_per_iteration)
+                progress_plot(history, directory, span, args.actions_per_iteration, args.asymmetric)
             advantages = pair_excluded_advantages([reward], current, reward_scale)
             diagnostics = pcgrad_update(policy, optimizer, current, rng, [item], advantages)
             row['gradient_norm'] = diagnostics['gradient_norm']

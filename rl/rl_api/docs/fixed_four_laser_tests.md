@@ -94,6 +94,29 @@ The `initial.pt` file and its state hash record the random initialization.
 supply the same fixed detunings, zero targets and the five-pair topology.
 `current_design.json` and `best_design.json` contain the actual physical matrices.
 
+## Asymmetric comparison
+
+To repeat the same four fresh experiments while allowing independent coupling
+strengths and phases in each direction, run:
+
+```bash
+bash scripts/submit_fixed_four_laser_tests.sh --asymmetric
+```
+
+The five-pair topology stays the same; only the requirement that reciprocal
+links have equal values is removed. Both strength and phase matrices can be
+asymmetric. The GNN architecture, initialization seed, starting budgets,
+128 sampled designs plus one central prediction, 1,000-iteration schedule,
+reward, simulator, 32 CPUs, 64 GB and 48-hour requests are retained. The score
+uses the executed directed Gaussian actions instead of reciprocal averages.
+Mirrored positive/negative exploration remains enabled; this is independent
+of whether the physical coupling values are symmetric.
+
+Job names end in `_asym`, for example `four_dirs64_4GHz_asym`. Runs are stored
+under `rl/rl_api/runs/great_lakes/four_fixed_fresh_<span>ghz_asym/<jobid>/`.
+Figures are named `four_fixed_<span>ghz_progress_asym.png`, keeping the existing
+symmetric runs and figures separate. Add `--smoke-test` for a two-iteration check.
+
 ## Live image viewer
 
 On your Mac:
@@ -112,3 +135,13 @@ separately from the sampled-action gradient. Plot titles show the direction coun
 The existing viewer and Cloudflare tunnel do not need to restart.
 The same live-sync command and image names are retained. New Slurm job IDs
 create new run directories; all earlier checkpoints remain in theirs.
+
+To sync both the four symmetric plots and the four asymmetric plots, stop the
+existing Mac sync command with Ctrl+C and restart it with:
+
+```bash
+python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric
+```
+
+All eight filenames are distinct and use the same viewer directory. The viewer
+and Cloudflare tunnel can continue running.

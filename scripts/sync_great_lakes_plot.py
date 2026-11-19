@@ -26,6 +26,9 @@ SYMMETRIC_TEST_PLOTS = (
 FIXED_CONTEXT_TEST_PLOTS = tuple(
     (f'four_fixed_fresh_{span}ghz', f'four_fixed_{span}ghz_progress.png')
     for span in (1, 2, 3, 4))
+FIXED_CONTEXT_ASYMMETRIC_TEST_PLOTS = tuple(
+    (f'four_fixed_fresh_{span}ghz_asym', f'four_fixed_{span}ghz_progress_asym.png')
+    for span in (1, 2, 3, 4))
 
 
 def options(argv=None):
@@ -40,6 +43,8 @@ def options(argv=None):
                            help='Mirror all three named four-laser comparison PNGs in one SSH session')
     selection.add_argument('--fixed-context-tests', action='store_true',
                            help='Mirror the four fresh fixed-context 1/2/3/4 GHz training PNGs')
+    parser.add_argument('--include-asymmetric', action='store_true',
+                        help='With --fixed-context-tests, also mirror the four _asym plots')
     parser.add_argument('--job-id', help='Optional exact Slurm job instead of the run-level live image')
     parser.add_argument('--filename', default='current_training_progress.png',
                         help='Progress PNG filename for a single --run')
@@ -48,6 +53,8 @@ def options(argv=None):
     parser.add_argument('--once', action='store_true', help='Copy once, then close the dedicated connection')
     parser.add_argument('--dry-run', action='store_true', help='Show paths without connecting or copying')
     args = parser.parse_args(argv)
+    if args.include_asymmetric and not args.fixed_context_tests:
+        parser.error('--include-asymmetric requires --fixed-context-tests')
     if not re.fullmatch(r'[A-Za-z0-9_][A-Za-z0-9_.@-]*', args.host):
         parser.error('--host must be an SSH hostname or user@hostname')
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', args.run):
@@ -74,6 +81,8 @@ def remote_plots(args):
     if args.symmetric_tests or args.fixed_context_tests:
         root = PurePosixPath(args.repository)/'rl/rl_api/runs/great_lakes'
         plots = FIXED_CONTEXT_TEST_PLOTS if args.fixed_context_tests else SYMMETRIC_TEST_PLOTS
+        if args.include_asymmetric:
+            plots += FIXED_CONTEXT_ASYMMETRIC_TEST_PLOTS
         return [root/run/filename for run, filename in plots]
     return [remote_plot(args)]
 
