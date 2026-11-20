@@ -218,7 +218,7 @@ git pull --ff-only origin updates
 bash scripts/submit_symmetric_density_tests.sh
 ```
 
-Each requests 32 CPUs, 64 GB and seven days using `arrays0`, with 31 simulation
+Each requests 32 CPUs, 64 GB and three days using `arrays0`, with 31 simulation
 workers. The launcher overrides the generic Slurm file's resource defaults.
 It splits the same 1,400 simulations into 175 jobs of eight cases instead of
 35 jobs of 40 cases, providing enough independent work for the larger pool.
