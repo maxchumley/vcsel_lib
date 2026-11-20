@@ -318,7 +318,7 @@ def test_symmetric_density_launcher_submits_two_distinct_recipes():
     for command,name,recipe in zip(commands,('density_sym_ref','density_sym_zero'),(symmetric,zero)):
         assert f'--job-name={name}' in command and '--smoke-test' in command
         assert recipe.__name__.split('.')[-1] in command
-        assert '--cpus-per-task=32' in command and '--time=3-00:00:00' in command
+        assert '--cpus-per-task=32' in command and '--time=7-00:00:00' in command
         assert command[command.index('--workers')+1]=='31'
         assert command[command.index('--pairs-per-job')+1]=='1'
         assert command[command.index('--actions-per-job')+1]=='8'
