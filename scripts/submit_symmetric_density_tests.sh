@@ -25,7 +25,7 @@ names=(density_sym_ref density_sym_zero)
 for index in 0 1; do
     command=(sbatch --parsable --job-name="${names[$index]}" --cpus-per-task=32 --time=7-00:00:00
         scripts/train_rl_great_lakes.slurm "${recipes[$index]}"
-        --workers 31 --pairs-per-job 1 --actions-per-job 8)
+        --workers 31 --pairs-per-job 5 --actions-per-job 8)
     if "$smoke_test"; then command+=(--smoke-test); fi
     if "$dry_run"; then
         printf '%q ' "${command[@]}"; printf '\n'

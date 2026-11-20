@@ -220,8 +220,9 @@ bash scripts/submit_symmetric_density_tests.sh
 
 Each requests 32 CPUs, 64 GB and seven days using `arrays0`, with 31 simulation
 workers. The launcher overrides the generic Slurm file's resource defaults.
-It splits the same 1,400 simulations into 175 jobs of eight cases instead of
-35 jobs of 40 cases, providing enough independent work for the larger pool.
+It restores 35 vectorized worker jobs of 40 cases (five contexts times eight
+actions), instead of 175 jobs of eight cases. The larger batches reduce
+repeated Python integration-loop overhead while retaining 31 workers.
 This changes batching and resource allocation, not contexts, samples or the
 training objective. The extra time is headroom, not a runtime guarantee.
 Already submitted jobs keep their original allocation; these changes apply
