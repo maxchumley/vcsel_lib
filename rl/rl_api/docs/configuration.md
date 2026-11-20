@@ -218,8 +218,14 @@ git pull --ff-only origin updates
 bash scripts/submit_symmetric_density_tests.sh
 ```
 
-Each requests 16 CPUs, 64 GB and two days using `arrays0`, with 14 simulation
-workers. `--smoke-test` runs two iterations, and `--dry-run` prints commands.
+Each requests 32 CPUs, 64 GB and seven days using `arrays0`, with 31 simulation
+workers. The launcher overrides the generic Slurm file's resource defaults.
+It splits the same 1,400 simulations into 175 jobs of eight cases instead of
+35 jobs of 40 cases, providing enough independent work for the larger pool.
+This changes batching and resource allocation, not contexts, samples or the
+training objective. The extra time is headroom, not a runtime guarantee.
+Already submitted jobs keep their original allocation; these changes apply
+when submitting new jobs. `--smoke-test` runs two iterations, and `--dry-run` prints commands.
 Separate run folders under `rl/rl_api/runs/great_lakes/` and separate image
 names prevent collisions. Automatic Mac plot sync discovers both runs.
 Run either recipe directly in a local notebook or as a Python module to use
