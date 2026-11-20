@@ -1,4 +1,4 @@
-"""Train a fresh model on one fixed four-laser context.
+"""Train one fixed four-laser case or continue it with narrow exploration.
 
 The existing architecture, Gaussian sampler, decoder, simulator, RMS reward,
 pair-excluded baseline and PCGrad update are reused. Only the context and
@@ -38,12 +38,15 @@ INITIAL_BUDGET_PER_LASER = {1: 4., 2: 6., 3: 9., 4: 12.}  # ns^-1; remains learn
 DEFAULT_ACTIONS_PER_ITERATION = 128
 
 
-def run_name(span, asymmetric=False):
+def run_name(span, asymmetric=False, precision=False):
+    if precision:
+        return f'four_fixed_{span}ghz_precision'
     return f'four_fixed_fresh_{span}ghz' + ('_asym' if asymmetric else '')
 
 
-def progress_filename(span, asymmetric=False):
-    return f'four_fixed_{span}ghz_progress' + ('_asym' if asymmetric else '') + '.png'
+def progress_filename(span, asymmetric=False, precision=False):
+    suffix = '_precision' if precision else '_asym' if asymmetric else ''
+    return f'four_fixed_{span}ghz_progress{suffix}.png'
 
 
 def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
@@ -146,7 +149,7 @@ def mean_record(item, measured):
     return row, design
 
 
-def progress_plot(history, directory, span, actions_per_iteration, asymmetric=False):
+def progress_plot(history, directory, span, actions_per_iteration, asymmetric=False, precision=False):
     import matplotlib.pyplot as plt
     with plt.rc_context({'font.family': 'serif', 'font.serif': ['cmr10'],
                          'mathtext.fontset': 'cm', 'axes.formatter.use_mathtext': True}):
@@ -163,10 +166,10 @@ def progress_plot(history, directory, span, actions_per_iteration, asymmetric=Fa
         axes[1].legend()
         for axis in axes:
             axis.grid(alpha=.2)
-        figure.suptitle(f'Fresh four-laser model: fixed {span} GHz span, '
+        figure.suptitle(('Precision' if precision else 'Fresh')+f' four-laser model: fixed {span} GHz span, '
                        f'{actions_per_iteration//2} mirrored directions'
                        + (' (asymmetric)' if asymmetric else ''))
-        save_training_progress(figure, directory, 200, filename=progress_filename(span, asymmetric))
+        save_training_progress(figure, directory, 200, filename=progress_filename(span, asymmetric, precision))
         plt.close(figure)
 
 
@@ -178,6 +181,8 @@ def options(argv=None):
         help='Sampled designs, excluding the central prediction; a multiple of eight (default: 128)')
     parser.add_argument('--asymmetric', action='store_true',
         help='Allow independent strengths and phases in each direction; suffix runs and figures with _asym')
+    parser.add_argument('--precision-checkpoint', type=Path,
+        help='Continue a symmetric fixed 4 GHz checkpoint with fresh Adam and narrow exploration')
     parser.add_argument('--initial-budget-per-laser', type=float,
         help='Initial learnable budget/M in ns^-1; defaults for spans 1/2/3/4 are 4/6/9/12')
     parser.add_argument('--workers', type=int,
@@ -197,6 +202,9 @@ def options(argv=None):
     if args.initial_budget_per_laser is not None and (
             not np.isfinite(args.initial_budget_per_laser) or args.initial_budget_per_laser <= 0):
         parser.error('--initial-budget-per-laser must be positive and finite')
+    if args.precision_checkpoint and (args.span_ghz != 4 or args.asymmetric
+                                     or args.initial_budget_per_laser is not None):
+        parser.error('Precision continuation uses symmetric 4 GHz values and preserves the checkpoint budget calibration')
     allocated = os.environ.get('SLURM_CPUS_PER_TASK')
     if allocated and args.workers + int(args.workers > 1) > int(allocated):
         parser.error('Simulation workers plus the trainer exceed allocated CPUs')
@@ -207,19 +215,32 @@ def main(argv=None):
     args = options(argv)
     torch.set_num_threads(1)
     span = args.span_ghz
-    directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span, args.asymmetric)/os.environ.get('SLURM_JOB_ID', 'local')
-    config, schedules = make_config(span, directory, iterations=args.iterations,
-        workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser,
-        actions_per_iteration=args.actions_per_iteration, asymmetric=args.asymmetric)
+    precision = args.precision_checkpoint is not None
+    directory = args.output_directory or PACKAGE_DIR/'runs/great_lakes'/run_name(span, args.asymmetric, precision)/os.environ.get('SLURM_JOB_ID', 'local')
     rng = core.set_random_seed(args.seed)
-    policy = build_policy(config)
-    config = calibrate_budget_references(policy, config)
+    initialization = None
+    if precision:
+        from .fixed_four_laser_precision import load_precision_policy, iteration_config
+        policy, config, initialization = load_precision_policy(args.precision_checkpoint, directory,
+            iterations=args.iterations, workers=args.workers, actions=args.actions_per_iteration,
+            topology=TOPOLOGY, seed=args.seed)
+        schedules = None
+        decay_end = args.iterations-1
+    else:
+        config, schedules = make_config(span, directory, iterations=args.iterations,
+            workers=args.workers, seed=args.seed, initial_budget_per_laser=args.initial_budget_per_laser,
+            actions_per_iteration=args.actions_per_iteration, asymmetric=args.asymmetric)
+        policy = build_policy(config)
+        config = calibrate_budget_references(policy, config)
+        decay_end = schedules.learning_rate_decay_end
     policy.config = config
     fingerprint = hashlib.sha256(b''.join(value.detach().cpu().numpy().tobytes()
         for value in policy.state_dict().values())).hexdigest()
-    recipe = dict(mode='fixed_context_fresh_joint', name=run_name(span, args.asymmetric),
-        experiment_revision='exploration_batch_size',
-        initialization='random weights; fresh optimizer and budget calibration', initial_checkpoint=None,
+    recipe = dict(mode='fixed_context_precision_joint' if precision else 'fixed_context_fresh_joint',
+        name=run_name(span, args.asymmetric, precision),
+        experiment_revision='precision_continuation' if precision else 'exploration_batch_size',
+        initialization='checkpoint weights; fresh optimizer' if precision else 'random weights; fresh optimizer and budget calibration',
+        initial_checkpoint=initialization,
         initial_budget_per_laser=config.log_budget_initial_per_laser,
         budget_remains_learnable=True,
         initial_state_sha256=fingerprint, seed=args.seed, iterations=args.iterations,
@@ -230,15 +251,15 @@ def main(argv=None):
         teacher_labels=False, architecture_change=False,
         actions_per_iteration=args.actions_per_iteration,
         independent_exploration_directions=args.actions_per_iteration//2,
-        ordinary_mirrored_pairs=3*args.actions_per_iteration//8,
-        wide_mirrored_pairs=args.actions_per_iteration//8,
+        ordinary_mirrored_pairs=args.actions_per_iteration//2 if precision else 3*args.actions_per_iteration//8,
+        wide_mirrored_pairs=0 if precision else args.actions_per_iteration//8,
         simulations_per_iteration=args.actions_per_iteration+1,
-        action_sampling='mirrored; 75 percent ordinary pairs and 25 percent wide pairs',
-        schedules='original full-run anneal to mean; learning-rate decay in final 10 percent',
+        action_sampling='mirrored; all pairs narrow' if precision else 'mirrored; 75 percent ordinary pairs and 25 percent wide pairs',
+        schedules='exploration scale .03 to .003 and LR 1e-5 to 1e-6 over updates; final mean evaluation' if precision else 'original full-run anneal to mean; learning-rate decay in final 10 percent',
         measurements='sampled actions and mean measured together before each update; checkpoints match measured means',
         phase_reference='laser 1 (lowest detuning), original target-delay residual',
         score='directed Gaussian' if args.asymmetric else 'reciprocal-pair Gaussian marginal',
-        progress_filename=progress_filename(span, args.asymmetric),
+        progress_filename=progress_filename(span, args.asymmetric, precision),
         metric_scope='same fixed context; no held-out or generalization claim',
         output_directory=str(directory), backend_config=exported_settings(config))
     import json
@@ -257,8 +278,8 @@ def main(argv=None):
     with context as pool:
         for iteration in range(args.iterations):
             started = perf_counter()
-            set_learning_rate(optimizer, config, iteration, decay_end=schedules.learning_rate_decay_end)
-            current = refinement_config(config, schedules, iteration)
+            set_learning_rate(optimizer, config, iteration, decay_end=decay_end)
+            current = iteration_config(config, iteration) if precision else refinement_config(config, schedules, iteration)
             policy.config = current
             policy.minimum_log_std = core.minimum_log_std_at(iteration, current)
             policy.maximum_log_std = core.maximum_log_std_at(iteration, current)
@@ -272,6 +293,7 @@ def main(argv=None):
                 optimizer_update=current.exploration_std_scale != 0.,
                 completed_optimizer_updates=iteration,
                 exploration_scale=current.exploration_std_scale,
+                learning_rate=float(optimizer.param_groups[0]['lr']),
                 iteration_seconds=perf_counter()-started)
             history.append(row)
             state = exploration_state(policy)
@@ -287,7 +309,8 @@ def main(argv=None):
                      best, sampling_recipe=recipe, exploration_state=state)
                 write_json(directory/'best_design.json', design)
             if iteration == 0 or (iteration+1) % args.plot_every == 0 or iteration+1 == args.iterations:
-                progress_plot(history, directory, span, args.actions_per_iteration, args.asymmetric)
+                plot_options = dict(precision=True) if precision else {}
+                progress_plot(history, directory, span, args.actions_per_iteration, args.asymmetric, **plot_options)
             advantages = pair_excluded_advantages([reward], current, reward_scale)
             diagnostics = pcgrad_update(policy, optimizer, current, rng, [item], advantages)
             row['gradient_norm'] = diagnostics['gradient_norm']

@@ -240,3 +240,73 @@ def test_four_named_jobs_match_viewer_paths_without_checkpoint_inputs(tmp_path):
         assert path.name.endswith('_asym.png')
     with pytest.raises(SystemExit):
         sync.options(['--include-asymmetric'])
+
+
+def test_precision_schedule_is_narrow_throughout_updates(tmp_path):
+    from rl.rl_api.experiments.fixed_four_laser_precision import iteration_config
+    config,_ = run.make_config(4,tmp_path)
+    assert iteration_config(config,0).exploration_std_scale == .03
+    assert iteration_config(config,998).exploration_std_scale == pytest.approx(.003)
+    assert iteration_config(config,999).exploration_std_scale == 0.
+    for args in (['--asymmetric'],['--span-ghz','3'],['--initial-budget-per-laser','12']):
+        with pytest.raises(SystemExit):
+            run.options(['--precision-checkpoint','best.pt']+args)
+
+
+def test_precision_starts_from_exact_weights_with_fresh_adam(tmp_path,fake_physics,monkeypatch):
+    monkeypatch.setattr(run,'progress_plot',lambda *a,**k: None)
+    source = tmp_path/'source'
+    run.main(['--iterations','3','--workers','1','--output-directory',str(source)])
+    directory = tmp_path/'precision'
+    _,history = run.main(['--precision-checkpoint',str(source/'final.pt'),
+        '--iterations','3','--workers','1','--output-directory',str(directory)])
+    original = CouplingModel.load(source/'final.pt',device='cpu')
+    initial = CouplingModel.load(directory/'initial.pt',device='cpu')
+    final = CouplingModel.load(directory/'final.pt',device='cpu')
+    for key,value in original.policy.state_dict().items():
+        torch.testing.assert_close(initial.policy.state_dict()[key],value,rtol=0,atol=0)
+    assert original.backend_config.coupling_budget_reference_by_m == initial.backend_config.coupling_budget_reference_by_m
+    assert original.backend_config.log_budget_initial_per_laser == initial.backend_config.log_budget_initial_per_laser
+    assert not torch.load(directory/'initial.pt',weights_only=False)['optimizer_state_dict']['state']
+    payload = torch.load(directory/'final.pt',weights_only=False)
+    assert max(int(v['step']) for v in payload['optimizer_state_dict']['state'].values()) == 2
+    for key in ('edge_output.weight','budget_head.2.weight','node_encoder.0.weight'):
+        assert not torch.equal(initial.policy.state_dict()[key],final.policy.state_dict()[key])
+    np.testing.assert_allclose([r['exploration_scale'] for r in history],[.03,.003,0.])
+    np.testing.assert_allclose([r['learning_rate'] for r in history],[1e-5,1e-6,1e-6])
+    assert [r['optimizer_update'] for r in history] == [True,True,False]
+    assert final.backend_config.phase_exploration_fraction == final.backend_config.phase_exploration_start_std == 0.
+    assert all(p.requires_grad for p in final.policy.parameters())
+    context=Context(np.zeros(4),np.linspace(-2.,2.,4));topology=Topology.from_receiver_source(run.TOPOLOGY)
+    original_design=original.propose(context,topology=topology,count=1)
+    initial_design=initial.propose(context,topology=topology,count=1)
+    np.testing.assert_array_equal(original_design.coupling_strengths_per_ns,initial_design.coupling_strengths_per_ns)
+    np.testing.assert_array_equal(original_design.coupling_phases_rad,initial_design.coupling_phases_rad)
+    saved=json.loads((directory/'current_design.json').read_text())
+    final_design=final.propose(context,topology=topology,count=1)
+    np.testing.assert_allclose(final_design.coupling_strengths_per_ns[0],saved['kappa_per_ns'],rtol=1e-6)
+    np.testing.assert_allclose(final_design.coupling_phases_rad[0],saved['phi_p_rad'],rtol=0,atol=2e-6)
+    recipe=json.loads((directory/'run.json').read_text())
+    assert recipe['mode']=='fixed_context_precision_joint'
+    assert recipe['initial_checkpoint']['source_iteration']==3
+    assert recipe['ordinary_mirrored_pairs']==64 and recipe['wide_mirrored_pairs']==0
+    assert recipe['progress_filename']=='four_fixed_4ghz_progress_precision.png'
+    assert recipe['teacher_labels'] is False and recipe['architecture_change'] is False
+
+
+def test_precision_launcher_and_viewer_have_a_separate_run(tmp_path):
+    script=ROOT/'scripts/submit_four_laser_precision.sh'
+    result=subprocess.run(['bash',str(script),'--dry-run'],capture_output=True,text=True,check=True)
+    commands=[shlex.split(line) for line in result.stdout.splitlines() if line.startswith('sbatch ')]
+    assert len(commands)==1
+    command=commands[0]
+    assert '--job-name=four_4GHz_precision' in command
+    assert command[command.index('--precision-checkpoint')+1].endswith('66366725/best.pt')
+    assert command[command.index('--actions-per-iteration')+1]=='128'
+    subprocess.run(['bash','-n',str(script)],check=True)
+    spec=util.spec_from_file_location('precision_sync',ROOT/'scripts/sync_great_lakes_plot.py')
+    sync=util.module_from_spec(spec);spec.loader.exec_module(sync)
+    paths=sync.remote_plots(sync.options(['--fixed-context-tests','--include-asymmetric','--include-precision']))
+    assert len(paths)==len({p.name for p in paths})==9
+    assert paths[-1].parent.name==run.run_name(4,precision=True)
+    assert paths[-1].name==run.progress_filename(4,precision=True)

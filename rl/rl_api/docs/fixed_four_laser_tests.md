@@ -145,3 +145,55 @@ python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmet
 
 All eight filenames are distinct and use the same viewer directory. The viewer
 and Cloudflare tunnel can continue running.
+
+## Symmetric 4 GHz precision continuation
+
+This separate run continues the **best checkpoint from job 66366725**, saved at
+iteration 653 with about 2.73 degrees worst-laser phase RMS. It uses the same
+fixed five-pair topology, equally spaced 4 GHz detunings, in-phase target,
+physical equations, simulator settings, architecture, reward and budget
+calibration. All original weights, strengths, phases and budget remain trainable.
+Only checkpoint weights and calibration are carried over; Adam momentum,
+sampling seed, reward scaling and history start fresh. There are no teacher
+labels or update-rejection rules.
+
+The 128 sampled designs form 64 narrow mirrored pairs; extra-wide phase
+exploration is disabled. Over 999 updates, the common exploration-SD multiplier
+decreases geometrically from 0.03 to 0.003. For the source checkpoint this gives
+about 0.27 to 0.027 degrees executed reciprocal coupling-phase SD, with strength
+and budget perturbations narrowed by the same multiplier. Learned SD heads
+remain active, so these physical widths can change during training. The learning
+rate decreases from 1e-5 to 1e-6 over those updates. Iteration 1,000 is an exact
+mean evaluation without an optimizer update. Each iteration still measures
+128 samples plus one central prediction; current and best predictions are
+recorded separately.
+
+On Great Lakes:
+
+```bash
+cd ~/vcsel_lib
+git pull --ff-only origin updates
+bash scripts/submit_four_laser_precision.sh
+```
+
+The launcher calls `sbatch` with job name **four_4GHz_precision**, using the
+existing 32-CPU, 64-GB, **48-hour** batch allocation. It defaults to
+`rl/rl_api/runs/great_lakes/four_fixed_fresh_4ghz/66366725/best.pt` and checks that
+the file exists before submission. `--checkpoint PATH` selects another
+compatible fixed-case symmetric 4 GHz checkpoint. `--smoke-test` runs only two
+iterations; `--dry-run` prints the submission without starting a job.
+
+Outputs go to `rl/rl_api/runs/great_lakes/four_fixed_4ghz_precision/<jobid>/`.
+The separate **four_fixed_4ghz_progress_precision.png** image is also copied to
+that run's parent folder. The checkpoint SHA-256, source iteration, fresh
+optimizer initialization, exploration scales and learning rates are recorded.
+`initial.pt` reproduces the original checkpoint's physical mean design;
+`best.pt` retains the best measured RMS reward from the continuation, including
+that initial design. `final.pt` remains the actual last measured model.
+
+To show this plot alongside the eight prior fixed-context plots, restart the
+Mac plot-sync command with:
+
+```bash
+python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric --include-precision
+```
