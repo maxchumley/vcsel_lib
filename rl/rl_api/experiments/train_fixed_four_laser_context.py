@@ -84,13 +84,14 @@ def make_config(span, directory, *, iterations=1000, workers=1, seed=7,
     return config, schedules
 
 
-def fixed_batch(policy, config, span, *, mean=False):
+def fixed_batch(policy, config, span, *, mean=False, topology_masks=None):
     targets = np.zeros((1, 4))
     detunings = np.linspace(-span/2, span/2, 4)[None]
     features = engine.encode_context(targets, detunings, policy)
     receiver, source = core.directed_link_indices(4)
-    mask = torch.as_tensor(TOPOLOGY[receiver, source][None, None], dtype=features.dtype)
-    gates = mask.repeat(1, 1 if mean else config.actions_per_topology, 1)
+    masks = TOPOLOGY[receiver, source][None] if topology_masks is None else np.asarray(topology_masks)
+    mask = torch.as_tensor(masks[None], dtype=features.dtype, device=features.device)
+    gates = mask.repeat_interleave(1 if mean else config.actions_per_topology, dim=1)
     if mean:
         with torch.no_grad():
             actions, budget, score = engine.sample_topology_conditioned_candidates(
@@ -107,12 +108,17 @@ def fixed_batch(policy, config, span, *, mean=False):
         roots=None, results=[])
 
 
-def evaluate_batch(item, mean, config, pool):
+def evaluate_batch(item, mean, config, pool, *, max_cases_per_job=None):
     """Vectorize sampled and mean designs together; never average their rewards."""
     kappa = np.concatenate((item['kappa'], mean['kappa']), axis=1)
     phi = np.concatenate((item['phi'], mean['phi']), axis=1)
     total = kappa.shape[1]
-    boundaries = np.linspace(0, total, min(config.n_jobs, total)+1, dtype=int)
+    if max_cases_per_job is None:
+        boundaries = np.linspace(0, total, min(config.n_jobs, total)+1, dtype=int)
+    else:
+        if max_cases_per_job < 1:
+            raise ValueError('Simulation chunks must contain at least one case')
+        boundaries = np.append(np.arange(0, total, max_cases_per_job), total)
     jobs = [(0, start, stop,
              (0, 0, 1, item['targets'], kappa[:,start:stop], phi[:,start:stop],
               item['detunings'], config)) for start, stop in zip(boundaries[:-1], boundaries[1:])]

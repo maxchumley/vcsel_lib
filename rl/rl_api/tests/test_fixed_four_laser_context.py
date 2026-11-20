@@ -12,6 +12,7 @@ import torch
 from rl.rl_api import Context, CouplingModel, Topology
 from rl.rl_api._compat import core
 from rl.rl_api.experiments import train_fixed_four_laser_context as run
+from rl.rl_api.experiments import train_four_laser_topologies_fixed as topologies
 from rl.rl_api.models import build_policy
 from rl.rl_api.training_batch import pcgrad_update
 import pytest
@@ -310,3 +311,115 @@ def test_precision_launcher_and_viewer_have_a_separate_run(tmp_path):
     assert len(paths)==len({p.name for p in paths})==9
     assert paths[-1].parent.name==run.run_name(4,precision=True)
     assert paths[-1].name==run.progress_filename(4,precision=True)
+
+
+def topology_source(tmp_path,span):
+    from rl.rl_api.checkpoints import save
+    config,_=run.make_config(span,tmp_path)
+    config=replace(config,coupling_budget_reference_by_m=((4,4.0074491114),))
+    torch.manual_seed(7)
+    policy=build_policy(config)
+    optimizer=torch.optim.Adam(policy.parameters(),lr=1e-4)
+    source=tmp_path/f'source_{span}.pt'
+    save(source,policy,optimizer,config,1000,.9,sampling_recipe=dict(mode='fixed_context_fresh_joint',
+        span_ghz=span,target_phases_rad=[0.]*4,detunings_ghz=np.linspace(-span/2,span/2,4).tolist()))
+    return source,policy,config
+
+
+def test_all38_fixed_spans_preserve_weights_and_cover_every_mask(tmp_path):
+    from rl.rl_api.symmetric_topologies import connected_symmetric_masks
+    bank=connected_symmetric_masks()
+    np.testing.assert_array_equal(np.unique(bank.sum(1)//2,return_counts=True)[1],[16,15,6,1])
+    for span in (1,2,3,4):
+        source,original,previous=topology_source(tmp_path,span)
+        actions=128 if span==4 else 8
+        policy,config,info=topologies.load_start(source,tmp_path/'next',span,1,actions,7)
+        assert info['source_iteration']==1000
+        for key,value in original.state_dict().items():
+            torch.testing.assert_close(policy.state_dict()[key],value,rtol=0,atol=0)
+        assert config.coupling_budget_reference_by_m==previous.coupling_budget_reference_by_m
+        assert config.log_budget_initial_per_laser==previous.log_budget_initial_per_laser
+        item=run.fixed_batch(policy,config,span,topology_masks=bank)
+        assert item['gates'].shape==(1,38*actions,12)
+        assert item['log_prob'].shape==(1,38*actions)
+        np.testing.assert_array_equal(item['gates'][0,::actions].numpy(),bank)
+        np.testing.assert_array_equal(item['detunings'],np.linspace(-span/2,span/2,4)[None])
+        for matrix in (item['kappa'],item['phi']):
+            np.testing.assert_array_equal(matrix,matrix.swapaxes(-1,-2))
+        del item
+    with pytest.raises(ValueError,match='matching fixed detunings'):
+        topologies.load_start(source,tmp_path,1,1,8,7)
+
+
+def test_all38_search_precision_and_checkpoint_roundtrip(tmp_path,fake_physics,monkeypatch):
+    from rl.rl_api.symmetric_topologies import connected_symmetric_masks
+    source,_,_=topology_source(tmp_path,4)
+    monkeypatch.setattr(topologies,'progress_plot',lambda *a:None)
+    advantages=[]
+    real_advantages=topologies.pair_excluded_advantages
+    def record_advantages(rewards,*args):
+        advantages.append(rewards[0].shape)
+        return real_advantages(rewards,*args)
+    monkeypatch.setattr(topologies,'pair_excluded_advantages',record_advantages)
+    precision_states=[]
+    real_batch=topologies.fixed_batch
+    def record_batch(policy,config,*args,**kwargs):
+        if config.phase_exploration_fraction==0. and config.exploration_std_scale>0. and not kwargs.get('mean',False):
+            precision_states.append({k:v.detach().clone() for k,v in policy.state_dict().items()})
+        return real_batch(policy,config,*args,**kwargs)
+    monkeypatch.setattr(topologies,'fixed_batch',record_batch)
+    directory=tmp_path/'all38'
+    _,history=topologies.main(['--span-ghz','4','--initial-checkpoint',str(source),'--smoke-test',
+        '--workers','1','--actions-per-topology','8','--cases-per-job','16','--output-directory',str(directory)])
+    assert [r['stage'] for r in history]==['search','precision','final']
+    assert [r['optimizer_update'] for r in history]==[True,True,False]
+    assert all(r['pcgrad_tasks']==3 for r in history)
+    assert advantages==[(1,304)]*3
+    assert max(len(k) for k,_,_ in fake_physics)<=16
+    assert sum(len(k) for k,_,_ in fake_physics)==3*342+38
+    before=torch.load(directory/'initial.pt',weights_only=False)
+    assert not before['optimizer_state_dict']['state']
+    final=torch.load(directory/'final.pt',weights_only=False)
+    assert max(int(v['step']) for v in final['optimizer_state_dict']['state'].values())==1
+    search=torch.load(directory/'best_search.pt',weights_only=False)
+    for key,value in search['policy_state_dict'].items():
+        torch.testing.assert_close(precision_states[0][key],value,rtol=0,atol=0)
+    loaded=CouplingModel.load(directory/'final.pt',device='cpu')
+    initial=CouplingModel.load(source,device='cpu')
+    assert not torch.equal(initial.policy.edge_output.weight,loaded.policy.edge_output.weight)
+    predicted=loaded.propose(Context(np.zeros(4),np.linspace(-2,2,4)),count=38,
+        topology=Topology.from_receiver_source(topologies.topology_metadata()['matrices_receiver_source']))
+    saved=json.loads((directory/'current_designs.json').read_text())['designs']
+    np.testing.assert_allclose(predicted.coupling_strengths_per_ns,np.array([d['kappa_per_ns'] for d in saved]),rtol=2e-6,atol=1e-6)
+    assert len(saved)==38 and [d['topology_id'] for d in saved]==list(range(38))
+    assert history[-1]['worst_error_deg']==max(d['worst_phase_rms_deg'] for d in saved)
+    assert (directory/'best_worst.pt').is_file()
+    recipe=json.loads((directory/'run.json').read_text())
+    assert recipe['teacher_labels'] is False and recipe['architecture_change'] is False
+    assert recipe['simulations_per_iteration']==342
+
+
+def test_all38_schedule_and_named_cluster_jobs(tmp_path):
+    config,_=run.make_config(4,tmp_path)
+    first,rate,stage=topologies.iteration_settings(config,0,1000,1000)
+    assert stage=='search' and first.exploration_std_scale==1. and first.phase_exploration_fraction==.25
+    end,rate,stage=topologies.iteration_settings(config,999,1000,1000)
+    assert end.exploration_std_scale==pytest.approx(.03) and rate==pytest.approx(1e-5)
+    start,rate,stage=topologies.iteration_settings(config,1000,1000,1000)
+    assert stage=='precision' and start.exploration_std_scale==.03 and start.phase_exploration_fraction==0.
+    end,rate,stage=topologies.iteration_settings(config,1999,1000,1000)
+    assert end.exploration_std_scale==pytest.approx(.003) and rate==pytest.approx(1e-6)
+    end,_,stage=topologies.iteration_settings(config,2000,1000,1000)
+    assert stage=='final' and end.exploration_std_scale==0.
+    launcher=ROOT/'scripts/submit_four_laser_topology_tests.sh'
+    result=subprocess.run(['bash',str(launcher),'--dry-run'],capture_output=True,text=True,check=True)
+    commands=[shlex.split(line) for line in result.stdout.splitlines() if line.startswith('sbatch ')]
+    assert len(commands)==4
+    for span,command,job in zip((1,2,3,4),commands,('66366722','66366723','66366724','66366725')):
+        assert f'--job-name=four_all38_{span}GHz' in command
+        assert command[command.index('--initial-checkpoint')+1].endswith(f'{job}/best.pt')
+        assert command[command.index('--actions-per-topology')+1]=='128'
+        assert topologies.progress_filename(span).endswith('progress.png')
+    slurm=ROOT/'scripts/train_four_laser_topologies_fixed_great_lakes.slurm'
+    assert '#SBATCH --time=4-00:00:00' in slurm.read_text()
+    subprocess.run(['bash','-n',str(launcher),str(slurm)],check=True)

@@ -197,3 +197,81 @@ prior fixed-context plots without restarting or changing flags:
 ```bash
 python3 scripts/sync_great_lakes_plot.py
 ```
+
+## All 38 topologies at fixed detunings
+
+The next four independent models learn **all 38 connected symmetric four-laser
+topologies** at the fixed, equally spaced 1, 2, 3 and 4 GHz detuning vectors in
+the first table. Detunings and in-phase targets do not vary during a run. Both
+strength and phase matrices remain symmetric. The GNN architecture, simulator,
+physical settings, laser-1 reference, RMS reward, reciprocal-pair action score,
+pair-excluded baseline and three PCGrad density groups are retained. Strengths,
+phases, budget and every original network parameter remain trainable; there
+are no teacher labels, sparsity penalties or coupling-budget penalties.
+
+Each run starts from its matching completed fixed-case `best.pt`:
+
+| Span | Starting job | New job name | New progress filename |
+|---|---|---|---|
+| 1 GHz | 66366722 | four_all38_1GHz | four_all38_fixed_1ghz_progress.png |
+| 2 GHz | 66366723 | four_all38_2GHz | four_all38_fixed_2ghz_progress.png |
+| 3 GHz | 66366724 | four_all38_3GHz | four_all38_fixed_3ghz_progress.png |
+| 4 GHz | 66366725 | four_all38_4GHz | four_all38_fixed_4ghz_progress.png |
+
+These are the completed fixed-case checkpoints; the separate 4 GHz precision
+experiment can continue independently. The source path, SHA-256 and iteration
+are recorded in the new manifest. Physical budget calibration and all weights
+are copied, while optimizer state and training history start fresh.
+
+Every iteration evaluates **128 mirrored samples per topology** (64 independent
+directions) and one central prediction per topology: **4,902 simulations**.
+The full bank contains 16 trees, 15 four-pair graphs, six five-pair graphs and
+one all-to-all graph. Each mask's 128 sampled rewards form its own baseline;
+the 38 central predictions never enter the sampled-action gradient.
+
+The schedule has 1,000 search updates, 1,000 precision updates, and a final
+evaluation without an optimizer update (2,001 plotted iterations). Search
+restores broad exploration and reduces its common SD multiplier from 1 to
+0.03. The search learning rate remains 1e-4 through the first 90%, then decays
+to 1e-5. Before precision starts, the last search update receives an extra
+38-design mean evaluation. The best full-bank RMS checkpoint is saved as
+`best_search.pt`, restored, and given fresh Adam momentum. Precision disables
+wide-phase samples, tapers the SD multiplier from 0.03 to 0.003 and learning
+rate from 1e-5 to 1e-6. There is no per-update acceptance/rejection rule.
+
+On Great Lakes:
+
+```bash
+cd ~/vcsel_lib
+git pull --ff-only origin updates
+bash scripts/submit_four_laser_topology_tests.sh
+```
+
+The launcher checks all four source checkpoints before submitting any job.
+Each job requests account `arrays0`, **32 CPUs, 64 GB and four days** on one
+standard node. The larger bank and two training stages need more headroom
+than the single-topology jobs. The requested time is a limit, not a measured
+runtime guarantee. Thirty-one workers simulate chunks of at most 32 cases,
+avoiding one very large trajectory allocation per worker. Jobs have no
+dependencies and can run concurrently when Slurm resources are available.
+
+`--dry-run` prints the four submissions. `--smoke-test` uses one search update,
+one precision update and the final evaluation. For a smaller launch check,
+combine it with `--actions-per-topology 8`; full runs default to 128. The
+launcher also accepts `--search-updates N`, `--precision-updates N` and
+`--checkpoint-root PATH`. For a custom starting checkpoint, run the Slurm file
+directly with `--span-ghz N --initial-checkpoint PATH`.
+
+Outputs are isolated under
+`rl/rl_api/runs/great_lakes/four_all38_fixed_<span>ghz/<jobid>/`.
+`current_designs.json` and `best_designs.json` contain all 38 matrices and
+individual metrics with stable topology IDs; `current_history.json` contains
+aggregate and pair-count summaries. `best.pt` is selected by mean RMS reward.
+`best_worst.pt` separately retains the smallest worst-topology phase RMS, with
+its matrices in `best_worst_designs.json`. Checkpoint selection does not change
+the training reward. The two-pane progress figure shows sampled/central RMS
+reward and median/worst topology errors, with a line marking the precision
+stage. All inference metrics concern the trained fixed detuning vector.
+
+The automatic Mac plot-sync script discovers the new filenames without adding
+flags or restarting its authenticated SSH session.
