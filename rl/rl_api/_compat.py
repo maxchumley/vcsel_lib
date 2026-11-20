@@ -50,6 +50,12 @@ class DensityControlledConfig(MirroredExplorationConfig):
 
 
 @dataclass
+class SymmetricDensityControlledConfig(DensityControlledConfig):
+    """Keep the density recipe and project both physical values reciprocally."""
+    symmetric_coupling_values: bool = True
+
+
+@dataclass
 class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
     """Four-laser reciprocal-value projection and the complete connected bank."""
     exhaustive_symmetric_topologies: bool = True
@@ -221,7 +227,9 @@ def make_backend_config(settings: dict):
     if converted.get('density_control', False):
         if config_class is not MirroredExplorationConfig:
             raise ValueError('Density control requires the mirrored exploration config')
-        config_class = DensityControlledConfig
+        config_class = (SymmetricDensityControlledConfig
+                        if converted.get('symmetric_coupling_values', False)
+                        else DensityControlledConfig)
     if converted.get('exhaustive_symmetric_topologies', False):
         if config_class is not MirroredExplorationConfig:
             raise ValueError('Exhaustive symmetry requires the supplied-topology mirrored recipe')

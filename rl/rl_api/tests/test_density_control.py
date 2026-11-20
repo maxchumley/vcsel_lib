@@ -12,6 +12,8 @@ from rl.rl_api.density_control import (DensityConditionedPolicy, decode_density_
     pair_counts, select_masks)
 from rl.rl_api.experiments import train_mirrored_delay_1000 as star
 from rl.rl_api.experiments import train_mirrored_symmetric_density_1000 as run
+from rl.rl_api.experiments import train_mirrored_symmetric_density_values_1000 as symmetric
+from rl.rl_api.experiments import train_mirrored_symmetric_density_values_zeroref_1000 as zero
 from rl.rl_api.models import build_policy
 from rl.rl_api.root_context import calibrate_budget_references
 
@@ -218,3 +220,102 @@ def test_density_training_validation_and_reloading(tmp_path,fake_physics,monkeyp
 def test_invalid_density_requests_are_rejected(fraction):
     with pytest.raises(ValueError,match=r'\[0,1\]'):
         pair_counts(5,fraction)
+
+
+def test_symmetric_density_recipes_only_change_values_reference_and_plot_names():
+    for recipe,phase in ((symmetric,'target_delay_residual'),(zero,'target_residual')):
+        before,after=asdict(run.CONFIG),asdict(recipe.CONFIG)
+        assert not before['model'].pop('symmetric_coupling_values')
+        assert after['model'].pop('symmetric_coupling_values')
+        before['model'].pop('phase_parameterization')
+        assert after['model'].pop('phase_parameterization')==phase
+        before['validation'].pop('progress_filename')
+        assert after['validation'].pop('progress_filename').endswith('progress.png')
+        assert before==after
+        assert recipe.INITIAL_CHECKPOINT is None
+        summary=recipe.CONFIG.summary()
+        assert summary['symmetric_masks'] and summary['symmetric_strengths'] and summary['symmetric_phases']
+        assert summary['simulations_per_iteration']==1400
+    assert len({r.RUN_NAME for r in (run,symmetric,zero)})==3
+    assert symmetric.CONFIG.validation.progress_filename!=zero.CONFIG.validation.progress_filename
+
+
+def test_zero_reference_only_removes_the_explicit_phase_rotation(tmp_path):
+    from rl.rl_api.models.policy import delay_phase_offsets
+    config=symmetric.CONFIG.to_backend(tmp_path/'reference')
+    no_reference=zero.CONFIG.to_backend(tmp_path/'zero')
+    policy=build_policy(config)
+    other=build_policy(no_reference)
+    other.load_state_dict(policy.state_dict())
+    features=engine.encode_context([[0.,.4,-.7]], [[-.9,-.1,1.2]],policy)
+    masks=torch.ones((1,6))
+    a=DensityConditionedPolicy(policy,[.5]).parameters_for_edges(features,topology_masks=masks)
+    b=DensityConditionedPolicy(other,[.5]).parameters_for_edges(features,topology_masks=masks)
+    torch.testing.assert_close(a[0][...,:6],b[0][...,:6],rtol=0,atol=0)
+    torch.testing.assert_close(a[1],b[1],rtol=0,atol=0)
+    offset=delay_phase_offsets(features,config).expand(-1,6)
+    assert offset.abs().min()>0.
+    torch.testing.assert_close(a[0][...,6:]-b[0][...,6:],offset)
+
+
+@pytest.mark.parametrize('recipe',[symmetric,zero],ids=['laser1','zero'])
+def test_density_values_symmetric_for_all_sizes_and_sampled_targets(tmp_path,recipe):
+    from rl.rl_api.density_control import prepare_density_size
+    torch.manual_seed(7)
+    config=recipe.CONFIG.to_backend(tmp_path)
+    policy=build_policy(config)
+    assert sum(p.numel() for p in policy.parameters())==sum(p.numel() for p in build_policy(run.CONFIG.to_backend(tmp_path)).parameters())
+    for size in range(3,10):
+        item=prepare_density_size(policy,config,np.random.default_rng(71),size,1)
+        assert np.any(item['targets']!=0.)
+        for matrix in (item['kappa'],item['phi']):
+            np.testing.assert_array_equal(matrix,matrix.swapaxes(-1,-2))
+        receiver,source=core.directed_link_indices(size)
+        graphs=np.zeros_like(item['kappa'],dtype=bool)
+        graphs[...,receiver,source]=item['gates'].numpy()
+        assert all(connected(g) for g in graphs[0])
+        np.testing.assert_array_equal(item['counts'],2*pair_counts(size,item['density_fractions']))
+        gradient=torch.autograd.grad(item['log_prob'][0,0],policy.edge_output.bias)[0]
+        assert torch.isfinite(gradient).all() and gradient.abs().sum()>0
+
+
+@pytest.mark.parametrize('recipe',[symmetric,zero],ids=['laser1','zero'])
+def test_symmetric_density_training_and_inference_roundtrip(tmp_path,fake_physics,recipe):
+    config=replace(recipe.CONFIG,sizes=(3,4),
+        sampling=replace(recipe.CONFIG.sampling,pairs_per_size=1,pairs_per_job=1),
+        optimization=replace(recipe.CONFIG.optimization,iterations=2,workers=1),
+        schedules=replace(recipe.CONFIG.schedules,ordinary_end=2,wide_end=2),
+        validation=replace(recipe.CONFIG.validation,pairs_per_size=5,plot_use_tex=False,notebook_display=False))
+    result=Experiment('symmetric-density',config=config,output_directory=tmp_path/'run').train(
+        live_plot=True,verify_reference=False)
+    for kappa,phi,_ in fake_physics:
+        np.testing.assert_array_equal(kappa,kappa.swapaxes(-1,-2))
+        np.testing.assert_array_equal(phi,phi.swapaxes(-1,-2))
+    payload=torch.load(result.checkpoint('final'),weights_only=False)
+    assert 'initialization' not in payload['sampling_recipe']
+    assert payload['sampling_recipe']['mode']=='density_controlled'
+    assert 'symmetric_values' in payload['sampling_recipe']
+    assert ('zero frequency' in payload['sampling_recipe']['phase_delay_reference'])==(recipe is zero)
+    model=CouplingModel.load(result.checkpoint('final'),device='cpu')
+    assert model.backend_config.symmetric_coupling_values
+    assert model.backend_config.phase_parameterization==recipe.CONFIG.model.phase_parameterization
+    context=Context([0.,.2,-.8,.7],[-2.,-.3,.5,2.])
+    designs=model.propose(context,density_fraction=None,count=10,seed=71)
+    np.testing.assert_array_equal(designs.coupling_strengths_per_ns,designs.coupling_strengths_per_ns.swapaxes(-1,-2))
+    np.testing.assert_array_equal(designs.coupling_phases_rad,designs.coupling_phases_rad.swapaxes(-1,-2))
+    assert (result.directory/recipe.CONFIG.validation.progress_filename).is_file()
+
+
+def test_symmetric_density_launcher_submits_two_distinct_recipes():
+    import shlex
+    import subprocess
+    from pathlib import Path
+    root=Path(__file__).resolve().parents[3]
+    script=root/'scripts/submit_symmetric_density_tests.sh'
+    result=subprocess.run(['bash',str(script),'--dry-run','--smoke-test'],check=True,capture_output=True,text=True)
+    commands=[shlex.split(line) for line in result.stdout.splitlines() if line.startswith('sbatch ')]
+    assert len(commands)==2
+    for command,name,recipe in zip(commands,('density_sym_ref','density_sym_zero'),(symmetric,zero)):
+        assert f'--job-name={name}' in command and '--smoke-test' in command
+        assert recipe.__name__.split('.')[-1] in command
+    subprocess.run(['bash','-n',str(script)],check=True)

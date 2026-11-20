@@ -394,12 +394,16 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
             topology_input='one density scalar; existing adjacency features uniformly K/(M*(M-1)/2)',
             selection='maximum sum-of-directed-strengths spanning tree, then highest remaining pairs',
             pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
-            phase_delay_reference='lowest mean-centered detuning (laser 1), unchanged from star run',
+            phase_delay_reference=('zero frequency reference; target offsets plus learned residual'
+                if config.phase_parameterization == 'target_residual' else
+                'lowest mean-centered detuning (laser 1), unchanged from star run'),
             baseline_scope='other mirrored action pairs in the same target/detuning/density context',
             reinforce_score='original all-to-all Gaussian actions, including removed strengths',
             physical_budget='unchanged predicted total, redistributed proportionally over selected directions',
             validation='fixed new target/detuning contexts with balanced density requests',
             objective='unchanged wrapped-RMS phase accuracy; no sparsity or budget penalty')
+        if getattr(config, 'symmetric_coupling_values', False):
+            sampling_recipe['symmetric_values'] = 'average reciprocal latent strengths and unwrapped phases before decoding'
     if getattr(config, 'exhaustive_symmetric_topologies', False):
         from .symmetric_topologies import topology_metadata
         sampling_recipe = dict(sampling_recipe or {}, mode='all_connected_symmetric',

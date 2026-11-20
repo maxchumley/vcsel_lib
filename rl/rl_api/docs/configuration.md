@@ -39,6 +39,7 @@ short interactive examples such as `Experiment("example")`.
 | `model` | `node_hidden_sizes`, `node_embedding_dim` | shared node encoder |
 | `model` | `message_hidden_size`, `message_passing_steps` | GNN message width/depth |
 | `model` | `edge_hidden_sizes` | shared continuous edge decoder; default `(128,128)` |
+| `model` | `symmetric_coupling_values` | density or exhaustive symmetric topology modes: average reciprocal latent strength and phase actions before physical decoding |
 | `model` | `normalize_incoming_by_degree` | normalize the decoder's incoming strengths by degree |
 | `model` | `softplus_strength_scale_per_ns`, `initial_budget_per_laser` | raw edge-strength scale and initial log-budget scale |
 | Native `phys` | `Tmax`, `dt`, `tau` | simulation duration, timestep, delay in seconds |
@@ -186,3 +187,40 @@ algorithm choices, and a small inactive legacy-compatibility block. This version
 does not expose switches for inactive DE teaching, learned gates, alternate
 curricula, or alternative objectives as supported public modes. Those require
 implementation/validation changes, rather than editing the historical JSON.
+
+## Matched density tests with symmetric values
+
+The original `train_mirrored_symmetric_density_1000` uses symmetric masks and
+independent directed coupling values. Two new recipes keep its architecture,
+fresh seed-7 initialization, sizes 3–9, random phase targets, 0–4 GHz span
+sampling, five density requests, eight mirrored actions and 1,000-iteration
+schedule. Both enforce symmetric physical strengths and phases with the
+existing reciprocal latent-action projection, before ranking and pruning.
+The score remains the original directed all-to-all Gaussian score, including
+pruned strengths. No shared-pair score, teacher, precision stage or additional
+simulation is introduced. Training still uses 1,400 simulations per iteration.
+
+| Recipe | Coupling-phase frequency reference | Job | Progress image |
+|---|---|---|---|
+| `train_mirrored_symmetric_density_values_1000` | Lowest mean-centered detuning, laser 1 | `density_sym_ref` | `density_sym_ref_progress.png` |
+| `train_mirrored_symmetric_density_values_zeroref_1000` | Zero (`target_residual`) | `density_sym_zero` | `density_sym_zero_progress.png` |
+
+Zero reference removes the explicit delay-frequency offset from the phase
+prediction. Target offsets and learned residuals remain, and physical
+reciprocal projection enforces the value symmetry in both recipes. This does
+not change the simulated LK equations or constrain the locked frequency.
+
+On Great Lakes, submit both independent jobs with:
+
+```bash
+cd ~/vcsel_lib
+git pull --ff-only origin updates
+bash scripts/submit_symmetric_density_tests.sh
+```
+
+Each requests 16 CPUs, 64 GB and two days using `arrays0`, with 14 simulation
+workers. `--smoke-test` runs two iterations, and `--dry-run` prints commands.
+Separate run folders under `rl/rl_api/runs/great_lakes/` and separate image
+names prevent collisions. Automatic Mac plot sync discovers both runs.
+Run either recipe directly in a local notebook or as a Python module to use
+the original local plotting settings. Neither recipe loads an old checkpoint.

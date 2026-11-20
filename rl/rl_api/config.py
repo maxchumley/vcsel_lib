@@ -343,20 +343,22 @@ class TrainingConfig:
                     or self.phase_correction.enabled):
                 raise ValueError('Exhaustive symmetric training requires four lasers, 38 supplied masks, '
                                  'in-phase targets, symmetric values and mirrored per_target density-band learning')
-        elif self.model.symmetric_coupling_values or self.sampling.target_mode != 'random':
-            raise ValueError('Symmetric values and in-phase sampling currently use all_connected_symmetric')
+        elif (self.sampling.target_mode != 'random'
+              or (self.model.symmetric_coupling_values and self.topology.mode != 'density')):
+            raise ValueError('Symmetric values require density or all_connected_symmetric training; '
+                             'in-phase sampling requires all_connected_symmetric')
         if self.sampling.symmetric_action_score != 'directed' and not exhaustive:
             raise ValueError('Shared-pair scoring requires all_connected_symmetric training')
         if self.topology.mode == 'density':
             if (self.model.encode_root
-                    or self.model.phase_parameterization != 'target_delay_residual'
+                    or self.model.phase_parameterization not in {'target_delay_residual', 'target_residual'}
                     or self.topology.backbone != 'rooted_star'
                     or self.topology.root_index is not None
                     or self.sampling.topology_sampling_mode != 'band_random'
                     or self.sampling.fixed_topology_bank_seed is not None
                     or self.sampling.action_sampling != 'mirrored'
                     or self.phase_correction.enabled):
-                raise ValueError('Density control requires the mirrored target_delay_residual recipe, '
+                raise ValueError('Density control requires a mirrored target residual phase recipe, '
                                  'band_random density requests, and no root encoding, graph bank or teacher')
         if (self.model.phase_parameterization == 'target_root_delay_residual'
                 and self.topology.backbone != 'random_reachable'):
@@ -457,6 +459,8 @@ class TrainingConfig:
             settings['encode_root'] = True
         if self.topology.mode == 'density':
             settings.update(density_control=True, topology_star_backbone=False)
+            if m.symmetric_coupling_values:
+                settings['symmetric_coupling_values'] = True
         if self.topology.backbone == 'all_connected_symmetric':
             settings.update(exhaustive_symmetric_topologies=True, symmetric_coupling_values=True,
                             in_phase_targets=True, topology_star_backbone=False,
@@ -547,7 +551,8 @@ class TrainingConfig:
                 topology_input='density fraction only; computational messages remain all-to-all',
                 density_features='reuse the two adjacency slots per pair with uniform retained-pair density',
                 pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
-                symmetric_masks=True, symmetric_strengths=False, symmetric_phases=False,
+                symmetric_masks=True, symmetric_strengths=self.model.symmetric_coupling_values,
+                symmetric_phases=self.model.symmetric_coupling_values,
                 mask_reuse='selected separately from each sampled strength matrix',
                 sampled_masks_per_size=s.pairs_per_size*candidates,
                 target_detuning_contexts_total=len(self.sizes)*s.pairs_per_size,
