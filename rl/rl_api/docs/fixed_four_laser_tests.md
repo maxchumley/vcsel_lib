@@ -122,10 +122,10 @@ symmetric runs and figures separate. Add `--smoke-test` for a two-iteration chec
 On your Mac:
 
 ```bash
-python3 scripts/sync_great_lakes_plot.py --fixed-context-tests
+python3 scripts/sync_great_lakes_plot.py
 ```
 
-This copies all four uniquely named images every ten seconds into the existing
+This automatically discovers all run-level progress images every ten seconds, including new tests, and copies them into the existing
 `rl/rl_api/runs/great_lakes_live/four_laser_symmetric` viewer directory. Each
 image has two panes: sampled/mean RMS rewards, and mean-design phase error with
 the 3-degree target. Images update every ten iterations, plus the first and last.
@@ -133,18 +133,18 @@ The sampled curve averages the 128 exploratory designs. The mean-design curve
 measures the central prediction without exploration noise and is monitored
 separately from the sampled-action gradient. Plot titles show the direction count.
 The existing viewer and Cloudflare tunnel do not need to restart.
-The same live-sync command and image names are retained. New Slurm job IDs
+Local image names include the run name to avoid collisions. New Slurm job IDs
 create new run directories; all earlier checkpoints remain in theirs.
 
-To sync both the four symmetric plots and the four asymmetric plots, stop the
-existing Mac sync command with Ctrl+C and restart it with:
+Automatic sync discovers both the four symmetric plots and the four asymmetric
+plots. Leave it running when starting another test:
 
 ```bash
-python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric
+python3 scripts/sync_great_lakes_plot.py
 ```
 
-All eight filenames are distinct and use the same viewer directory. The viewer
-and Cloudflare tunnel can continue running.
+All plots use the same viewer directory. The viewer and Cloudflare tunnel can
+continue running. The old suite-selection flags remain available for a limited view.
 
 ## Symmetric 4 GHz precision continuation
 
@@ -191,9 +191,9 @@ optimizer initialization, exploration scales and learning rates are recorded.
 `best.pt` retains the best measured RMS reward from the continuation, including
 that initial design. `final.pt` remains the actual last measured model.
 
-To show this plot alongside the eight prior fixed-context plots, restart the
-Mac plot-sync command with:
+The automatic Mac sync command discovers this precision plot alongside the
+prior fixed-context plots without restarting or changing flags:
 
 ```bash
-python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric --include-precision
+python3 scripts/sync_great_lakes_plot.py
 ```

@@ -37,4 +37,4 @@ else
     job=$("${command[@]}")
     echo "Submitted four_4GHz_precision: $job"
 fi
-echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric --include-precision'
+echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py (leave running; new tests appear automatically)'

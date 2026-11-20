@@ -135,36 +135,51 @@ The existing Cloudflare viewer serves folders on the Mac. Its temporary public
 URL can change without affecting synchronization: mirror the cluster PNG into
 a watched local folder, and keep the viewer/tunnel running normally.
 
-Run a one-file transfer check in a **Mac terminal**, not in the SSH terminal:
+Start automatic synchronization in a **Mac terminal**, not in the SSH terminal:
 
 ```bash
 cd ~/Documents/GitHub/vcsel_lib
-python3 scripts/sync_great_lakes_plot.py --once
-```
-
-Authenticate to Great Lakes normally when prompted. For continuous updates:
-
-```bash
 python3 scripts/sync_great_lakes_plot.py
 ```
 
-This opens one private persistent SSH connection, checks for a changed PNG
-every 10 seconds, and copies only `current_training_progress.png` with rsync.
-SSH authentication is reused across checks; connection failure stops the sync
-instead of repeatedly prompting. Ctrl+C stops only this sync connection.
-Training and the viewer remain running. No remote files, packages or Slurm
-settings are changed. These commands do not restart the training job.
+Authenticate to Great Lakes normally when prompted and leave this command
+running. Every ten seconds it discovers run-level progress PNGs under
+`~/vcsel_lib/rl/rl_api/runs/great_lakes/`, including newly started experiments.
+One incremental rsync transfers the discovered images over the same private
+SSH connection. **Starting a new test does not require restarting sync or
+another MFA login.** No suite flags or new run names are needed.
 
-The default remote source is the four-laser run's stable parent-folder image:
+For a one-time transfer check instead:
 
-```text
-~/vcsel_lib/rl/rl_api/runs/great_lakes/<four-laser RUN_NAME>/current_training_progress.png
+```bash
+python3 scripts/sync_great_lakes_plot.py --once
 ```
 
-Use `--job-id JOBID` to select one exact job instead, or `--run RUN_NAME` and
-`--repository REMOTE_PATH` for another output location. `--dry-run` shows the
-paths without connecting. The normal SSH host/configuration is used; `--host`
-can override it. No passwords are stored in this helper.
+Discovery reads only the live parent-folder progress images, not duplicate
+images inside individual job folders, checkpoints, or training histories:
+
+```text
+~/vcsel_lib/rl/rl_api/runs/great_lakes/<RUN_NAME>/*progress*.png
+```
+
+Local image names are `<RUN_NAME>__<filename>.png`, so different experiments
+using the generic `current_training_progress.png` cannot overwrite one another.
+Updates replace complete files atomically. Existing mirror images are retained.
+
+To watch only selected experiments, the existing `--run RUN_NAME`,
+`--symmetric-tests` and `--fixed-context-tests` options remain available.
+`--job-id JOBID` selects one exact job; `--filename IMAGE.png` selects its image.
+Without `--run`, these two options use the original four-laser run name.
+`--repository REMOTE_PATH` and `--host HOST` select another repository or server.
+`--dry-run` shows the discovery pattern or explicit paths without connecting.
+
+An already-running copy of the older script needs one restart to load automatic
+discovery. After that, leave the automatic command running for new tests.
+The connection must remain alive: disconnecting, closing the Mac, or a server
+session timeout can still require a new login. Authentication is never bypassed
+or stored. Connection failure stops sync instead of repeatedly prompting.
+Ctrl+C stops only this sync connection; training and the viewer remain running.
+No remote files, packages or Slurm settings are changed.
 
 The default local mirror folder is separate from the local run's plot:
 
@@ -243,19 +258,21 @@ names are `four_sym_A_pairscore_laser1_1k`, `four_sym_B_directed_meanref_1k`, an
 `four_sym_C_pairscore_meanref_1k`. Their uniquely named PNGs are saved inside
 each job directory and atomically copied to its run's parent folder.
 
-On the **Mac**, replace the one-image sync command with:
+The automatic **Mac** sync picks up all three plots as soon as they are written.
+If it is not already running, start it with:
 
 ```bash
-python3 scripts/sync_great_lakes_plot.py --symmetric-tests
+python3 scripts/sync_great_lakes_plot.py
 ```
 
-It copies all three uniquely named images into the existing watched folder,
+It copies the discovered images into the existing watched folder,
 `rl/rl_api/runs/great_lakes_live/four_laser_symmetric/`, through one authenticated
 SSH connection, checking every ten seconds. A queued job's missing PNG does not
 prevent the other two from syncing. Use the existing **Great Lakes Four-Laser
 RL** viewer source; the site/tunnel does not need restarting. Images update at
 iteration 1, every ten iterations and the final iteration. A single variant
 can also be mirrored with `--run RUN_NAME --filename PROGRESS_FILENAME`.
+Use `--symmetric-tests` to limit synchronization to these three plots.
 
 The editable variant modules are
 `experiments/train_four_laser_symmetric_pairscore_1000.py`,

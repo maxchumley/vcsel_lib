@@ -52,8 +52,4 @@ for span in 1 2 3 4; do
     fi
 done
 echo 'Monitor: squeue -u "$USER" -o "%.18i %.24j %.9T %.10M %.20R"'
-if "$asymmetric"; then
-    echo 'Mac plot sync (both suites): python3 scripts/sync_great_lakes_plot.py --fixed-context-tests --include-asymmetric'
-else
-    echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py --fixed-context-tests'
-fi
+echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py (leave running; new tests appear automatically)'

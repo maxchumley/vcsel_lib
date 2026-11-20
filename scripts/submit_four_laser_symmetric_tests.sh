@@ -49,4 +49,4 @@ for test in \
 done
 
 echo 'Monitor names: squeue -u "$USER" -o "%.18i %.24j %.9T %.10M %.20R"'
-echo 'On your Mac, sync the three images: python3 scripts/sync_great_lakes_plot.py --symmetric-tests'
+echo 'Mac plot sync: python3 scripts/sync_great_lakes_plot.py (leave running; new tests appear automatically)'

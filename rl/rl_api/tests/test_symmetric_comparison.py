@@ -2,6 +2,7 @@
 from dataclasses import asdict, replace
 from importlib import import_module, util
 from pathlib import Path
+import json
 import shlex
 import subprocess
 import sys
@@ -171,3 +172,78 @@ def test_three_named_submissions_match_recipes_and_sync_paths(tmp_path):
     assert len(list(tmp_path.glob('*.png'))) == 3
     with patch.object(sync.subprocess,'run',side_effect=AssertionError('dry run connects')):
         assert sync.main(['--symmetric-tests','--dry-run']) == 0
+
+
+def test_auto_sync_default_and_remote_discovery_ignore_job_copies(tmp_path):
+    sync=sync_module()
+    assert sync.options([]).auto_discover
+    assert sync.options(['--all-runs']).auto_discover
+    assert not sync.options(['--run','one_run']).auto_discover
+    assert not sync.options(['--fixed-context-tests']).auto_discover
+    for args in (['--all-runs','--job-id','123'],['--run','']):
+        with pytest.raises(SystemExit):
+            sync.options(args)
+    run=tmp_path/'test_run';run.mkdir()
+    (run/'current_training_progress.png').write_bytes(b'plot')
+    (run/'final_couplings.png').write_bytes(b'not a training plot')
+    job=run/'123';job.mkdir();(job/'current_training_progress.png').write_bytes(b'duplicate')
+    (run/'linked_progress.png').symlink_to(run/'current_training_progress.png')
+    command=[sys.executable,'-c',sync.DISCOVERY_SCRIPT,str(tmp_path)]
+    output=subprocess.run(command,capture_output=True,text=True,check=True).stdout
+    assert json.loads(output.partition('=')[2]) == ['test_run/current_training_progress.png']
+    new=tmp_path/'new_test';new.mkdir();(new/'new_progress.png').write_bytes(b'new')
+    output=subprocess.run(command,capture_output=True,text=True,check=True).stdout
+    assert len(json.loads(output.partition('=')[2])) == 2
+
+
+def test_new_runs_are_synced_without_reauthenticating_or_overwriting(tmp_path,monkeypatch):
+    import shutil
+    sync=sync_module()
+    remote=tmp_path/'remote';remote.mkdir()
+    first=remote/'first';first.mkdir();(first/'current_training_progress.png').write_bytes(b'first')
+    destination=tmp_path/'viewer'
+    calls=[];polls=[]
+    original_run=subprocess.run
+    def fake_run(command,**kwargs):
+        calls.append(command)
+        if command[0]=='ssh' and '-c' in command[-1]:
+            output=original_run([sys.executable,'-c',sync.DISCOVERY_SCRIPT,str(remote)],
+                                capture_output=True,text=True,check=True).stdout
+            return subprocess.CompletedProcess(command,0,stdout='login banner\n'+output,stderr='')
+        if command[0]=='rsync':
+            assert '--files-from=-' in command and '--from0' in command
+            assert 'BatchMode=yes' in command[command.index('-e')+1]
+            for name in kwargs['input'].split('\0'):
+                if name:
+                    target=Path(command[-1])/name;target.parent.mkdir(parents=True,exist_ok=True)
+                    shutil.copy2(remote/name,target)
+        return subprocess.CompletedProcess(command,0,stdout='',stderr='')
+    def between_polls(seconds):
+        polls.append(seconds)
+        if len(polls)==1:
+            second=remote/'second';second.mkdir()
+            (second/'current_training_progress.png').write_bytes(b'second')
+        else:
+            raise KeyboardInterrupt
+    monkeypatch.setattr(sync.subprocess,'run',fake_run)
+    monkeypatch.setattr(sync.shutil,'which',lambda name:'/usr/bin/'+name)
+    monkeypatch.setattr(sync.time,'sleep',between_polls)
+    assert sync.main(['--destination',str(destination)]) == 0
+    assert (destination/'first__current_training_progress.png').read_bytes()==b'first'
+    assert (destination/'second__current_training_progress.png').read_bytes()==b'second'
+    assert sum('-fN' in command for command in calls)==1
+    assert sum(command[0]=='rsync' for command in calls)==2
+    assert polls==[10.,10.]
+    assert not list(destination.glob('*.tmp'))
+
+
+def test_remote_discovery_rejects_paths_outside_the_live_run_folder():
+    sync=sync_module()
+    args=sync.options([])
+    for bad in ('../private_progress.png','/private_progress.png','one/two/progress.png'):
+        def fake_run(command,**kwargs):
+            return subprocess.CompletedProcess(command,0,
+                stdout='VCSEL_PROGRESS_JSON='+json.dumps([bad])+'\n',stderr='')
+        with patch.object(sync.subprocess,'run',side_effect=fake_run):
+            with pytest.raises(RuntimeError,match='Invalid remote progress-image path'):
+                sync.discover_plots(args,'socket')
