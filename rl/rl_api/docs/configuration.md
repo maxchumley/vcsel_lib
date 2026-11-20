@@ -228,5 +228,7 @@ Already submitted jobs keep their original allocation; these changes apply
 when submitting new jobs. `--smoke-test` runs two iterations, and `--dry-run` prints commands.
 Separate run folders under `rl/rl_api/runs/great_lakes/` and separate image
 names prevent collisions. Automatic Mac plot sync discovers both runs.
+Figures update at iteration 1, every 10 iterations and the final iteration.
+Validation remains at iteration 1, every 50 iterations and the final iteration.
 Run either recipe directly in a local notebook or as a Python module to use
 the original local plotting settings. Neither recipe loads an old checkpoint.

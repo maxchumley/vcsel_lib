@@ -229,6 +229,8 @@ def test_symmetric_density_recipes_only_change_values_reference_and_plot_names()
         assert after['model'].pop('symmetric_coupling_values')
         before['model'].pop('phase_parameterization')
         assert after['model'].pop('phase_parameterization')==phase
+        assert before['validation'].pop('plot_every')==1
+        assert after['validation'].pop('plot_every')==10
         before['validation'].pop('progress_filename')
         assert after['validation'].pop('progress_filename').endswith('progress.png')
         assert before==after
@@ -236,6 +238,7 @@ def test_symmetric_density_recipes_only_change_values_reference_and_plot_names()
         summary=recipe.CONFIG.summary()
         assert summary['symmetric_masks'] and summary['symmetric_strengths'] and summary['symmetric_phases']
         assert summary['simulations_per_iteration']==1400
+        assert recipe.CONFIG.to_backend('.').plot_update_interval==10
     assert len({r.RUN_NAME for r in (run,symmetric,zero)})==3
     assert symmetric.CONFIG.validation.progress_filename!=zero.CONFIG.validation.progress_filename
 
