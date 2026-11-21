@@ -139,6 +139,31 @@ class AnnealedRootAwarePhasePolicy(ScaledExploration, RootAwareDelayResidualPhas
     """The existing SD schedule with a root-aware node encoder."""
 
 
+class ReciprocalPairPolicy(ScaledExploration, engine.BernoulliSparseGNNPolicy):
+    """Use the canonical orientation's edge head once for each unordered pair.
+
+    The lower/higher detuning indices choose a consistent orientation. Both
+    directions use its distribution; the opposite head prediction is unused.
+    Keep the existing head weights/layers and all target inputs. Antisymmetric
+    target offsets are absent, as they canceled in the previous projection.
+    """
+    def parameters_for_edges(self, features, **options):
+        from ..reciprocal_pairs import pair_layout, expand_pair_actions
+        outputs = super().parameters_for_edges(features, **options)
+        canonical, expansion, _ = pair_layout(features.shape[1], features.device)
+        edges = outputs[0].shape[-1] // 2
+        columns = torch.cat((canonical, canonical + edges))
+        mean = outputs[0][:, columns]
+        pairs = len(canonical)
+        if self.config.phase_parameterization == 'target_delay_residual':
+            mean = torch.cat((mean[:, :pairs], mean[:, pairs:] +
+                              delay_phase_offsets(features, self.config)), dim=-1)
+        # Match the executed SD of averaging two equally wide directed draws.
+        log_std = outputs[1][:, columns] - .5 * math.log(2.)
+        return (expand_pair_actions(mean, expansion),
+                expand_pair_actions(log_std, expansion), *outputs[2:])
+
+
 def build_policy(config):
     """Select the recorded phase convention, preserving all parameter keys/order.
 
@@ -146,6 +171,10 @@ def build_policy(config):
     would alter model/optimizer state layout during a reproducibility refactor.
     """
     mode = getattr(config,'phase_parameterization','absolute')
+    if getattr(config, 'reciprocal_pair_actions', False):
+        if mode not in {'target_residual', 'target_delay_residual'}:
+            raise ValueError('Reciprocal pair policy requires a zero or laser-1 reference')
+        return ReciprocalPairPolicy(config).to(config.device)
     classes = {
         'absolute': engine.BernoulliSparseGNNPolicy,
         'target_residual': TargetResidualPhasePolicy,

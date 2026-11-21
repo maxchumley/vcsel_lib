@@ -42,11 +42,12 @@ def exploration_state(policy):
         scale = float(policy.config.exploration_std_scale)
         state.update(action_std_scale=scale,
             effective_nominal_budget_std=scale*state['nominal_budget_std'],
-            extra_wide_phase_sd_deg=math.degrees(policy.config.phase_exploration_start_std)*scale)
+            extra_wide_phase_sd_deg=math.degrees(policy.config.phase_exploration_start_std)*scale
+                / (math.sqrt(2.) if getattr(policy.config, 'reciprocal_pair_actions', False) else 1.))
     return state
 
 
-def sample_annealed_candidates(policy, features, masks, *, mirrored=False):
+def sample_annealed_candidates(policy, features, masks, *, mirrored=False, continuous_mean=False):
     """Sample the opt-in full-run taper, including extra-wide phase actions.
 
     The policy scales ordinary edge/budget SDs. Extra-wide phase SD gets the
@@ -65,13 +66,25 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False):
     budget_mean, budget_log_std = policy.budget_parameters(repeated, pooled_states=pooled)
     budget_mean = budget_mean.reshape(batch, candidates)
     scale = policy.config.exploration_std_scale
-    if scale == 0.:
+    if scale == 0. or continuous_mean:
         return mean.clone(), budget_mean.clone(), features.new_zeros((batch, candidates))
     std = log_std.reshape_as(mean).exp()
+    pair_mode = getattr(policy.config, 'reciprocal_pair_actions', False)
+    score_masks = masks
+    if pair_mode:
+        from .reciprocal_pairs import pair_layout, check_shared_actions
+        canonical, expansion, _ = pair_layout(features.shape[1], features.device)
+        check_shared_actions(mean, masks, features.shape[1])
+        columns = torch.cat((canonical, canonical + edges))
+        mean, std = mean[..., columns], std[..., columns]
+        score_masks = masks[..., canonical]
+        edges = len(canonical)
     slots = torch.arange(candidates, device=features.device) % policy.config.actions_per_topology
     wide_count = round(policy.config.actions_per_topology*policy.config.phase_exploration_fraction)
     extra = (slots < wide_count).to(std.dtype)[None, :, None]
     extra = extra * policy.config.phase_exploration_start_std * scale
+    if pair_mode:
+        extra = extra / math.sqrt(2.)
     std = torch.cat((std[..., :edges], torch.sqrt(std[..., edges:].square()+extra.square())), dim=-1)
     if mirrored:
         per_topology = policy.config.actions_per_topology
@@ -87,11 +100,11 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False):
     actions = normal.sample()
     if mirrored:
         actions = mirror_pairs(actions, mean)
-    if getattr(policy.config, 'symmetric_action_score', 'directed') == 'shared_pair':
+    if not pair_mode and getattr(policy.config, 'symmetric_action_score', 'directed') == 'shared_pair':
         from .symmetric_topologies import reciprocal_normal_log_prob
         log_prob = reciprocal_normal_log_prob(actions, mean, std, masks, features.shape[1])
     else:
-        log_prob = (normal.log_prob(actions)*torch.cat((masks, masks), dim=-1)).sum(dim=-1)
+        log_prob = (normal.log_prob(actions)*torch.cat((score_masks, score_masks), dim=-1)).sum(dim=-1)
     budget_std = budget_log_std.reshape(batch, candidates).exp()
     if mirrored:
         budget_mean = shared_pair_parameters(budget_mean)
@@ -100,6 +113,9 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False):
     budget_actions = budget_normal.sample()
     if mirrored:
         budget_actions = mirror_pairs(budget_actions, budget_mean)
+    if pair_mode:
+        from .reciprocal_pairs import expand_pair_actions
+        actions = expand_pair_actions(actions, expansion)
     return actions, budget_actions, log_prob+budget_normal.log_prob(budget_actions)
 
 

@@ -56,6 +56,12 @@ class SymmetricDensityControlledConfig(DensityControlledConfig):
 
 
 @dataclass
+class ReciprocalPairDensityConfig(SymmetricDensityControlledConfig):
+    """One sampled strength/phase per reciprocal pair, without projection."""
+    reciprocal_pair_actions: bool = True
+
+
+@dataclass
 class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
     """Four-laser reciprocal-value projection and the complete connected bank."""
     exhaustive_symmetric_topologies: bool = True
@@ -230,6 +236,10 @@ def make_backend_config(settings: dict):
         config_class = (SymmetricDensityControlledConfig
                         if converted.get('symmetric_coupling_values', False)
                         else DensityControlledConfig)
+    if converted.get('reciprocal_pair_actions', False):
+        if config_class is not SymmetricDensityControlledConfig:
+            raise ValueError('Reciprocal pair actions require symmetric density control')
+        config_class = ReciprocalPairDensityConfig
     if converted.get('exhaustive_symmetric_topologies', False):
         if config_class is not MirroredExplorationConfig:
             raise ValueError('Exhaustive symmetry requires the supplied-topology mirrored recipe')

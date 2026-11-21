@@ -139,12 +139,21 @@ def prepare_density_size(policy, config, rng, size, pair_count):
         roots=None, density_fractions=fractions, results=[])
 
 
+def density_candidates(policy, features, masks, *, continuous_mean=False):
+    if getattr(policy.config, 'reciprocal_pair_actions', False):
+        from .exploration import sample_annealed_candidates
+        return sample_annealed_candidates(policy, features, masks,
+                                           continuous_mean=continuous_mean)
+    return engine.sample_topology_conditioned_candidates(
+        policy, features, masks, continuous_mean=continuous_mean)
+
+
 def validation_actions(policy, features, config, seed):
     """One fixed density request per held-out context, balanced across five slots."""
     count = len(features)
     groups = density_requests((count+4)//5, np.random.default_rng(seed)).reshape(-1)[:count, None]
     dense = features.new_ones((count, 1, config.n_lasers*(config.n_lasers-1)))
-    actions, budget, _ = engine.sample_topology_conditioned_candidates(
+    actions, budget, _ = density_candidates(
         DensityConditionedPolicy(policy, groups), features, dense, continuous_mean=True)
     _, decoded = decode_density_actions(actions, budget, groups, config)
     return decoded
@@ -172,7 +181,7 @@ def infer_density_designs(policy, context, config, fractions, count, continuous_
     with torch.random.fork_rng(devices=[]) if seed is not None else nullcontext(), torch.inference_mode():
         if seed is not None:
             torch.manual_seed(seed)
-        actions, budget, _ = engine.sample_topology_conditioned_candidates(
+        actions, budget, _ = density_candidates(
             DensityConditionedPolicy(policy, values), features, dense,
             continuous_mean=continuous_mean or config.exploration_std_scale == 0.)
         masks, decoded = decode_density_actions(actions, budget, values[None], config)

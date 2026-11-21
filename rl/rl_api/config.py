@@ -29,8 +29,13 @@ class ModelConfig:
     phase_parameterization: str = "absolute"
     encode_root: bool = False
     symmetric_coupling_values: bool = False
+    reciprocal_pair_actions: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.reciprocal_pair_actions, bool):
+            raise ValueError("reciprocal_pair_actions must be True or False")
+        if self.reciprocal_pair_actions and not self.symmetric_coupling_values:
+            raise ValueError("Reciprocal pair actions require symmetric coupling values")
         if not isinstance(self.encode_root, bool):
             raise ValueError("encode_root must be True or False")
         if not isinstance(self.symmetric_coupling_values, bool):
@@ -328,6 +333,8 @@ class TrainingConfig:
                     or self.sampling.topologies_per_pair != 5
                     or self.sampling.reuse_masks_across_pairs):
                 raise ValueError("Fixed topology banks require five random_reachable band_random masks")
+        if self.model.reciprocal_pair_actions and self.topology.mode != 'density':
+            raise ValueError('Reciprocal pair actions currently require density training')
         exhaustive = self.topology.backbone == 'all_connected_symmetric'
         if exhaustive:
             if (self.sizes != (4,) or self.topology.mode != 'provided'
@@ -461,6 +468,8 @@ class TrainingConfig:
             settings.update(density_control=True, topology_star_backbone=False)
             if m.symmetric_coupling_values:
                 settings['symmetric_coupling_values'] = True
+            if m.reciprocal_pair_actions:
+                settings['reciprocal_pair_actions'] = True
         if self.topology.backbone == 'all_connected_symmetric':
             settings.update(exhaustive_symmetric_topologies=True, symmetric_coupling_values=True,
                             in_phase_targets=True, topology_star_backbone=False,
@@ -553,6 +562,7 @@ class TrainingConfig:
                 pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
                 symmetric_masks=True, symmetric_strengths=self.model.symmetric_coupling_values,
                 symmetric_phases=self.model.symmetric_coupling_values,
+                reciprocal_pair_actions=self.model.reciprocal_pair_actions,
                 mask_reuse='selected separately from each sampled strength matrix',
                 sampled_masks_per_size=s.pairs_per_size*candidates,
                 target_detuning_contexts_total=len(self.sizes)*s.pairs_per_size,

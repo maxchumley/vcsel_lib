@@ -404,6 +404,15 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
             objective='unchanged wrapped-RMS phase accuracy; no sparsity or budget penalty')
         if getattr(config, 'symmetric_coupling_values', False):
             sampling_recipe['symmetric_values'] = 'average reciprocal latent strengths and unwrapped phases before decoding'
+        if getattr(config, 'reciprocal_pair_actions', False):
+            sampling_recipe.update(
+                symmetric_values='one canonical pair strength and phase sample copied to both directions; no averaging',
+                reinforce_score='one Gaussian strength/phase score per unordered pair, including pruned pairs',
+                pair_orientation='receiver index below source index in sorted detuning order',
+                pair_exploration='directed head SD and extra-wide phase SD divided by sqrt(2)',
+                phase_delay_reference=('zero plus learned pair residual'
+                    if config.phase_parameterization == 'target_residual' else
+                    'lowest mean-centered detuning (laser 1) plus learned pair residual'))
     if getattr(config, 'exhaustive_symmetric_topologies', False):
         from .symmetric_topologies import topology_metadata
         sampling_recipe = dict(sampling_recipe or {}, mode='all_connected_symmetric',
