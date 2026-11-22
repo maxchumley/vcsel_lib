@@ -50,6 +50,17 @@ class DensityControlledConfig(MirroredExplorationConfig):
 
 
 @dataclass
+class SymmetryRefinementDensityConfig(DensityControlledConfig):
+    """Checkpointed continuous projection used by the refinement runner."""
+    coupling_symmetry_fraction: float = 0.0
+
+    def __post_init__(self):
+        super().__post_init__()
+        if not 0. <= self.coupling_symmetry_fraction <= 1.:
+            raise ValueError('coupling_symmetry_fraction must be in [0,1]')
+
+
+@dataclass
 class SymmetricDensityControlledConfig(DensityControlledConfig):
     """Keep the density recipe and project both physical values reciprocally."""
     symmetric_coupling_values: bool = True
@@ -236,6 +247,10 @@ def make_backend_config(settings: dict):
         config_class = (SymmetricDensityControlledConfig
                         if converted.get('symmetric_coupling_values', False)
                         else DensityControlledConfig)
+    if 'coupling_symmetry_fraction' in converted:
+        if config_class is not DensityControlledConfig:
+            raise ValueError('Gradual symmetry requires an untied density policy')
+        config_class = SymmetryRefinementDensityConfig
     if converted.get('reciprocal_pair_actions', False):
         if config_class is not SymmetricDensityControlledConfig:
             raise ValueError('Reciprocal pair actions require symmetric density control')

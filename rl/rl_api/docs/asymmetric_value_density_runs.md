@@ -1,5 +1,10 @@
 # Symmetric density topologies with asymmetric coupling values
 
+**Superseded launcher:** the user replaced these two fresh runs with the warm-started
+[symmetry refinement](density_symmetry_refinement.md). The old launcher now forwards
+to that single refinement. The recipes below remain available through `train_batch`
+for reproducibility, but this launcher no longer submits them.
+
 These two fresh recipes copy the last reciprocal-pair density runs, disabling
 only `ModelConfig.symmetric_coupling_values` and `reciprocal_pair_actions`.
 Each selected reciprocal pair still enables both directions. Directed strength
@@ -37,13 +42,13 @@ requested density. Surviving directed strengths are normalized proportionally
 to the predicted total budget. Both directions remain enabled even when their
 values differ. Symmetric connectivity therefore does not impose value symmetry.
 
-Submit both on Great Lakes:
+The superseded submission command now starts the replacement refinement:
 
 ```sh
 git pull --ff-only origin updates
 bash scripts/submit_asymmetric_value_density_tests.sh
 ```
 
-The launcher retains 32 CPUs, 31 workers, 64 GB and seven days per independent
+The replacement retains 32 CPUs, 31 workers, 64 GB and seven days for its single
 job, with five contexts × eight actions vectorized per worker task. Add
 `--dry-run` to preview or `--smoke-test` to run two iterations.

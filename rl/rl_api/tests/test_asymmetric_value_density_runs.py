@@ -89,15 +89,11 @@ def test_training_and_saved_model_use_asymmetric_values(tmp_path,fake_physics,re
     assert (result.directory/recipe.CONFIG.validation.progress_filename).is_file()
 
 
-def test_launcher_names_and_resources():
+def test_superseded_launcher_routes_to_warm_refinement():
     script=Path(__file__).resolve().parents[3]/'scripts/submit_asymmetric_value_density_tests.sh'
     subprocess.run(['bash','-n',str(script)],check=True)
     output=subprocess.run(['bash',str(script),'--dry-run','--smoke-test'],check=True,capture_output=True,text=True).stdout
     commands=[shlex.split(line) for line in output.splitlines() if line.startswith('sbatch ')]
-    assert len(commands)==2
-    for cmd,name,recipe in zip(commands,('density_asym_ref','density_asym_zero'),
-            ('train_mirrored_density_asymmetric_values_1000','train_mirrored_density_asymmetric_values_zeroref_1000')):
-        assert '--job-name='+name in cmd and recipe in cmd and '--time=7-00:00:00' in cmd
-        assert '--cpus-per-task=32' in cmd and cmd[cmd.index('--workers')+1]=='31'
-        assert cmd[cmd.index('--pairs-per-job')+1]=='5' and cmd[cmd.index('--actions-per-job')+1]=='8'
-        assert '--smoke-test' in cmd
+    assert len(commands)==1
+    assert 'scripts/train_density_symmetry_refinement.slurm' in commands[0]
+    assert '--initial-checkpoint' in commands[0] and '--smoke-test' in commands[0]

@@ -51,7 +51,25 @@ def apply_root_reference(phases, masks, detunings_ghz, root_indices, config):
 def decode_samples(actions, masks, config, *, budget_actions=None,
                    detunings_ghz=None, root_indices=None):
     """Existing physical decoder, followed only by the opt-in reference shift."""
-    if getattr(config, 'reciprocal_pair_actions', False):
+    if hasattr(config, 'coupling_symmetry_fraction'):
+        fraction = config.coupling_symmetry_fraction
+        if not 0. <= fraction <= 1.:
+            raise ValueError('coupling_symmetry_fraction must be in [0,1]')
+        if fraction:
+            from .symmetric_topologies import reciprocal_actions
+            from .reciprocal_pairs import pair_layout
+            import torch
+            paired = reciprocal_actions(actions, masks, config.n_lasers)
+            edges = actions.shape[-1]//2
+            canonical, expansion, reverse = pair_layout(config.n_lasers, actions.device)
+            phase = actions[..., edges:]
+            difference = phase[..., reverse]-phase
+            delta = torch.atan2(torch.sin(difference), torch.cos(difference))
+            # Move along the short arc, including pairs straddling +/-pi.
+            phase = (phase[..., canonical]+.5*delta[..., canonical])[..., expansion] if fraction == 1. else phase+.5*fraction*delta
+            strength = paired[..., :edges] if fraction == 1. else (1.-fraction)*actions[..., :edges]+fraction*paired[..., :edges]
+            actions = torch.cat((strength, phase), dim=-1)
+    elif getattr(config, 'reciprocal_pair_actions', False):
         from .reciprocal_pairs import check_shared_actions
         check_shared_actions(actions, masks, config.n_lasers)
     elif getattr(config, 'symmetric_coupling_values', False):
