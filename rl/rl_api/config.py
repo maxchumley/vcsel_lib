@@ -30,9 +30,13 @@ class ModelConfig:
     encode_root: bool = False
     symmetric_coupling_values: bool = False
     reciprocal_pair_actions: bool = False
+    asymmetric_coupling_phases: bool = False
     condition_phases_on_coupling: bool = False
 
     def __post_init__(self):
+        if type(self.asymmetric_coupling_phases) is not bool or (self.asymmetric_coupling_phases
+                and not (self.reciprocal_pair_actions and self.condition_phases_on_coupling)):
+            raise ValueError('Asymmetric pair phases require conditional reciprocal strength actions')
         if not isinstance(self.condition_phases_on_coupling, bool):
             raise ValueError('condition_phases_on_coupling must be True or False')
         if not isinstance(self.reciprocal_pair_actions, bool):
@@ -510,6 +514,8 @@ class TrainingConfig:
                 settings['symmetric_coupling_values'] = True
             if m.reciprocal_pair_actions:
                 settings['reciprocal_pair_actions'] = True
+            if m.asymmetric_coupling_phases:
+                settings['asymmetric_coupling_phases'] = True
             if m.condition_phases_on_coupling:
                 settings['condition_phases_on_coupling'] = True
         if self.topology.backbone == 'all_connected_symmetric':
@@ -603,7 +609,7 @@ class TrainingConfig:
                 density_features='reuse the two adjacency slots per pair with uniform retained-pair density',
                 pair_count='M-1 + round(s * (M*(M-1)/2 - (M-1)))',
                 symmetric_masks=True, symmetric_strengths=self.model.symmetric_coupling_values,
-                symmetric_phases=self.model.symmetric_coupling_values,
+                symmetric_phases=self.model.symmetric_coupling_values and not self.model.asymmetric_coupling_phases,
                 reciprocal_pair_actions=self.model.reciprocal_pair_actions,
                 mask_reuse='selected separately from each sampled strength matrix',
                 sampled_masks_per_size=s.pairs_per_size*candidates,

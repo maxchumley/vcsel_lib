@@ -130,7 +130,8 @@ class CouplingConditionedPhase:
                             states.mean(1)[:,None].expand(-1,edges,-1)), dim=-1)
         latent = self.edge_latent(inputs.reshape(batch*edges,-1))
         residual = self.coupling_phase_head(latent).reshape(batch,edges)
-        if getattr(self.config, 'reciprocal_pair_actions', False):
+        if (getattr(self.config, 'reciprocal_pair_actions', False)
+                and not getattr(self.config, 'asymmetric_coupling_phases', False)):
             from ..reciprocal_pairs import pair_layout
             canonical, expansion, _ = pair_layout(size,features.device)
             residual = residual[:,canonical][:,expansion]
@@ -199,6 +200,14 @@ class ReciprocalPairPolicy(ScaledExploration, engine.BernoulliSparseGNNPolicy):
         outputs = super().parameters_for_edges(features, **options)
         canonical, expansion, _ = pair_layout(features.shape[1], features.device)
         edges = outputs[0].shape[-1] // 2
+        if getattr(self.config, 'asymmetric_coupling_phases', False):
+            phase = outputs[0][:, edges:]
+            if self.config.phase_parameterization == 'target_delay_residual':
+                phase = phase + delay_phase_offsets(features, self.config)
+            strength = outputs[0][:, canonical][:, expansion]
+            std = outputs[1] - .5*math.log(2.)
+            return (torch.cat((strength, phase),dim=-1),
+                    torch.cat((std[:,canonical][:,expansion],std[:,edges:]),dim=-1),*outputs[2:])
         columns = torch.cat((canonical, canonical + edges))
         mean = outputs[0][:, columns]
         pairs = len(canonical)

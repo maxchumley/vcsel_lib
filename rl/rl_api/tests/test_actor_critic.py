@@ -14,6 +14,7 @@ from rl.rl_api.density_control import prepare_density_size
 from rl.rl_api.experiments import train_density_actor_critic_1000 as current
 from rl.rl_api.experiments import train_density_actor_critic_replay_1000 as replay
 from rl.rl_api.experiments import train_density_conditioned_fresh_1000 as baseline
+from rl.rl_api.experiments import train_density_actor_critic_replay_asymphase_1000 as mixed
 from rl.rl_api.exploration import refinement_config
 from rl.rl_api.models import build_policy
 
@@ -28,8 +29,8 @@ def small_config(recipe=current):
                            notebook_display=False, plot_dpi=60))
 
 
-def prepared(tmp_path):
-    public = small_config()
+def prepared(tmp_path,recipe=current):
+    public = small_config(recipe)
     config = refinement_config(public.to_backend(tmp_path), public.schedules, 0)
     torch.manual_seed(config.random_seed)
     policy = build_policy(config)
@@ -126,8 +127,9 @@ def test_initialization_holdouts_and_no_actor_change_during_critic_fit(tmp_path)
     assert ranking_metrics(np.zeros_like(rewards),rewards,trainable,8)[1]==14
 
 
-def test_virtual_actor_uses_fresh_actions_no_simulations_or_critic_gradients(tmp_path,monkeypatch,fake_physics):
-    public,config,policy,items=prepared(tmp_path)
+@pytest.mark.parametrize('recipe',[current,mixed],ids=['symmetric-phases','directed-phases'])
+def test_virtual_actor_uses_fresh_actions_no_simulations_or_critic_gradients(tmp_path,monkeypatch,fake_physics,recipe):
+    public,config,policy,items=prepared(tmp_path,recipe)
     settings=replace(public.actor_critic,warmup_iterations=1)
     state=ActorCriticState(settings,config,tmp_path)
     # Analytic test oracle: action-dependent, independently measurable reward.
@@ -156,7 +158,9 @@ def test_virtual_actor_uses_fresh_actions_no_simulations_or_critic_gradients(tmp
     torch.testing.assert_close(rng,torch.get_rng_state(),atol=0,rtol=0)
     for item,result in zip(items,draws):
         assert not np.array_equal(item['kappa'],result[-1][0])
-        for values in result[-1][:2]:np.testing.assert_array_equal(values,values.swapaxes(-1,-2))
+        np.testing.assert_array_equal(result[-1][0],result[-1][0].swapaxes(-1,-2))
+        if recipe is current:
+            np.testing.assert_array_equal(result[-1][1],result[-1][1].swapaxes(-1,-2))
     # A bad local ranking blocks virtual updates despite small absolute error.
     monkeypatch.setattr(state,'predict',lambda data:torch.full((len(data['reward']),),.5))
     metrics=state.update(policy,optimizer,config,items,rewards,1)

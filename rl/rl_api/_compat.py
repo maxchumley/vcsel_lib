@@ -107,6 +107,11 @@ class CouplingConditionedPairDensityConfig(ReciprocalPairDensityConfig):
 
 
 @dataclass
+class CouplingConditionedMixedPairDensityConfig(CouplingConditionedPairDensityConfig):
+    asymmetric_coupling_phases: bool = True
+
+
+@dataclass
 class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
     """Four-laser reciprocal-value projection and the complete connected bank."""
     exhaustive_symmetric_topologies: bool = True
@@ -299,6 +304,10 @@ def make_backend_config(settings: dict):
         if config_class not in conditional_classes:
             raise ValueError('Conditional phases require density control')
         config_class = conditional_classes[config_class]
+    if converted.get('asymmetric_coupling_phases', False):
+        if config_class is not CouplingConditionedPairDensityConfig:
+            raise ValueError('Asymmetric phases require conditioned reciprocal density strengths')
+        config_class = CouplingConditionedMixedPairDensityConfig
     if converted.get('exhaustive_symmetric_topologies', False):
         if config_class is not MirroredExplorationConfig:
             raise ValueError('Exhaustive symmetry requires the supplied-topology mirrored recipe')

@@ -72,7 +72,8 @@ def decode_samples(actions, masks, config, *, budget_actions=None,
             actions = torch.cat((strength, phase), dim=-1)
     elif getattr(config, 'reciprocal_pair_actions', False):
         from .reciprocal_pairs import check_shared_actions
-        check_shared_actions(actions, masks, config.n_lasers)
+        check_shared_actions(actions, masks, config.n_lasers,
+                             share_phases=not getattr(config,'asymmetric_coupling_phases',False))
     elif getattr(config, 'symmetric_coupling_values', False):
         from .symmetric_topologies import reciprocal_actions
         actions = reciprocal_actions(actions, masks, config.n_lasers)

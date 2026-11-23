@@ -432,6 +432,12 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
                 conditional_phase_scores='one Gaussian score per sampled phase coordinate, given its own strength draw',
                 mirrored_parameters='opposite strength/budget noises; opposite phase noises around each conditional mean',
                 extra_simulations=0)
+        if getattr(config,'asymmetric_coupling_phases',False):
+            sampling_recipe.update(symmetric_values='one shared strength per unordered pair; independent directed phases',
+                reinforce_score='one Gaussian strength score per unordered pair plus one phase score per direction',
+                symmetric_strengths=True,symmetric_phases=False,
+                phase_delay_reference='lowest mean-centered detuning (laser 1) plus learned directed residuals',
+                phase_conditioning='directed phase residuals conditioned on the selected symmetric strengths')
     if getattr(config, 'exhaustive_symmetric_topologies', False):
         from .symmetric_topologies import topology_metadata
         sampling_recipe = dict(sampling_recipe or {}, mode='all_connected_symmetric',

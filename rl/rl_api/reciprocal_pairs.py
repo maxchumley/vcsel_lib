@@ -20,11 +20,11 @@ def expand_pair_actions(actions, expansion):
                       actions[..., pairs:][..., expansion]), dim=-1)
 
 
-def check_shared_actions(actions, masks, size):
+def check_shared_actions(actions, masks, size, *, share_phases=True):
     _, _, reverse = pair_layout(size, actions.device)
     edges = len(reverse)
     if not torch.equal(masks, masks[..., reverse]):
         raise ValueError('Reciprocal pair actions require symmetric masks')
     if (not torch.equal(actions[..., :edges], actions[..., :edges][..., reverse])
-            or not torch.equal(actions[..., edges:], actions[..., edges:][..., reverse])):
+            or (share_phases and not torch.equal(actions[..., edges:], actions[..., edges:][..., reverse]))):
         raise ValueError('Reciprocal pairs must share exactly one strength and phase action')

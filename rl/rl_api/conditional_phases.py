@@ -25,7 +25,8 @@ def sample_conditional_density(policy, features, config, fractions, *, mirrored=
     phases = actions[...,edges:] + residual.detach()
     if not continuous_mean and config.exploration_std_scale != 0.:
         base_phases, sampled_phases, correction = actions[...,edges:], phases, residual
-        if getattr(config, 'reciprocal_pair_actions', False):
+        if (getattr(config, 'reciprocal_pair_actions', False)
+                and not getattr(config,'asymmetric_coupling_phases',False)):
             from .reciprocal_pairs import pair_layout
             canonical = pair_layout(size,features.device)[0]
             base_phases, sampled_phases, correction = (

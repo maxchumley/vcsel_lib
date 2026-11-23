@@ -58,6 +58,10 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False, conti
     its mean. The first two slots form the wide pair in the eight-action run.
     Reflection is detached: learning still uses Gaussian REINFORCE scores.
     """
+    if getattr(policy.config,'asymmetric_coupling_phases',False):
+        from .mixed_pair_phases import sample_mixed_pairs
+        return sample_mixed_pairs(policy,features,masks,mirrored=mirrored,
+            continuous_mean=continuous_mean,return_phase_parameters=return_phase_parameters)
     batch, candidates, edges = masks.shape
     repeated = features[:, None].expand(-1, candidates, -1, -1).reshape(
         batch*candidates, features.shape[1], features.shape[2])
