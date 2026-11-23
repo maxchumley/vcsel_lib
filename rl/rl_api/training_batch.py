@@ -190,7 +190,7 @@ def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase
 def run_training_batch(policy, optimizer, config, rng, iteration, *,
                        simulation_pool=None, reward_scale_state=None,
                        mask_sampler=sample_shared_rooted_topologies, schedules=None,
-                       phase_correction=None):
+                       phase_correction=None, actor_critic=None):
     """One supplied-topology batch; explicit samplers also support parity tests."""
     if (not config.topology_input_mode or config.objective_mode!='phase_only'
             or config.phase_reward_mode!='wrapped_rms'
@@ -249,6 +249,8 @@ def run_training_batch(policy, optimizer, config, rng, iteration, *,
     options = dict(phase_correction=phase_correction) if joint_correction else {}
     update_start=perf_counter()
     diagnostics = pcgrad_update(policy,optimizer,config,rng,prepared,advantages,**options)
+    if actor_critic is not None:
+        diagnostics.update(actor_critic.update(policy, optimizer, config, prepared, rewards, iteration))
     if getattr(config,'exhaustive_symmetric_topologies',False):
         diagnostics.update(simulation_seconds=simulation_seconds,update_seconds=perf_counter()-update_start)
     if mean_phase_only:

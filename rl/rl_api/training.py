@@ -39,9 +39,12 @@ HISTORY_KEYS = (
 )
 
 
-def make_history(config, *, phase_correction=None, fixed_topology_bank=False):
+def make_history(config, *, phase_correction=None, fixed_topology_bank=False, actor_critic=False):
     """Keep the current RMS run's active metrics, excluding unused placeholders."""
     history = {key: [] for key in HISTORY_KEYS}
+    if actor_critic:
+        from .actor_critic import HISTORY_KEYS as critic_keys
+        history.update({key: [] for key in critic_keys})
     if phase_correction is not None and phase_correction.enabled:
         from .phase_correction import HISTORY_KEYS as correction_keys
         history.update({key: [] for key in correction_keys})
@@ -138,6 +141,10 @@ def record_history(history, metrics, validation, config, *, seen_validation=None
     for key in mean_keys:
         if key in history:
             history[key].append(metrics[key])
+    if 'critic_loss' in history:
+        from .actor_critic import HISTORY_KEYS as critic_keys
+        for key in critic_keys:
+            history[key].append(metrics[key])
     names = {
         "held_out_reward": "training_reward", "held_out_rooted_fraction": "rooted_fraction",
         "held_out_phase_reward": "phase_reward",
@@ -222,6 +229,11 @@ def print_progress(iteration, config, metrics, history):
         correction += (f" sim={metrics['simulation_seconds']:.1f}s"
                        f" update={metrics['update_seconds']:.2f}s"
                        f" validation={metrics['validation_seconds']:.1f}s")
+    if 'critic_loss' in metrics:
+        correction += (f" critic-MAE={metrics['critic_mae']:.3f}"
+                       f" critic-rank={metrics['critic_rank_accuracy']:.1%}"
+                       f" buffer={metrics['critic_buffer_size']}"
+                       f" critic-actor-updates={metrics['critic_actor_updates']}")
     print(f"{iteration+1}/{config.training_iterations} "
           f"RMS={metrics['training_reward']:.3f} cosine={metrics['phase_reward']:.3f} "
           f"held-out-RMS={history['held_out_reward'][-1]:.3f} "
@@ -454,9 +466,24 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
     if getattr(config, 'exhaustive_symmetric_topologies', False):
         write_json(directory/'symmetric_topology_bank.json', sampling_recipe['topology_bank'])
     optimizer = torch.optim.Adam(policy.parameters(), lr=config.learning_rate)
+    critic = None
+    if experiment.config.actor_critic.enabled:
+        from .actor_critic import ActorCriticState
+        critic = ActorCriticState(experiment.config.actor_critic, config, directory)
+        batch_options['actor_critic'] = critic
+        sampling_recipe = dict(sampling_recipe or {}, actor_critic=dict(
+            **asdict(experiment.config.actor_critic),
+            target='measured simulator RMS reward, no bootstrapped returns',
+            critic_inputs='context, requested density and executed mask, strengths and phases',
+            holdout='one entire current target/detuning context per M; all density/action siblings excluded',
+            sampling='balanced fitting records by M and actual physical density band',
+            actor_update_source='one true-reward update plus gated fresh-current-policy critic-reward updates',
+            actor_gate='warmup, current held-out MAE and within-context/density pairwise ranking',
+            experience_archive='experiences/batch_*.npz; archives are never read by the trainer',
+            extra_simulations=0))
     reward_scale_state = {}
     history = make_history(config, phase_correction=phase_correction,
-                           fixed_topology_bank=topology_bank is not None)
+                           fixed_topology_bank=topology_bank is not None, actor_critic=critic is not None)
     bank = make_validation_bank(config)
     seen_topologies = unseen_topologies = None
     if topology_bank is not None:
@@ -508,6 +535,8 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
             record_history(history, metrics, validation, config, **options)
             save(config.current_checkpoint_file, policy, optimizer, current_config, iteration+1,
                  history["held_out_reward"][-1], sampling_recipe=sampling_recipe, exploration_state=state)
+            if critic is not None:
+                critic.save(iteration+1, snapshot=validate_now)
             plot_now = live_plot and (iteration == 0 or (iteration+1) % config.plot_update_interval == 0
                                      or iteration+1 == config.training_iterations)
             save_progress(history, current_config, directory, write_history=validate_now, live_plot=plot_now,

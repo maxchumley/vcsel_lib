@@ -266,6 +266,32 @@ class PhaseCorrectionConfig:
 
 
 @dataclass(frozen=True)
+class ActorCriticConfig:
+    """Optional one-step reward critic; historical replay is the ablation switch."""
+    enabled: bool = False
+    use_replay: bool = True
+    replay_capacity: int = 100000
+    critic_updates: int = 20
+    critic_batch_size: int = 256
+    critic_learning_rate: float = 3e-4
+    actor_updates: int = 4
+    warmup_iterations: int = 10
+    minimum_rank_accuracy: float = .55
+    maximum_reward_mae: float = .10
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool or type(self.use_replay) is not bool:
+            raise ValueError('Actor-critic switches must be Boolean')
+        for name in ('replay_capacity','critic_updates','critic_batch_size','actor_updates','warmup_iterations'):
+            if type(getattr(self,name)) is not int or getattr(self,name)<1:
+                raise ValueError(f'{name} must be a positive integer')
+        if not math.isfinite(self.critic_learning_rate) or self.critic_learning_rate<=0:
+            raise ValueError('critic_learning_rate must be positive and finite')
+        if not .5 < self.minimum_rank_accuracy <= 1. or not 0. < self.maximum_reward_mae <= 1.:
+            raise ValueError('Use rank accuracy in (.5,1] and reward MAE in (0,1]')
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Current recipe with separate, documented user-facing sections."""
     sizes: tuple[int, ...] = tuple(range(3, 10))
@@ -282,6 +308,7 @@ class TrainingConfig:
     validation: ValidationConfig = field(default_factory=ValidationConfig)
     reward: RewardConfig = field(default_factory=RewardConfig)
     phase_correction: PhaseCorrectionConfig = field(default_factory=PhaseCorrectionConfig)
+    actor_critic: ActorCriticConfig = field(default_factory=ActorCriticConfig)
 
     def __post_init__(self):
         object.__setattr__(self, "sizes", tuple(self.sizes))
@@ -341,6 +368,13 @@ class TrainingConfig:
         if self.model.condition_phases_on_coupling and (
                 self.topology.mode != 'density' or not self.schedules.anneal_to_mean):
             raise ValueError('Conditional phases require density training with anneal_to_mean')
+        if self.actor_critic.enabled and (
+                self.topology.mode!='density' or not self.model.condition_phases_on_coupling
+                or not self.model.reciprocal_pair_actions or self.phase_correction.enabled
+                or self.sampling.pairs_per_size<2
+                or self.actor_critic.replay_capacity<len(self.sizes)*self.sampling.pairs_per_size
+                    *self.sampling.topologies_per_pair*self.sampling.actions_per_topology):
+            raise ValueError('Actor-critic training requires conditional reciprocal density actions and >=2 contexts per size')
         exhaustive = self.topology.backbone == 'all_connected_symmetric'
         if exhaustive:
             if (self.sizes != (4,) or self.topology.mode != 'provided'
@@ -606,4 +640,15 @@ class TrainingConfig:
                     correction_mean_simulations_max=means,
                     simulations_per_iteration_max=len(self.sizes)*s.pairs_per_size*candidates+2*means,
                     correction_update='separate phase-output-row gradient step; shared layers unchanged')
+        if self.actor_critic.enabled:
+            summary.update(actor_critic='separate GNN trained on measured RMS rewards',
+                critic_training_data=('rolling replay' if self.actor_critic.use_replay else 'current batch only'),
+                critic_capacity=(self.actor_critic.replay_capacity if self.actor_critic.use_replay
+                                 else summary['simulations_per_iteration']),
+                critic_updates=self.actor_critic.critic_updates,
+                critic_batch_size=self.actor_critic.critic_batch_size,
+                extra_actor_updates_max=self.actor_critic.actor_updates,
+                critic_warmup_iterations=self.actor_critic.warmup_iterations,
+                critic_actor_gate=f'MAE <= {self.actor_critic.maximum_reward_mae}, rank >= {self.actor_critic.minimum_rank_accuracy}',
+                extra_simulations=0)
         return summary

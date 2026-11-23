@@ -12,6 +12,12 @@ scripts and checkpoints are separate. Bernoulli gate training is deferred.
 
 ## Start here
 
+**Actor–critic comparison:** [current-batch versus replay](../../docs/rl_actor_critic.md)
+adds two fresh symmetric 3–9 laser density runs, keeping the conditioned actor,
+laser-1 reference and real simulation budget. A separate reward GNN supplies
+gated additional actor updates; the replay arm retains up to 100,000 designs.
+Launch both with `bash scripts/submit_density_actor_critic_tests.sh`.
+
 **Four-laser cluster experiment:** `experiments/train_four_laser_inphase_all_symmetric_1000.py`
 trains a fresh in-phase model on all 38 connected symmetric four-laser topologies,
 with both physical coupling matrices symmetric and 0–4 GHz detuning spans.

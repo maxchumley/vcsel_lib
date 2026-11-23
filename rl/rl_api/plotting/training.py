@@ -43,8 +43,9 @@ def training_figure(history, config, settings):
             rc("font", family="serif")
         figure = engine.training_figure(history, config)
         iteration = len(history["training_reward"])
+        method = 'Actor–critic' if 'critic_loss' in history else 'REINFORCE'
         figure.axes[0].set_title(
-            f"REINFORCE training (iteration {iteration}/{config.training_iterations})")
+            f"{method} training (iteration {iteration}/{config.training_iterations})")
         if 'seen_topology_held_out_reward' in history:
             import numpy as np
             grid = figure.add_gridspec(1, 3)
