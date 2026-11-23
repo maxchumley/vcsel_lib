@@ -24,8 +24,14 @@ def sample_conditional_density(policy, features, config, fractions, *, mirrored=
     # the original +/- phase noises around those means; do not share residuals.
     phases = actions[...,edges:] + residual.detach()
     if not continuous_mean and config.exploration_std_scale != 0.:
-        base_log = torch.distributions.Normal(base_mean,phase_std).log_prob(actions[...,edges:])
-        conditional_log = torch.distributions.Normal(base_mean+residual,phase_std).log_prob(phases)
+        base_phases, sampled_phases, correction = actions[...,edges:], phases, residual
+        if getattr(config, 'reciprocal_pair_actions', False):
+            from .reciprocal_pairs import pair_layout
+            canonical = pair_layout(size,features.device)[0]
+            base_phases, sampled_phases, correction = (
+                value[...,canonical] for value in (base_phases,sampled_phases,correction))
+        base_log = torch.distributions.Normal(base_mean,phase_std).log_prob(base_phases)
+        conditional_log = torch.distributions.Normal(base_mean+correction,phase_std).log_prob(sampled_phases)
         score = score + (conditional_log-base_log).sum(-1)
     actions = torch.cat((actions[...,:edges],phases),dim=-1)
     # Keep the exact mask/strength draw used as input to the phase decoder.

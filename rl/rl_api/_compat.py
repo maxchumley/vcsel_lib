@@ -91,6 +91,22 @@ class ReciprocalPairDensityConfig(SymmetricDensityControlledConfig):
 
 
 @dataclass
+class CouplingConditionedDensityConfig(DensityControlledConfig):
+    """Fresh density policy with a second graph pass on executed strengths."""
+    condition_phases_on_coupling: bool = True
+
+
+@dataclass
+class CouplingConditionedSymmetricDensityConfig(SymmetricDensityControlledConfig):
+    condition_phases_on_coupling: bool = True
+
+
+@dataclass
+class CouplingConditionedPairDensityConfig(ReciprocalPairDensityConfig):
+    condition_phases_on_coupling: bool = True
+
+
+@dataclass
 class ExhaustiveSymmetricConfig(MirroredExplorationConfig):
     """Four-laser reciprocal-value projection and the complete connected bank."""
     exhaustive_symmetric_topologies: bool = True
@@ -269,14 +285,20 @@ def make_backend_config(settings: dict):
         if config_class is not DensityControlledConfig:
             raise ValueError('Gradual symmetry requires an untied density policy')
         config_class = SymmetryRefinementDensityConfig
-    if converted.get('condition_phases_on_coupling', False):
-        if config_class is not SymmetryRefinementDensityConfig:
-            raise ValueError('Conditional phases require the untied density refinement config')
-        config_class = CouplingConditionedRefinementConfig
     if converted.get('reciprocal_pair_actions', False):
         if config_class is not SymmetricDensityControlledConfig:
             raise ValueError('Reciprocal pair actions require symmetric density control')
         config_class = ReciprocalPairDensityConfig
+    if converted.get('condition_phases_on_coupling', False):
+        conditional_classes = {
+            DensityControlledConfig: CouplingConditionedDensityConfig,
+            SymmetricDensityControlledConfig: CouplingConditionedSymmetricDensityConfig,
+            ReciprocalPairDensityConfig: CouplingConditionedPairDensityConfig,
+            SymmetryRefinementDensityConfig: CouplingConditionedRefinementConfig,
+        }
+        if config_class not in conditional_classes:
+            raise ValueError('Conditional phases require density control')
+        config_class = conditional_classes[config_class]
     if converted.get('exhaustive_symmetric_topologies', False):
         if config_class is not MirroredExplorationConfig:
             raise ValueError('Exhaustive symmetry requires the supplied-topology mirrored recipe')

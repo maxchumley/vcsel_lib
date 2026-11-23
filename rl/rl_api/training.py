@@ -413,6 +413,13 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
                 phase_delay_reference=('zero plus learned pair residual'
                     if config.phase_parameterization == 'target_residual' else
                     'lowest mean-centered detuning (laser 1) plus learned pair residual'))
+        if getattr(config, 'condition_phases_on_coupling', False):
+            sampling_recipe.update(condition_phases_on_coupling=True,
+                phase_conditioning='second graph pass on detached, selected physical strengths and mask',
+                phase_residual_initialization='zero linear head; preserve original starting policy',
+                conditional_phase_scores='one Gaussian score per sampled phase coordinate, given its own strength draw',
+                mirrored_parameters='opposite strength/budget noises; opposite phase noises around each conditional mean',
+                extra_simulations=0)
     if getattr(config, 'exhaustive_symmetric_topologies', False):
         from .symmetric_topologies import topology_metadata
         sampling_recipe = dict(sampling_recipe or {}, mode='all_connected_symmetric',

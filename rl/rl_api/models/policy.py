@@ -102,7 +102,9 @@ class CouplingConditionedPhase:
     """Reuse graph layers on executed strengths, then add a zero-start phase head."""
     def __init__(self, config):
         super().__init__(config)
-        self.coupling_phase_head = torch.nn.Linear(self.edge_output.in_features, 1)
+        # Adding a zero-start head must not shift the fresh run's sampling RNG.
+        with torch.random.fork_rng(devices=[]):
+            self.coupling_phase_head = torch.nn.Linear(self.edge_output.in_features, 1)
         torch.nn.init.zeros_(self.coupling_phase_head.weight)
         torch.nn.init.zeros_(self.coupling_phase_head.bias)
 
@@ -127,7 +129,12 @@ class CouplingConditionedPhase:
         inputs = torch.cat((states[:,sources], states[:,receivers], local,
                             states.mean(1)[:,None].expand(-1,edges,-1)), dim=-1)
         latent = self.edge_latent(inputs.reshape(batch*edges,-1))
-        return self.coupling_phase_head(latent).reshape(batch,edges)
+        residual = self.coupling_phase_head(latent).reshape(batch,edges)
+        if getattr(self.config, 'reciprocal_pair_actions', False):
+            from ..reciprocal_pairs import pair_layout
+            canonical, expansion, _ = pair_layout(size,features.device)
+            residual = residual[:,canonical][:,expansion]
+        return residual
 
 
 class ConditionalDelayResidualPhasePolicy(CouplingConditionedPhase, AnnealedDelayResidualPhasePolicy):
@@ -204,6 +211,10 @@ class ReciprocalPairPolicy(ScaledExploration, engine.BernoulliSparseGNNPolicy):
                 expand_pair_actions(log_std, expansion), *outputs[2:])
 
 
+class ConditionalReciprocalPairPhasePolicy(CouplingConditionedPhase, ReciprocalPairPolicy):
+    """One conditional phase per reciprocal pair, copied to both directions."""
+
+
 def build_policy(config):
     """Select the recorded phase convention, preserving all parameter keys/order.
 
@@ -212,14 +223,14 @@ def build_policy(config):
     """
     mode = getattr(config,'phase_parameterization','absolute')
     if getattr(config, 'condition_phases_on_coupling', False):
-        if (not getattr(config, 'density_control', False)
-                or getattr(config, 'reciprocal_pair_actions', False)
-                or getattr(config, 'encode_root', False)):
-            raise ValueError('Conditional phases require an untied density policy')
+        if not getattr(config, 'density_control', False) or getattr(config, 'encode_root', False):
+            raise ValueError('Conditional phases require a density policy without root encoding')
         classes = {'target_delay_residual': ConditionalDelayResidualPhasePolicy,
                    'target_residual': ConditionalResidualPhasePolicy}
         if mode not in classes:
             raise ValueError('Conditional phases require a zero or laser-1 reference')
+        if getattr(config, 'reciprocal_pair_actions', False):
+            return ConditionalReciprocalPairPhasePolicy(config).to(config.device)
         return classes[mode](config).to(config.device)
     if getattr(config, 'reciprocal_pair_actions', False):
         if mode not in {'target_residual', 'target_delay_residual'}:

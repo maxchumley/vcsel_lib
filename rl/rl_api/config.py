@@ -30,8 +30,11 @@ class ModelConfig:
     encode_root: bool = False
     symmetric_coupling_values: bool = False
     reciprocal_pair_actions: bool = False
+    condition_phases_on_coupling: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.condition_phases_on_coupling, bool):
+            raise ValueError('condition_phases_on_coupling must be True or False')
         if not isinstance(self.reciprocal_pair_actions, bool):
             raise ValueError("reciprocal_pair_actions must be True or False")
         if self.reciprocal_pair_actions and not self.symmetric_coupling_values:
@@ -335,6 +338,9 @@ class TrainingConfig:
                 raise ValueError("Fixed topology banks require five random_reachable band_random masks")
         if self.model.reciprocal_pair_actions and self.topology.mode != 'density':
             raise ValueError('Reciprocal pair actions currently require density training')
+        if self.model.condition_phases_on_coupling and (
+                self.topology.mode != 'density' or not self.schedules.anneal_to_mean):
+            raise ValueError('Conditional phases require density training with anneal_to_mean')
         exhaustive = self.topology.backbone == 'all_connected_symmetric'
         if exhaustive:
             if (self.sizes != (4,) or self.topology.mode != 'provided'
@@ -470,6 +476,8 @@ class TrainingConfig:
                 settings['symmetric_coupling_values'] = True
             if m.reciprocal_pair_actions:
                 settings['reciprocal_pair_actions'] = True
+            if m.condition_phases_on_coupling:
+                settings['condition_phases_on_coupling'] = True
         if self.topology.backbone == 'all_connected_symmetric':
             settings.update(exhaustive_symmetric_topologies=True, symmetric_coupling_values=True,
                             in_phase_targets=True, topology_star_backbone=False,
@@ -569,6 +577,12 @@ class TrainingConfig:
                 density_requests_per_pair=s.topologies_per_pair,
                 pcgrad_tasks_are_upper_bound=True,
                 validation_simulations_per_check=len(self.sizes)*self.validation.pairs_per_size)
+            if self.model.condition_phases_on_coupling:
+                summary.update(
+                    new_parameters=(self.model.edge_hidden_sizes[-1]+1
+                        if self.model.edge_hidden_sizes else 'one linear phase head'),
+                    phase_conditioning='second graph pass on selected physical strengths; zero-start residual',
+                    extra_simulations=0)
         if self.topology.backbone == 'all_connected_symmetric':
             summary.update(topology_sampling='all 38 connected labeled symmetric masks every iteration',
                 topology_backbone='all_connected_symmetric', target_mode='in_phase',

@@ -67,14 +67,20 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False, conti
     budget_mean, budget_log_std = policy.budget_parameters(repeated, pooled_states=pooled)
     budget_mean = budget_mean.reshape(batch, candidates)
     scale = policy.config.exploration_std_scale
-    if return_phase_parameters and (getattr(policy.config, 'reciprocal_pair_actions', False)
-            or getattr(policy.config, 'symmetric_action_score', 'directed') != 'directed'):
-        raise ValueError('Phase parameters require directed Gaussian scores')
+    pair_mode = getattr(policy.config, 'reciprocal_pair_actions', False)
+    if return_phase_parameters and getattr(policy.config, 'symmetric_action_score', 'directed') != 'directed':
+        raise ValueError('Phase parameters require explicit Gaussian action scores')
     if scale == 0. or continuous_mean:
         result = mean.clone(), budget_mean.clone(), features.new_zeros((batch, candidates))
-        return (*result, mean[...,edges:], log_std.reshape_as(mean)[...,edges:].exp()) if return_phase_parameters else result
+        if not return_phase_parameters:
+            return result
+        phase_mean, phase_std = mean[...,edges:], log_std.reshape_as(mean)[...,edges:].exp()
+        if pair_mode:
+            from .reciprocal_pairs import pair_layout
+            canonical = pair_layout(features.shape[1],features.device)[0]
+            phase_mean, phase_std = phase_mean[...,canonical], phase_std[...,canonical]
+        return (*result,phase_mean,phase_std)
     std = log_std.reshape_as(mean).exp()
-    pair_mode = getattr(policy.config, 'reciprocal_pair_actions', False)
     score_masks = masks
     if pair_mode:
         from .reciprocal_pairs import pair_layout, check_shared_actions
