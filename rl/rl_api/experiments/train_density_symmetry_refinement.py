@@ -14,6 +14,7 @@ from .. import CouplingModel
 from .._compat import PACKAGE_DIR, core, exported_settings, make_backend_config
 from ..checkpoints import save, write_json
 from ..exploration import exploration_state
+from ..models import build_policy
 from ..simulation import initialize_worker
 from ..training import make_validation_bank, evaluate_bank
 from ..training_batch import run_training_batch
@@ -117,7 +118,7 @@ def options(argv=None):
 
 
 def main(argv=None, *, projection_method='latent_blend', components='both',
-         name=RUN_NAME, progress_filename=PROGRESS_FILENAME):
+         name=RUN_NAME, progress_filename=PROGRESS_FILENAME, condition_phases=False):
     args=options(argv);torch.set_num_threads(1)
     directory=args.output_directory or PACKAGE_DIR/'runs/great_lakes'/name/os.environ.get('SLURM_JOB_ID','local')
     if not args.initial_checkpoint.is_file():
@@ -127,6 +128,16 @@ def main(argv=None, *, projection_method='latent_blend', components='both',
     config=replace(config,coupling_symmetry_method=projection_method,
         coupling_symmetry_strengths=components in {'both','strengths'},
         coupling_symmetry_phases=components in {'both','phases'})
+    added_weights=0
+    if condition_phases:
+        settings=exported_settings(config);settings['condition_phases_on_coupling']=True
+        config=make_backend_config(settings)
+        conditional=build_policy(config)
+        missing,unexpected=conditional.load_state_dict(policy.state_dict(),strict=False)
+        if set(missing)!={'coupling_phase_head.weight','coupling_phase_head.bias'} or unexpected:
+            raise ValueError('Conditional warm start must preserve every original weight')
+        added_weights=sum(p.numel() for p in conditional.coupling_phase_head.parameters())
+        policy=conditional
     policy.config=config
     recipe=dict(mode=('density_physical_symmetry_bounds' if projection_method=='physical_bounds' else 'density_symmetry_refinement'),
         name=name,projection_method=projection_method,components=components,initialization=initialization,
@@ -140,7 +151,11 @@ def main(argv=None, *, projection_method='latent_blend', components='both',
         initial_exploration_scale=.03,final_exploration_scale=.003,wide_phase_actions=False,
         advancement='train at current fraction; tighten only when validation retains original accuracy',
         checkpoint_selection='highest fraction passing original validation floors; reward breaks ties',
-        progress_filename=progress_filename,weights_added=0,teacher_labels=False,
+        progress_filename=progress_filename,weights_added=added_weights,teacher_labels=False,
+        condition_phases_on_coupling=condition_phases,
+        phase_conditioning=('second graph pass on detached selected physical strengths; zero-initialized residual head'
+                            if condition_phases else 'original density-conditioned phase head'),
+        extra_simulations=0,
         training_simulations_per_update=config.targets_per_batch*config.candidates_per_target,
         validation_cases=len(config.training_n_lasers)*config.held_out_target_count)
     print(recipe,flush=True)

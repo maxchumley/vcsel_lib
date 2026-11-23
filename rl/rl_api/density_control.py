@@ -133,9 +133,14 @@ def prepare_density_size(policy, config, rng, size, pair_count):
     features = engine.encode_context(targets, detunings, policy)
     fractions = np.repeat(density_requests(pair_count, rng), config.actions_per_topology, axis=1)
     dense = features.new_ones((pair_count, config.candidates_per_target, size*(size-1)))
-    actions, budget_actions, log_prob = sample_annealed_candidates(
-        DensityConditionedPolicy(policy, fractions), features, dense, mirrored=True)
-    masks, decoded = decode_density_actions(actions, budget_actions, fractions, local)
+    if getattr(config, 'condition_phases_on_coupling', False):
+        from .conditional_phases import sample_conditional_density
+        _, _, log_prob, masks, decoded = sample_conditional_density(
+            policy, features, local, fractions, mirrored=True)
+    else:
+        actions, budget_actions, log_prob = sample_annealed_candidates(
+            DensityConditionedPolicy(policy, fractions), features, dense, mirrored=True)
+        masks, decoded = decode_density_actions(actions, budget_actions, fractions, local)
     kappa, phi, counts, rho, shortfall = decoded
     return dict(n_lasers=size, config=local, targets=targets, detunings=detunings,
         features=features, gates=masks, log_prob=log_prob, kappa=kappa, phi=phi,
@@ -156,6 +161,9 @@ def validation_actions(policy, features, config, seed):
     """One fixed density request per held-out context, balanced across five slots."""
     count = len(features)
     groups = density_requests((count+4)//5, np.random.default_rng(seed)).reshape(-1)[:count, None]
+    if getattr(config, 'condition_phases_on_coupling', False):
+        from .conditional_phases import sample_conditional_density
+        return sample_conditional_density(policy, features, config, groups, continuous_mean=True)[-1]
     dense = features.new_ones((count, 1, config.n_lasers*(config.n_lasers-1)))
     actions, budget, _ = density_candidates(
         DensityConditionedPolicy(policy, groups), features, dense, continuous_mean=True)
@@ -185,10 +193,15 @@ def infer_density_designs(policy, context, config, fractions, count, continuous_
     with torch.random.fork_rng(devices=[]) if seed is not None else nullcontext(), torch.inference_mode():
         if seed is not None:
             torch.manual_seed(seed)
-        actions, budget, _ = density_candidates(
-            DensityConditionedPolicy(policy, values), features, dense,
-            continuous_mean=continuous_mean or config.exploration_std_scale == 0.)
-        masks, decoded = decode_density_actions(actions, budget, values[None], config)
+        if getattr(config, 'condition_phases_on_coupling', False):
+            from .conditional_phases import sample_conditional_density
+            _, _, _, masks, decoded = sample_conditional_density(
+                policy, features, config, values[None], continuous_mean=continuous_mean)
+        else:
+            actions, budget, _ = density_candidates(
+                DensityConditionedPolicy(policy, values), features, dense,
+                continuous_mean=continuous_mean or config.exploration_std_scale == 0.)
+            masks, decoded = decode_density_actions(actions, budget, values[None], config)
     kappa, phi, counts, rho, shortfall = decoded
     return dict(target_phases_rad=target, detuning_distribution_ghz=detunings,
         kappa_per_ns=kappa[0], phi_p_rad=phi[0], gates=masks.cpu().numpy()[0],

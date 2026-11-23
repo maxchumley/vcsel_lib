@@ -98,6 +98,46 @@ class AnnealedDelayResidualPhasePolicy(ScaledExploration, TargetDelayResidualPha
     """The same mirrored-run annealing with explicit reference-delay phases."""
 
 
+class CouplingConditionedPhase:
+    """Reuse graph layers on executed strengths, then add a zero-start phase head."""
+    def __init__(self, config):
+        super().__init__(config)
+        self.coupling_phase_head = torch.nn.Linear(self.edge_output.in_features, 1)
+        torch.nn.init.zeros_(self.coupling_phase_head.weight)
+        torch.nn.init.zeros_(self.coupling_phase_head.bias)
+
+    def phase_residual_for_coupling(self, features, kappa_per_ns):
+        # The sampled strengths are a conditioning variable, not a pathwise
+        # gradient. Their own REINFORCE scores still train strength selection.
+        kappa = torch.as_tensor(kappa_per_ns, dtype=features.dtype,
+                                device=features.device).detach()
+        batch, size, _ = features.shape
+        if kappa.shape != (batch, size, size):
+            raise ValueError('Conditional strengths must have shape (batch,M,M)')
+        receivers, sources = core.directed_link_indices(size)
+        encoded = torch.log1p(kappa[:, receivers, sources] /
+                             self.config.softplus_strength_scale_per_ns)
+        states, local, receivers, sources = self._graph_context(features, encoded)
+        edges = size*(size-1)
+        if self.config.condition_on_n_lasers:
+            low, high = min(self.config.training_n_lasers), max(self.config.training_n_lasers)
+            position = 0. if low == high else 2*(size-low)/(high-low)-1
+            sizes = features.new_tensor((position, 1./(size-1))).view(1,1,2)
+            local = torch.cat((local, sizes.expand(batch,edges,2)), dim=-1)
+        inputs = torch.cat((states[:,sources], states[:,receivers], local,
+                            states.mean(1)[:,None].expand(-1,edges,-1)), dim=-1)
+        latent = self.edge_latent(inputs.reshape(batch*edges,-1))
+        return self.coupling_phase_head(latent).reshape(batch,edges)
+
+
+class ConditionalDelayResidualPhasePolicy(CouplingConditionedPhase, AnnealedDelayResidualPhasePolicy):
+    """Density base phases plus a correction conditioned on the executed graph."""
+
+
+class ConditionalResidualPhasePolicy(CouplingConditionedPhase, AnnealedResidualPhasePolicy):
+    """The same conditional correction with a zero delay-frequency reference."""
+
+
 class RootAwareDelayResidualPhasePolicy(TargetDelayResidualPhasePolicy):
     """One extra node feature; the message layers and output heads are unchanged."""
     def __init__(self, config):
@@ -171,6 +211,16 @@ def build_policy(config):
     would alter model/optimizer state layout during a reproducibility refactor.
     """
     mode = getattr(config,'phase_parameterization','absolute')
+    if getattr(config, 'condition_phases_on_coupling', False):
+        if (not getattr(config, 'density_control', False)
+                or getattr(config, 'reciprocal_pair_actions', False)
+                or getattr(config, 'encode_root', False)):
+            raise ValueError('Conditional phases require an untied density policy')
+        classes = {'target_delay_residual': ConditionalDelayResidualPhasePolicy,
+                   'target_residual': ConditionalResidualPhasePolicy}
+        if mode not in classes:
+            raise ValueError('Conditional phases require a zero or laser-1 reference')
+        return classes[mode](config).to(config.device)
     if getattr(config, 'reciprocal_pair_actions', False):
         if mode not in {'target_residual', 'target_delay_residual'}:
             raise ValueError('Reciprocal pair policy requires a zero or laser-1 reference')

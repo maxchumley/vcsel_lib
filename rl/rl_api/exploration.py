@@ -47,7 +47,8 @@ def exploration_state(policy):
     return state
 
 
-def sample_annealed_candidates(policy, features, masks, *, mirrored=False, continuous_mean=False):
+def sample_annealed_candidates(policy, features, masks, *, mirrored=False, continuous_mean=False,
+                              return_phase_parameters=False):
     """Sample the opt-in full-run taper, including extra-wide phase actions.
 
     The policy scales ordinary edge/budget SDs. Extra-wide phase SD gets the
@@ -66,8 +67,12 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False, conti
     budget_mean, budget_log_std = policy.budget_parameters(repeated, pooled_states=pooled)
     budget_mean = budget_mean.reshape(batch, candidates)
     scale = policy.config.exploration_std_scale
+    if return_phase_parameters and (getattr(policy.config, 'reciprocal_pair_actions', False)
+            or getattr(policy.config, 'symmetric_action_score', 'directed') != 'directed'):
+        raise ValueError('Phase parameters require directed Gaussian scores')
     if scale == 0. or continuous_mean:
-        return mean.clone(), budget_mean.clone(), features.new_zeros((batch, candidates))
+        result = mean.clone(), budget_mean.clone(), features.new_zeros((batch, candidates))
+        return (*result, mean[...,edges:], log_std.reshape_as(mean)[...,edges:].exp()) if return_phase_parameters else result
     std = log_std.reshape_as(mean).exp()
     pair_mode = getattr(policy.config, 'reciprocal_pair_actions', False)
     score_masks = masks
@@ -116,7 +121,8 @@ def sample_annealed_candidates(policy, features, masks, *, mirrored=False, conti
     if pair_mode:
         from .reciprocal_pairs import expand_pair_actions
         actions = expand_pair_actions(actions, expansion)
-    return actions, budget_actions, log_prob+budget_normal.log_prob(budget_actions)
+    result = actions, budget_actions, log_prob+budget_normal.log_prob(budget_actions)
+    return (*result, mean[...,edges:], std[...,edges:]) if return_phase_parameters else result
 
 
 def shared_pair_parameters(values):

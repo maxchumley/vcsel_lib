@@ -73,6 +73,12 @@ class SymmetryRefinementDensityConfig(DensityControlledConfig):
 
 
 @dataclass
+class CouplingConditionedRefinementConfig(SymmetryRefinementDensityConfig):
+    """Predict phase corrections after selecting the actual physical strengths."""
+    condition_phases_on_coupling: bool = True
+
+
+@dataclass
 class SymmetricDensityControlledConfig(DensityControlledConfig):
     """Keep the density recipe and project both physical values reciprocally."""
     symmetric_coupling_values: bool = True
@@ -263,6 +269,10 @@ def make_backend_config(settings: dict):
         if config_class is not DensityControlledConfig:
             raise ValueError('Gradual symmetry requires an untied density policy')
         config_class = SymmetryRefinementDensityConfig
+    if converted.get('condition_phases_on_coupling', False):
+        if config_class is not SymmetryRefinementDensityConfig:
+            raise ValueError('Conditional phases require the untied density refinement config')
+        config_class = CouplingConditionedRefinementConfig
     if converted.get('reciprocal_pair_actions', False):
         if config_class is not SymmetricDensityControlledConfig:
             raise ValueError('Reciprocal pair actions require symmetric density control')
