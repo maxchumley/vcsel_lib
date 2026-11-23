@@ -73,7 +73,7 @@ def load_start(path, directory, args):
         copied='all model weights and physical budget calibration',reset='Adam, sampler, reward scale and refinement history')
 
 
-def plot_progress(history,directory):
+def plot_progress(history,directory,filename=PROGRESS_FILENAME,label='enforced symmetry'):
     from ..plotting.training import save_training_progress
     import matplotlib.pyplot as plt
     with plt.rc_context({'font.family':'serif','font.serif':['cmr10'],'mathtext.fontset':'cm',
@@ -84,10 +84,10 @@ def plot_progress(history,directory):
         axes[0].plot(x,[r['reward'] for r in history],label='validation means')
         axes[0].set(xlabel='Refinement update',ylabel='RMS reward',ylim=(0,1.02))
         axes[1].plot(x,[r['success'] for r in history],label=r'validation within $3^\circ$')
-        axes[1].plot(x,[r['fraction'] for r in history],label='enforced symmetry')
+        axes[1].plot(x,[r['fraction'] for r in history],label=label)
         axes[1].set(xlabel='Refinement update',ylabel='Fraction',ylim=(0,1.02))
         for ax in axes:ax.grid(alpha=.2);ax.legend()
-        save_training_progress(fig,directory,200,filename=PROGRESS_FILENAME)
+        save_training_progress(fig,directory,200,filename=filename)
         plt.close(fig)
 
 
@@ -116,23 +116,31 @@ def options(argv=None):
     return args
 
 
-def main(argv=None):
+def main(argv=None, *, projection_method='latent_blend', components='both',
+         name=RUN_NAME, progress_filename=PROGRESS_FILENAME):
     args=options(argv);torch.set_num_threads(1)
-    directory=args.output_directory or PACKAGE_DIR/'runs/great_lakes'/RUN_NAME/os.environ.get('SLURM_JOB_ID','local')
+    directory=args.output_directory or PACKAGE_DIR/'runs/great_lakes'/name/os.environ.get('SLURM_JOB_ID','local')
     if not args.initial_checkpoint.is_file():
         raise FileNotFoundError(f'Working-model checkpoint missing: {args.initial_checkpoint}')
     # No directories or training side effects in preview mode.
     policy,config,initialization=load_start(args.initial_checkpoint,directory,args)
-    recipe=dict(mode='density_symmetry_refinement',initialization=initialization,
+    config=replace(config,coupling_symmetry_method=projection_method,
+        coupling_symmetry_strengths=components in {'both','strengths'},
+        coupling_symmetry_phases=components in {'both','phases'})
+    policy.config=config
+    recipe=dict(mode=('density_physical_symmetry_bounds' if projection_method=='physical_bounds' else 'density_symmetry_refinement'),
+        name=name,projection_method=projection_method,components=components,initialization=initialization,
         updates=args.updates,symmetry_increment=args.increment,validation_every=args.every,
         maximum_reward_drop=args.reward_drop,maximum_success_drop=args.success_drop,plot_every=args.plot_every,
         starting_fraction=0.,goal_fraction=1.,phase_reference='laser 1, unchanged',
-        parameterization='blend latent strengths toward reciprocal averages; move phases together along shortest circular arcs',
+        parameterization=('hard bounds on decoded physical pair strength ratios and circular phase differences'
+            if projection_method=='physical_bounds' else
+            'blend latent strengths toward reciprocal averages; move phases together along shortest circular arcs'),
         objective='unchanged wrapped RMS with mirrored REINFORCE, pair-excluded baseline and PCGrad',
         initial_exploration_scale=.03,final_exploration_scale=.003,wide_phase_actions=False,
         advancement='train at current fraction; tighten only when validation retains original accuracy',
         checkpoint_selection='highest fraction passing original validation floors; reward breaks ties',
-        progress_filename=PROGRESS_FILENAME,weights_added=0,teacher_labels=False,
+        progress_filename=progress_filename,weights_added=0,teacher_labels=False,
         training_simulations_per_update=config.targets_per_batch*config.candidates_per_target,
         validation_cases=len(config.training_n_lasers)*config.held_out_target_count)
     print(recipe,flush=True)
@@ -173,12 +181,15 @@ def main(argv=None):
             row=dict(iteration=iteration,fraction=fraction,validation_fraction=validation_fraction,
                 sample_reward=metrics['training_reward'],**validation,validated=validate,
                 accuracy_retained=accepted if validate else None,learning_rate=rate,
+                strength_mismatch_limit=(1.-fraction if projection_method=='physical_bounds' and current.coupling_symmetry_strengths else None),
+                phase_gap_limit_deg=(180.*(1.-fraction) if projection_method=='physical_bounds' and current.coupling_symmetry_phases else None),
                 exploration_scale=current.exploration_std_scale)
             history.append(row)
             save(directory/'current.pt',policy,optimizer,current,iteration,validation['reward'],
                 sampling_recipe=recipe,exploration_state=exploration_state(policy))
             write_json(directory/'current_history.json',dict(recipe=recipe,history=history))
-            if iteration==1 or iteration%args.plot_every==0 or iteration==args.updates:plot_progress(history,directory)
+            if iteration==1 or iteration%args.plot_every==0 or iteration==args.updates:plot_progress(history,directory,progress_filename,
+                label='physical bound tightening' if projection_method=='physical_bounds' else 'enforced symmetry')
             print(f"{iteration}/{args.updates} symmetry={fraction:.2f} RMS={metrics['training_reward']:.4f} "
                   f"validation={validation['reward']:.4f} 3deg={100*validation['success']:.1f}%"+
                   ((' retained' if accepted else ' HOLD') if validate else ''),flush=True)
@@ -190,11 +201,17 @@ def main(argv=None):
              sampling_recipe=recipe,exploration_state=exploration_state(policy))
         fully=replace(final,coupling_symmetry_fraction=1.);policy.config=fully
         full_quality=quality(evaluate_bank(policy,fully,bank,args.updates,pool)) if fraction!=1. else final_quality
-        save(directory/'fully_symmetric.pt',policy,optimizer,fully,args.updates,full_quality['reward'],
+        endpoint_name='fully_symmetric.pt' if components=='both' else 'constraint_endpoint.pt'
+        save(directory/endpoint_name,policy,optimizer,fully,args.updates,full_quality['reward'],
              sampling_recipe={**recipe,'forced_endpoint_evaluation':fraction!=1.},exploration_state=exploration_state(policy))
         result=dict(reached_fraction=fraction,best_accepted_fraction=best[0],final_validation=final_quality,
-            fully_symmetric_validation=full_quality,
-            fully_symmetric_accuracy_retained=retained(full_quality,baseline,args.reward_drop,args.success_drop))
+            projection_method=projection_method,components=components,endpoint_checkpoint=endpoint_name,
+            endpoint_validation=full_quality,
+            endpoint_accuracy_retained=retained(full_quality,baseline,args.reward_drop,args.success_drop),
+            value_symmetry_complete=components=='both' and fraction==1.)
+        if components=='both':
+            result.update(fully_symmetric_validation=full_quality,
+                fully_symmetric_accuracy_retained=result['endpoint_accuracy_retained'])
         write_json(directory/'result.json',result);print(result,flush=True)
     return result
 

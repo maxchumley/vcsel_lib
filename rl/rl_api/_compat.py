@@ -53,11 +53,23 @@ class DensityControlledConfig(MirroredExplorationConfig):
 class SymmetryRefinementDensityConfig(DensityControlledConfig):
     """Checkpointed continuous projection used by the refinement runner."""
     coupling_symmetry_fraction: float = 0.0
+    coupling_symmetry_method: str = 'latent_blend'
+    coupling_symmetry_strengths: bool = True
+    coupling_symmetry_phases: bool = True
 
     def __post_init__(self):
         super().__post_init__()
         if not 0. <= self.coupling_symmetry_fraction <= 1.:
             raise ValueError('coupling_symmetry_fraction must be in [0,1]')
+        if self.coupling_symmetry_method not in {'latent_blend', 'physical_bounds'}:
+            raise ValueError('Unknown coupling_symmetry_method')
+        if (type(self.coupling_symmetry_strengths) is not bool
+                or type(self.coupling_symmetry_phases) is not bool
+                or not (self.coupling_symmetry_strengths or self.coupling_symmetry_phases)):
+            raise ValueError('Select at least one Boolean coupling symmetry component')
+        if (self.coupling_symmetry_method == 'latent_blend'
+                and not (self.coupling_symmetry_strengths and self.coupling_symmetry_phases)):
+            raise ValueError('Legacy latent blending requires both symmetry components')
 
 
 @dataclass

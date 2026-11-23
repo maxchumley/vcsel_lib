@@ -51,7 +51,8 @@ def apply_root_reference(phases, masks, detunings_ghz, root_indices, config):
 def decode_samples(actions, masks, config, *, budget_actions=None,
                    detunings_ghz=None, root_indices=None):
     """Existing physical decoder, followed only by the opt-in reference shift."""
-    if hasattr(config, 'coupling_symmetry_fraction'):
+    physical_bounds = getattr(config, 'coupling_symmetry_method', 'latent_blend') == 'physical_bounds'
+    if hasattr(config, 'coupling_symmetry_fraction') and not physical_bounds:
         fraction = config.coupling_symmetry_fraction
         if not 0. <= fraction <= 1.:
             raise ValueError('coupling_symmetry_fraction must be in [0,1]')
@@ -77,6 +78,9 @@ def decode_samples(actions, masks, config, *, budget_actions=None,
         actions = reciprocal_actions(actions, masks, config.n_lasers)
     kappa, phases, counts, rho, shortfall = engine.decode_samples(
         actions, masks, config, budget_actions=budget_actions)
+    if physical_bounds:
+        from .physical_symmetry import constrain_physical_values
+        kappa, phases = constrain_physical_values(kappa, phases, masks, config)
     phases = apply_root_reference(phases, masks, detunings_ghz, root_indices, config)
     return kappa, phases, counts, rho, shortfall
 

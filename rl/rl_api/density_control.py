@@ -112,7 +112,11 @@ def decode_density_actions(actions, budget_actions, fractions, config):
     from .phase_reference import decode_samples
     dense = torch.ones((*actions.shape[:2], actions.shape[-1]//2),
                        dtype=actions.dtype, device=actions.device)
-    kappa = decode_samples(actions, dense, config, budget_actions=budget_actions)[0]
+    # Physical bounds preserve pair totals. Rank the original strengths explicitly
+    # so floating-point ties cannot change a graph merely as the bound tightens.
+    ranking_config = (replace(config, coupling_symmetry_fraction=0.)
+        if getattr(config, 'coupling_symmetry_method', '') == 'physical_bounds' else config)
+    kappa = decode_samples(actions, dense, ranking_config, budget_actions=budget_actions)[0]
     masks = torch.as_tensor(select_masks(kappa, fractions), dtype=actions.dtype, device=actions.device)
     decoded = decode_samples(actions, masks, config, budget_actions=budget_actions)
     return masks, decoded
