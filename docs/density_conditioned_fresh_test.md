@@ -40,3 +40,11 @@ files live under
 `rl/rl_api/runs/great_lakes/symmetric_density_pairs_conditioned_phase_fresh_1k/<job-id>/`.
 Its unique `density_conditioned_sym_fresh_progress.png` is automatically
 discovered by the existing plot sync. All existing jobs remain unchanged.
+
+For the matched zero-frequency-reference experiment, submit
+`bash scripts/submit_density_conditioned_fresh.sh --zero-reference`.
+This changes only `phase_parameterization` to `target_residual` and the output
+names. The explicit laser-1 delay rotation is omitted; physical detunings,
+delay, simulator equations, random initialization seed and all training settings
+remain identical. The job is `density_cond_zero` and the figure is
+`density_conditioned_sym_zero_fresh_progress.png`.

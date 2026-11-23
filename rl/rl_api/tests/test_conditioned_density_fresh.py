@@ -17,6 +17,7 @@ from rl.rl_api.models import build_policy
 from rl.rl_api.reciprocal_pairs import pair_layout,check_shared_actions
 from rl.rl_api.experiments import train_mirrored_symmetric_density_pairs_1000 as base
 from rl.rl_api.experiments import train_density_conditioned_fresh_1000 as run
+from rl.rl_api.experiments import train_density_conditioned_fresh_zeroref_1000 as zero
 
 
 def test_recipe_only_adds_conditioning_and_unique_outputs():
@@ -34,7 +35,7 @@ def test_recipe_only_adds_conditioning_and_unique_outputs():
 
 
 @pytest.mark.parametrize('size',range(3,10))
-def test_pair_conditioning_preserves_start_and_scores_unique_coordinates(tmp_path,size):
+def test_pair_conditioning_preserves_start_and_scores_unique_coordinates(tmp_path,size,assert_mirrored_phase_noise):
     config=replace(run.CONFIG.to_backend(tmp_path),n_lasers=size)
     torch.manual_seed(7);original=build_policy(base.CONFIG.to_backend(tmp_path))
     original.config=replace(original.config,n_lasers=size)
@@ -68,8 +69,7 @@ def test_pair_conditioning_preserves_start_and_scores_unique_coordinates(tmp_pat
     expected=s+(torch.distributions.Normal(mean+residual,std).log_prob(phases)-
                 torch.distributions.Normal(mean,std).log_prob(a[...,edges:][...,canonical])).sum(-1)
     torch.testing.assert_close(ss,expected)
-    noise=phases-(mean+residual).detach()
-    torch.testing.assert_close(noise[:,::2],-noise[:,1::2],rtol=1e-4,atol=4e-6)
+    assert_mirrored_phase_noise(phases,mean+residual)
     check_shared_actions(aa,mm,size)
     for values in pp[:2]:np.testing.assert_array_equal(values,values.swapaxes(-1,-2))
     np.testing.assert_array_equal(pp[0],physical[0])
@@ -78,12 +78,13 @@ def test_pair_conditioning_preserves_start_and_scores_unique_coordinates(tmp_pat
     assert policy.edge_output.weight.grad[:2].abs().sum()>0
 
 
-def test_full_size_pipeline_reload_and_two_panel_plot(tmp_path,fake_physics):
-    config=replace(run.CONFIG,
-        sampling=replace(run.CONFIG.sampling,pairs_per_size=1,pairs_per_job=1),
-        optimization=replace(run.CONFIG.optimization,iterations=2,workers=1),
-        schedules=replace(run.CONFIG.schedules,ordinary_end=2,wide_end=2),
-        validation=replace(run.CONFIG.validation,pairs_per_size=5,plot_use_tex=False,notebook_display=False))
+@pytest.mark.parametrize('recipe',[run,zero],ids=['laser1','zero'])
+def test_full_size_pipeline_reload_and_two_panel_plot(tmp_path,fake_physics,recipe):
+    config=replace(recipe.CONFIG,
+        sampling=replace(recipe.CONFIG.sampling,pairs_per_size=1,pairs_per_job=1),
+        optimization=replace(recipe.CONFIG.optimization,iterations=2,workers=1),
+        schedules=replace(recipe.CONFIG.schedules,ordinary_end=2,wide_end=2),
+        validation=replace(recipe.CONFIG.validation,pairs_per_size=5,plot_use_tex=False,notebook_display=False))
     result=Experiment('fresh-conditional',config=config,output_directory=tmp_path/'run').train(
         live_plot=True,verify_reference=False)
     manifest=json.loads((result.directory/'run.json').read_text())
@@ -117,6 +118,15 @@ def test_full_size_pipeline_reload_and_two_panel_plot(tmp_path,fake_physics):
     assert (result.directory/config.validation.progress_filename).is_file()
 
 
+def test_zero_reference_only_changes_phase_offset_and_output_names():
+    a,b=asdict(run.CONFIG),asdict(zero.CONFIG)
+    assert a['model'].pop('phase_parameterization')=='target_delay_residual'
+    assert b['model'].pop('phase_parameterization')=='target_residual'
+    assert a['validation'].pop('progress_filename')!=b['validation'].pop('progress_filename')
+    assert a==b and zero.INITIAL_CHECKPOINT is None
+    assert run.RUN_NAME!=zero.RUN_NAME
+
+
 def test_fresh_job_resources():
     script=Path(__file__).resolve().parents[3]/'scripts/submit_density_conditioned_fresh.sh'
     subprocess.run(['bash','-n',str(script)],check=True)
@@ -124,3 +134,8 @@ def test_fresh_job_resources():
     assert output.count('sbatch ')==1 and '--initial-checkpoint' not in output
     for token in ('--job-name=density_cond_fresh','--cpus-per-task=32','--time=7-00:00:00','--workers 31'):
         assert token in output
+    output=subprocess.run(['bash',str(script),'--dry-run','--zero-reference'],
+        check=True,capture_output=True,text=True).stdout
+    assert output.count('sbatch ')==1 and '--job-name=density_cond_zero' in output
+    assert 'train_density_conditioned_fresh_zeroref_1000' in output
+    assert '--initial-checkpoint' not in output

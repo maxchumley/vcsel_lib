@@ -4,6 +4,19 @@ import pytest
 import torch
 
 
+@pytest.fixture
+def assert_mirrored_phase_noise():
+    """Allow cancellation roundoff in float32 phases with large common offsets."""
+    def check(samples,means):
+        noise=samples-means.detach()
+        magnitude=max(1.,float(samples.detach().abs().max()),float(means.detach().abs().max()))
+        # Reflecting, adding a conditional mean and subtracting it can each
+        # round. The absolute error scales with the phases, not the tiny noise.
+        tolerance=8*torch.finfo(samples.dtype).eps*magnitude
+        torch.testing.assert_close(noise[:,::2],-noise[:,1::2],rtol=0.,atol=tolerance)
+    return check
+
+
 @pytest.fixture(autouse=True)
 def single_thread():
     before = torch.get_num_threads()

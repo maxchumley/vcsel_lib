@@ -50,7 +50,7 @@ def test_zero_head_preserves_actions_scores_rng_and_physical_designs(tmp_path,si
     assert sum(p.numel() for p in policy.coupling_phase_head.parameters())==129
 
 
-def test_conditional_scores_own_mirror_means_and_detached_strengths(tmp_path):
+def test_conditional_scores_own_mirror_means_and_detached_strengths(tmp_path,assert_mirrored_phase_noise):
     _,policy,config,features,fractions=setup(tmp_path)
     with torch.no_grad():policy.coupling_phase_head.weight.fill_(.07)
     dense=features.new_ones((1,8,12))
@@ -66,8 +66,7 @@ def test_conditional_scores_own_mirror_means_and_detached_strengths(tmp_path):
     aa,bb,ss,mm,pp=sample_conditional_density(policy,features,config,fractions,mirrored=True)
     torch.testing.assert_close(aa[...,:12],a[...,:12]);torch.testing.assert_close(bb,b)
     torch.testing.assert_close(mm,masks);np.testing.assert_array_equal(pp[0],physical[0])
-    noise=aa[...,12:]-(mean+residual).detach()
-    torch.testing.assert_close(noise[:,::2],-noise[:,1::2],rtol=1e-4,atol=3e-6)
+    assert_mirrored_phase_noise(aa[...,12:],mean+residual)
     expected=s+(torch.distributions.Normal(mean+residual,std).log_prob(aa[...,12:])-
                 torch.distributions.Normal(mean,std).log_prob(a[...,12:])).sum(-1)
     torch.testing.assert_close(ss,expected)
