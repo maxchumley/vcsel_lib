@@ -135,7 +135,7 @@ def prepare_density_size(policy, config, rng, size, pair_count):
     dense = features.new_ones((pair_count, config.candidates_per_target, size*(size-1)))
     if getattr(config, 'condition_phases_on_coupling', False):
         from .conditional_phases import sample_conditional_density
-        _, _, log_prob, masks, decoded = sample_conditional_density(
+        actions, budget_actions, log_prob, masks, decoded = sample_conditional_density(
             policy, features, local, fractions, mirrored=True)
     else:
         actions, budget_actions, log_prob = sample_annealed_candidates(
@@ -145,7 +145,8 @@ def prepare_density_size(policy, config, rng, size, pair_count):
     return dict(n_lasers=size, config=local, targets=targets, detunings=detunings,
         features=features, gates=masks, log_prob=log_prob, kappa=kappa, phi=phi,
         counts=counts, rho=rho, shortfall=shortfall, reach=np.ones_like(counts, dtype=float),
-        roots=None, density_fractions=fractions, results=[])
+        roots=None, density_fractions=fractions, actions=actions.detach(),
+        budget_actions=budget_actions.detach(), results=[])
 
 
 def density_candidates(policy, features, masks, *, continuous_mean=False):

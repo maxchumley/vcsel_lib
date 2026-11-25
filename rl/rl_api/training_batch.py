@@ -100,14 +100,17 @@ def collect_rewards(item, config):
     return rms['phase_rms_reward'], metrics
 
 
-def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase_correction=None):
+def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase_correction=None,
+                  candidate_losses=None):
     """Group gradients by physical band or mask rank; combine with PCGrad."""
     losses, weights, labels, context_counts = [], [], [], []
     correction_values = []
-    for item, advantage_np in zip(prepared,advantages):
+    supplied_losses = candidate_losses
+    for item_index, (item, advantage_np) in enumerate(zip(prepared,advantages)):
         advantage = torch.as_tensor(advantage_np,
             dtype=item['features'].dtype,device=item['features'].device)
-        candidate_losses = -(item['log_prob']*advantage)
+        candidate_losses = (-(item['log_prob']*advantage) if supplied_losses is None
+                            else supplied_losses[item_index])
         teachers, correction_losses = [], None
         if phase_correction is not None and phase_correction.enabled:
             from .phase_correction import teacher_losses
@@ -190,7 +193,7 @@ def pcgrad_update(policy, optimizer, config, rng, prepared, advantages, *, phase
 def run_training_batch(policy, optimizer, config, rng, iteration, *,
                        simulation_pool=None, reward_scale_state=None,
                        mask_sampler=sample_shared_rooted_topologies, schedules=None,
-                       phase_correction=None, actor_critic=None):
+                       phase_correction=None, actor_critic=None, ppo=None):
     """One supplied-topology batch; explicit samplers also support parity tests."""
     if (not config.topology_input_mode or config.objective_mode!='phase_only'
             or config.phase_reward_mode!='wrapped_rms'
@@ -204,8 +207,9 @@ def run_training_batch(policy, optimizer, config, rng, iteration, *,
     policy.minimum_log_std = core.minimum_log_std_at(iteration,config)
     policy.maximum_log_std = core.maximum_log_std_at(iteration,config)
     pair_count = config.targets_per_batch//len(config.training_n_lasers)
-    prepared = [prepare_size(policy,config,rng,size,pair_count,iteration,mask_sampler)
-                for size in config.training_n_lasers]
+    with torch.set_grad_enabled(ppo is None):
+        prepared = [prepare_size(policy,config,rng,size,pair_count,iteration,mask_sampler)
+                    for size in config.training_n_lasers]
     work = simulation_jobs(prepared,config)
     worker = core.simulate_indexed_target_chunk
     if hasattr(config, "phase_model"):
@@ -248,7 +252,11 @@ def run_training_batch(policy, optimizer, config, rng, iteration, *,
     advantages = advantage_function(rewards,config,reward_scale_state)
     options = dict(phase_correction=phase_correction) if joint_correction else {}
     update_start=perf_counter()
-    diagnostics = pcgrad_update(policy,optimizer,config,rng,prepared,advantages,**options)
+    if ppo is not None:
+        from .ppo import ppo_update
+        diagnostics = ppo_update(policy, optimizer, config, rng, prepared, advantages, ppo)
+    else:
+        diagnostics = pcgrad_update(policy,optimizer,config,rng,prepared,advantages,**options)
     if actor_critic is not None:
         diagnostics.update(actor_critic.update(policy, optimizer, config, prepared, rewards, iteration))
     if getattr(config,'exhaustive_symmetric_topologies',False):

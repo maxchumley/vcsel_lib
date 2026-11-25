@@ -39,9 +39,12 @@ HISTORY_KEYS = (
 )
 
 
-def make_history(config, *, phase_correction=None, fixed_topology_bank=False, actor_critic=False):
+def make_history(config, *, phase_correction=None, fixed_topology_bank=False, actor_critic=False, ppo=False):
     """Keep the current RMS run's active metrics, excluding unused placeholders."""
     history = {key: [] for key in HISTORY_KEYS}
+    if ppo:
+        from .ppo import HISTORY_KEYS as ppo_keys
+        history.update({key: [] for key in ppo_keys})
     if actor_critic:
         from .actor_critic import HISTORY_KEYS as critic_keys
         history.update({key: [] for key in critic_keys})
@@ -145,6 +148,10 @@ def record_history(history, metrics, validation, config, *, seen_validation=None
         from .actor_critic import HISTORY_KEYS as critic_keys
         for key in critic_keys:
             history[key].append(metrics[key])
+    if 'ppo_updates' in history:
+        from .ppo import HISTORY_KEYS as ppo_keys
+        for key in ppo_keys:
+            history[key].append(metrics[key])
     names = {
         "held_out_reward": "training_reward", "held_out_rooted_fraction": "rooted_fraction",
         "held_out_phase_reward": "phase_reward",
@@ -234,6 +241,9 @@ def print_progress(iteration, config, metrics, history):
                        f" critic-rank={metrics['critic_rank_accuracy']:.1%}"
                        f" buffer={metrics['critic_buffer_size']}"
                        f" critic-actor-updates={metrics['critic_actor_updates']}")
+    if 'ppo_updates' in metrics:
+        correction += (f" PPO-updates={metrics['ppo_updates']} KL-max={metrics['ppo_kl']:.4g}"
+                       f" clipped={metrics['ppo_clip_fraction']:.1%}")
     print(f"{iteration+1}/{config.training_iterations} "
           f"RMS={metrics['training_reward']:.3f} cosine={metrics['phase_reward']:.3f} "
           f"held-out-RMS={history['held_out_reward'][-1]:.3f} "
@@ -488,8 +498,17 @@ def train(experiment, *, live_plot=True, verify_reference=True, restart=False,
             experience_archive='experiences/batch_*.npz; archives are never read by the trainer',
             extra_simulations=0))
     reward_scale_state = {}
+    if experiment.config.ppo.enabled:
+        batch_options['ppo'] = experiment.config.ppo
+        sampling_recipe = dict(sampling_recipe or {}, ppo=dict(
+            **asdict(experiment.config.ppo), critic=False, historical_replay=False,
+            objective='clipped joint latent action ratio; fixed pair-excluded measured-reward advantages',
+            update_description='full fresh batch, PCGrad by M and density; no additional simulations',
+            kl='old-to-new joint Gaussian KL, conditional on sampled strengths; stop on maximum mean by M',
+            target_phase_offset=experiment.config.model.add_target_phase_offset))
     history = make_history(config, phase_correction=phase_correction,
-                           fixed_topology_bank=topology_bank is not None, actor_critic=critic is not None)
+                           fixed_topology_bank=topology_bank is not None, actor_critic=critic is not None,
+                           ppo=experiment.config.ppo.enabled)
     bank = make_validation_bank(config)
     seen_topologies = unseen_topologies = None
     if topology_bank is not None:

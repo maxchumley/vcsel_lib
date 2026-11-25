@@ -202,6 +202,8 @@ class ReciprocalPairPolicy(ScaledExploration, engine.BernoulliSparseGNNPolicy):
         edges = outputs[0].shape[-1] // 2
         if getattr(self.config, 'asymmetric_coupling_phases', False):
             phase = outputs[0][:, edges:]
+            if getattr(self.config, 'add_target_phase_offset', False):
+                phase = phase + target_phase_offsets(features)
             if self.config.phase_parameterization == 'target_delay_residual':
                 phase = phase + delay_phase_offsets(features, self.config)
             strength = outputs[0][:, canonical][:, expansion]

@@ -109,6 +109,7 @@ class CouplingConditionedPairDensityConfig(ReciprocalPairDensityConfig):
 @dataclass
 class CouplingConditionedMixedPairDensityConfig(CouplingConditionedPairDensityConfig):
     asymmetric_coupling_phases: bool = True
+    add_target_phase_offset: bool = False
 
 
 @dataclass

@@ -43,3 +43,32 @@ def sample_mixed_pairs(policy,features,masks,*,mirrored=False,continuous_mean=Fa
     full=torch.cat((actions[...,:pairs][...,expansion],actions[...,pairs:]),dim=-1)
     result=(full,budget,score)
     return (*result,mean[...,pairs:],std[...,pairs:]) if return_phase_parameters else result
+
+
+def mixed_pair_distributions(policy, features, masks, *, mirrored=True):
+    """Reevaluate the sampler's independent coordinates, without drawing actions.
+
+    Strengths use one canonical coordinate per pair; phases use every directed
+    coordinate. Wide slots and mirrored parameter sharing match sampling.
+    """
+    batch, candidates, edges = masks.shape
+    size = features.shape[1]
+    repeated = features[:, None].expand(-1, candidates, -1, -1).reshape(-1, size, 4)
+    mean, log_std, _, pooled = policy.parameters_for_edges(repeated,
+        topology_masks=masks.reshape(-1, edges), return_pooled=True)
+    mean, std = mean.reshape(batch, candidates, 2*edges), log_std.exp().reshape(batch, candidates, 2*edges)
+    canonical, _, _ = pair_layout(size, features.device)
+    columns = torch.cat((canonical, torch.arange(edges, 2*edges, device=features.device)))
+    mean, std = mean[..., columns], std[..., columns]
+    wide = round(policy.config.actions_per_topology*policy.config.phase_exploration_fraction)
+    slots = torch.arange(candidates, device=features.device) % policy.config.actions_per_topology
+    extra = (slots < wide).to(std.dtype)[None, :, None]
+    extra = extra*policy.config.phase_exploration_start_std*policy.config.exploration_std_scale/math.sqrt(2.)
+    pairs = len(canonical)
+    std = torch.cat((std[..., :pairs], torch.sqrt(std[..., pairs:].square()+extra.square())), -1)
+    bm, bs = policy.budget_parameters(repeated, pooled_states=pooled)
+    bm, bs = bm.reshape(batch, candidates), bs.exp().reshape(batch, candidates)
+    if mirrored:
+        mean, std = shared_pair_parameters(mean), shared_pair_parameters(std)
+        bm, bs = shared_pair_parameters(bm), shared_pair_parameters(bs)
+    return torch.distributions.Normal(mean, std), torch.distributions.Normal(bm, bs), columns

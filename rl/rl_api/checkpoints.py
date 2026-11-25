@@ -110,4 +110,6 @@ def write_run_manifest(path, *, name, public_config, backend_config, initializat
         resume_supported=False)
     if initialization is not None:
         manifest['initialization'] = initialization
+    if public_config.ppo.enabled:
+        manifest['numerical_backend'] = 'fresh-batch PPO/PCGrad; existing density GNN and VCSEL simulator'
     write_json(path, manifest)

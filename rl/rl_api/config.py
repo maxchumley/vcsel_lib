@@ -31,9 +31,13 @@ class ModelConfig:
     symmetric_coupling_values: bool = False
     reciprocal_pair_actions: bool = False
     asymmetric_coupling_phases: bool = False
+    add_target_phase_offset: bool = False
     condition_phases_on_coupling: bool = False
 
     def __post_init__(self):
+        if type(self.add_target_phase_offset) is not bool or (self.add_target_phase_offset
+                and not self.asymmetric_coupling_phases):
+            raise ValueError('Explicit pair target offsets require asymmetric coupling phases')
         if type(self.asymmetric_coupling_phases) is not bool or (self.asymmetric_coupling_phases
                 and not (self.reciprocal_pair_actions and self.condition_phases_on_coupling)):
             raise ValueError('Asymmetric pair phases require conditional reciprocal strength actions')
@@ -296,6 +300,25 @@ class ActorCriticConfig:
 
 
 @dataclass(frozen=True)
+class PPOConfig:
+    """Fresh-batch PPO with measured rewards and the existing empirical baseline."""
+    enabled: bool = False
+    clip_ratio: float = .1
+    updates: int = 4
+    target_kl: float = .01
+
+    def __post_init__(self):
+        if type(self.enabled) is not bool:
+            raise ValueError('PPO enabled must be Boolean')
+        if type(self.updates) is not int or self.updates < 1:
+            raise ValueError('PPO updates must be a positive integer')
+        if not math.isfinite(self.clip_ratio) or not 0. < self.clip_ratio < 1.:
+            raise ValueError('PPO clip_ratio must be in (0,1)')
+        if not math.isfinite(self.target_kl) or self.target_kl <= 0.:
+            raise ValueError('PPO target_kl must be positive and finite')
+
+
+@dataclass(frozen=True)
 class TrainingConfig:
     """Current recipe with separate, documented user-facing sections."""
     sizes: tuple[int, ...] = tuple(range(3, 10))
@@ -313,6 +336,7 @@ class TrainingConfig:
     reward: RewardConfig = field(default_factory=RewardConfig)
     phase_correction: PhaseCorrectionConfig = field(default_factory=PhaseCorrectionConfig)
     actor_critic: ActorCriticConfig = field(default_factory=ActorCriticConfig)
+    ppo: PPOConfig = field(default_factory=PPOConfig)
 
     def __post_init__(self):
         object.__setattr__(self, "sizes", tuple(self.sizes))
@@ -369,6 +393,11 @@ class TrainingConfig:
                 raise ValueError("Fixed topology banks require five random_reachable band_random masks")
         if self.model.reciprocal_pair_actions and self.topology.mode != 'density':
             raise ValueError('Reciprocal pair actions currently require density training')
+        if self.ppo.enabled and (self.actor_critic.enabled or self.phase_correction.enabled
+                or self.topology.mode != 'density' or not self.model.asymmetric_coupling_phases
+                or not self.model.condition_phases_on_coupling
+                or self.sampling.action_sampling != 'mirrored'):
+            raise ValueError('PPO requires mixed conditional density actions without critic or phase teachers')
         if self.model.condition_phases_on_coupling and (
                 self.topology.mode != 'density' or not self.schedules.anneal_to_mean):
             raise ValueError('Conditional phases require density training with anneal_to_mean')
@@ -516,6 +545,8 @@ class TrainingConfig:
                 settings['reciprocal_pair_actions'] = True
             if m.asymmetric_coupling_phases:
                 settings['asymmetric_coupling_phases'] = True
+                if m.add_target_phase_offset:
+                    settings['add_target_phase_offset'] = True
             if m.condition_phases_on_coupling:
                 settings['condition_phases_on_coupling'] = True
         if self.topology.backbone == 'all_connected_symmetric':
@@ -657,4 +688,9 @@ class TrainingConfig:
                 critic_warmup_iterations=self.actor_critic.warmup_iterations,
                 critic_actor_gate=f'MAE <= {self.actor_critic.maximum_reward_mae}, rank >= {self.actor_critic.minimum_rank_accuracy}',
                 extra_simulations=0)
+        if self.ppo.enabled:
+            summary.update(policy_optimizer='PPO with existing PCGrad task grouping',
+                ppo_clip_ratio=self.ppo.clip_ratio, ppo_maximum_updates=self.ppo.updates,
+                ppo_target_kl=self.ppo.target_kl, critic_enabled=False, historical_replay=False,
+                explicit_target_phase_offset=self.model.add_target_phase_offset)
         return summary
